@@ -1,0 +1,22 @@
+export const EBAY_TOKEN =
+  'v^1.1#i^1#I^3#f^0#r^0#p^3#t^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';
+export async function searchEbay(query: string) {
+  const res = await fetch(
+    `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(query)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${EBAY_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    },
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error('eBay API Error:', text);
+    throw new Error('eBay request failed');
+  }
+
+  const data = await res.json();
+  return data;
+}

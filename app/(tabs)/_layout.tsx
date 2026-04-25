@@ -1,33 +1,39 @@
-import { Tabs } from 'expo-router';
+import { Tabs, useRouter } from 'expo-router';
 import React from 'react';
 
-import { HapticTab } from '@/components/haptic-tab';
-import { IconSymbol } from '@/components/ui/icon-symbol';
-import { Colors } from '@/constants/theme';
-import { useColorScheme } from '@/hooks/use-color-scheme';
-
 export default function TabLayout() {
-  const colorScheme = useColorScheme();
+  const router = useRouter();
 
   return (
     <Tabs
       screenOptions={{
-        tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
         headerShown: false,
-        tabBarButton: HapticTab,
-      }}>
+        tabBarActiveTintColor: '#60A5FA',
+        tabBarInactiveTintColor: '#94A3B8',
+        tabBarLabelStyle: {
+          fontWeight: '700',
+          fontSize: 12,
+        },
+        tabBarStyle: {
+          paddingBottom: 6,
+          height: 70,
+        },
+      }}
+    >
       <Tabs.Screen
         name="index"
-        options={{
-          title: 'Home',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="house.fill" color={color} />,
+        listeners={{
+          tabPress: (event) => {
+            event.preventDefault();
+            router.replace({
+              pathname: '/(tabs)',
+              params: { homeReset: String(Date.now()) },
+            });
+          },
         }}
-      />
-      <Tabs.Screen
-        name="explore"
         options={{
-          title: 'Explore',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="paperplane.fill" color={color} />,
+          title: 'Start Over',
+          tabBarLabel: 'Start Over',
         }}
       />
     </Tabs>

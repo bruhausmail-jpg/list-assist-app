@@ -1,18 +1,20 @@
 {
   "expo": {
-    "name": "Box_Wizard_App",
-    "slug": "Box_Wizard_App",
+    "name": "List Assist",
+    "slug": "list-assist",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "boxwizardapp",
+    "scheme": "listassist",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.danahauser.boxwizard",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "CFBundleDisplayName": "List Assist",
+        "CFBundleName": "List Assist"
       }
     },
     "android": {
