@@ -56,5 +56,8 @@
         "projectId": "4b6a137e-d511-4e8d-a510-d05e671c4046"
       }
     }
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
   }
 }
