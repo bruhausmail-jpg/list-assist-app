@@ -2,12 +2,26 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+
+// Safe fetch helper for Render/Node versions that may not expose global fetch.
+const fetch = (...args) => {
+  if (typeof globalThis.fetch === 'function') {
+    return globalThis.fetch(...args);
+  }
+  return import('node-fetch').then(({ default: nodeFetch }) =>
+    nodeFetch(...args),
+  );
+};
+
 const { thriftStoresHandler } = require('./thrift-stores-route');
 const estateSalesRoute = require('./estate-sales-route');
 const garageSalesRoute = require('./garage-sales-route');
+
 const app = express();
+
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
+
 app.get('/api/thrift-stores', thriftStoresHandler);
 app.use('/api/estate-sales', estateSalesRoute);
 app.use(garageSalesRoute);
@@ -107,6 +121,33 @@ function buildLooseItemHintQuery(hint) {
   return cleaned;
 }
 
+function normalizeEbayItem(item) {
+  if (!item) return null;
+
+  const priceValue = item.price?.value ?? null;
+  const shippingValue = item.shippingOptions?.[0]?.shippingCost?.value ?? null;
+
+  return {
+    id: item.itemId || '',
+    title: item.title || '',
+    price: priceValue,
+    priceCurrency: item.price?.currency || 'USD',
+    displayPrice: priceValue ? `$${priceValue}` : '',
+    shipping: shippingValue,
+    displayShipping: shippingValue ? `$${shippingValue}` : '',
+    condition: item.condition || '',
+    image: item.image?.imageUrl || '',
+    link: item.itemWebUrl || '',
+    seller: item.seller?.username || '',
+    marketplace: item.itemLocation?.country || 'US',
+  };
+}
+
+function normalizeEbayItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map(normalizeEbayItem).filter(Boolean);
+}
+
 app.get('/', (req, res) => {
   res.send('API is working');
 });
@@ -155,7 +196,14 @@ app.get('/api/ebay-search', async (req, res) => {
       });
     }
 
-    res.json(data);
+    const itemSummaries = Array.isArray(data?.itemSummaries)
+      ? data.itemSummaries
+      : [];
+
+    res.json({
+      ...data,
+      items: normalizeEbayItems(itemSummaries),
+    });
   } catch (error) {
     console.error('Server error:', error.message);
     res.status(500).json({
@@ -165,6 +213,71 @@ app.get('/api/ebay-search', async (req, res) => {
   }
 });
 
+app.get('/api/ebay-sold', async (req, res) => {
+  try {
+    const query = String(req.query.q || '').trim();
+    const limit = Math.max(1, Math.min(Number(req.query.limit || 10), 50));
+
+    if (!query) {
+      return res
+        .status(400)
+        .json({ error: 'Missing search query parameter "q"' });
+    }
+
+    const accessToken = await getEbayAccessToken();
+
+    const url = new URL(EBAY_BROWSE_SEARCH_URL);
+    url.searchParams.set('q', query);
+    url.searchParams.set('limit', String(limit));
+    url.searchParams.append('filter', 'buyingOptions:{FIXED_PRICE}');
+    url.searchParams.append('filter', 'soldItemsOnly:true');
+
+    const ebayResponse = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+      },
+    });
+
+    const responseText = await ebayResponse.text();
+
+    if (!ebayResponse.ok) {
+      return res.status(ebayResponse.status).json({
+        error: 'eBay sold search failed',
+        message: responseText,
+      });
+    }
+
+    let data;
+    try {
+      data = JSON.parse(responseText);
+    } catch (parseError) {
+      return res.status(500).json({
+        error: 'Could not parse eBay sold response',
+        message: responseText,
+      });
+    }
+
+    const itemSummaries = Array.isArray(data?.itemSummaries)
+      ? data.itemSummaries
+      : [];
+
+    res.json({
+      ...data,
+      itemSummaries,
+      items: normalizeEbayItems(itemSummaries),
+      searchType: 'sold',
+      exactQuery: query,
+    });
+  } catch (error) {
+    console.error('Sold search server error:', error.message);
+    res.status(500).json({
+      error: 'Server error',
+      message: error.message,
+    });
+  }
+});
 app.post(
   '/api/ebay/search-by-image',
   upload.single('file'),
@@ -217,7 +330,7 @@ app.post(
         });
       }
 
-      let imageMatches = Array.isArray(imageData?.itemSummaries)
+      const imageMatches = Array.isArray(imageData?.itemSummaries)
         ? imageData.itemSummaries
         : [];
 
@@ -249,7 +362,7 @@ app.post(
         }
       }
 
-      // Merge image matches first, then text matches, deduped by itemId
+      // Merge image matches first, then text matches, deduped by itemId/title.
       const seen = new Set();
       const merged = [...imageMatches, ...textMatches].filter((item) => {
         const key = item?.itemId || item?.title;
@@ -258,13 +371,20 @@ app.post(
         return true;
       });
 
+      const limitedMerged = merged.slice(0, limit);
+      const limitedImageMatches = imageMatches.slice(0, limit);
+      const limitedTextMatches = textMatches.slice(0, limit);
+
       return res.json({
         note: hint
           ? `Image search ran first, then helper words "${hint}" were blended in.`
           : 'Image search ran successfully.',
-        itemSummaries: merged.slice(0, limit),
-        imageItemSummaries: imageMatches.slice(0, limit),
-        textItemSummaries: textMatches.slice(0, limit),
+        itemSummaries: limitedMerged,
+        imageItemSummaries: limitedImageMatches,
+        textItemSummaries: limitedTextMatches,
+        items: normalizeEbayItems(limitedMerged),
+        imageItems: normalizeEbayItems(limitedImageMatches),
+        textItems: normalizeEbayItems(limitedTextMatches),
         exactQuery: exactQuery || '',
       });
     } catch (error) {
@@ -277,11 +397,10 @@ app.post(
   },
 );
 
+// Fallback Craigslist route. If estate-sales-route handles this request first,
+// Express will use that route. This remains here as a backup.
 app.get('/api/estate-sales', async (req, res) => {
   try {
-    const fetchModule = await import('node-fetch');
-    const fetch = fetchModule.default;
-
     const cheerioModule = await import('cheerio');
     const load = cheerioModule.load || cheerioModule.default?.load;
 
@@ -359,6 +478,135 @@ app.get('/api/estate-sales', async (req, res) => {
     res.status(500).json({
       error: 'Failed to fetch Craigslist sales',
       detail: String(err?.message || err),
+    });
+  }
+});
+
+const BUG_REPORT_TO_EMAIL = process.env.BUG_REPORT_TO_EMAIL || '';
+const BUG_REPORT_FROM_EMAIL =
+  process.env.BUG_REPORT_FROM_EMAIL || 'List Assist <onboarding@resend.dev>';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+
+function cleanBugReportText(value, maxLength = 4000) {
+  return String(value || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/[\u0000-\u001F\u007F]/g, (char) =>
+      char === '\n' || char === '\t' ? char : ' ',
+    )
+    .trim()
+    .slice(0, maxLength);
+}
+
+function isValidEmail(value) {
+  return /^\S+@\S+\.\S+$/.test(String(value || '').trim());
+}
+
+async function sendBugReportEmail(report) {
+  if (!RESEND_API_KEY || !BUG_REPORT_TO_EMAIL) {
+    return {
+      sent: false,
+      reason: 'RESEND_API_KEY or BUG_REPORT_TO_EMAIL is not configured.',
+    };
+  }
+
+  const subjectPrefix =
+    report.type === 'suggestion' ? 'Suggestion' : 'Bug Report';
+  const subject = `List Assist ${subjectPrefix}`;
+  const lines = [
+    `Type: ${report.type}`,
+    `User email: ${report.email || 'Not provided'}`,
+    `App: ${report.appName || 'List Assist'}`,
+    `Version: ${report.appVersion || 'Unknown'}`,
+    `Screen: ${report.screen || 'Unknown'}`,
+    `Home mode: ${report.homeMode || 'Unknown'}`,
+    `Scan mode: ${report.homeScanMode || 'Unknown'}`,
+    `Finder mode: ${report.finderMode || 'Unknown'}`,
+    `Radius miles: ${report.radiusMiles || 'Unknown'}`,
+    `Created at: ${report.createdAt || new Date().toISOString()}`,
+    '',
+    'Message:',
+    report.message,
+  ];
+
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: BUG_REPORT_FROM_EMAIL,
+      to: [BUG_REPORT_TO_EMAIL],
+      reply_to: report.email || undefined,
+      subject,
+      text: lines.join('\n'),
+    }),
+  });
+
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Resend email failed: ${response.status} ${responseText}`);
+  }
+
+  return { sent: true };
+}
+
+app.post('/api/bug-report', async (req, res) => {
+  try {
+    const report = {
+      type:
+        String(req.body?.type || '')
+          .trim()
+          .toLowerCase() === 'suggestion'
+          ? 'suggestion'
+          : 'bug',
+      message: cleanBugReportText(req.body?.message),
+      email: cleanBugReportText(req.body?.email, 250),
+      appName: cleanBugReportText(req.body?.appName, 120),
+      appVersion: cleanBugReportText(req.body?.appVersion, 80),
+      screen: cleanBugReportText(req.body?.screen, 120),
+      homeMode: cleanBugReportText(req.body?.homeMode, 80),
+      homeScanMode: cleanBugReportText(req.body?.homeScanMode, 80),
+      finderMode: cleanBugReportText(req.body?.finderMode, 80),
+      radiusMiles: cleanBugReportText(req.body?.radiusMiles, 20),
+      createdAt: cleanBugReportText(req.body?.createdAt, 80),
+    };
+
+    if (report.message.length < 5) {
+      return res.status(400).json({
+        error: 'Please include a few details before sending.',
+      });
+    }
+
+    if (report.email && !isValidEmail(report.email)) {
+      return res.status(400).json({
+        error: 'Email address is not valid.',
+      });
+    }
+
+    console.log('List Assist bug report received:', report);
+
+    let emailStatus = { sent: false, reason: 'Email not attempted.' };
+    try {
+      emailStatus = await sendBugReportEmail(report);
+    } catch (emailError) {
+      console.error('Bug report email error:', emailError.message);
+      emailStatus = { sent: false, reason: emailError.message };
+    }
+
+    return res.json({
+      success: true,
+      emailed: Boolean(emailStatus.sent),
+      message: emailStatus.sent
+        ? 'Report sent.'
+        : 'Report saved to server logs. Email forwarding is not configured.',
+    });
+  } catch (error) {
+    console.error('Bug report server error:', error.message);
+    return res.status(500).json({
+      error: 'Server error',
+      message: error.message,
     });
   }
 });

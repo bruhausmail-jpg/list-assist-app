@@ -17,6 +17,7 @@ import {
   Linking,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -61,7 +62,8 @@ type AppStep =
   | 'compCheck'
   | 'listingBuilder'
   | 'priceCheckerChooser'
-  | 'priceCheckerResult';
+  | 'priceCheckerResult'
+  | 'bugReport';
 
 type ReferenceConfig = {
   key: ReferenceType;
@@ -285,10 +287,12 @@ const BARCODE_RATE_LIMIT_COOLDOWN_MS = 60000;
 const PACKAGE_FRONT_LOOKUP_TIMEOUT_MS = 20000;
 const LIST_ASSIST_LISTING_DRAFTS_STORAGE_KEY = 'listassist_listing_drafts_v1';
 const GARAGE_SALE_FAVORITES_STORAGE_KEY = 'listassist_garage_sale_favorites_v1';
-const LOCAL_BACKEND_BASE_URL = 'http://10.0.0.108:3001';
+const HELPER_TIPS_STORAGE_KEY = 'listassist_helper_tips_enabled_v1';
+const LOCAL_BACKEND_BASE_URL = 'https://list-assist-app.onrender.com';
 const THRIFT_STORES_API_URL = `${LOCAL_BACKEND_BASE_URL}/api/thrift-stores`;
 const GARAGE_SALES_API_URL = `${LOCAL_BACKEND_BASE_URL}/api/garage-sales`;
 const LIVE_EBAY_SEARCH_API_URL = `${LOCAL_BACKEND_BASE_URL}/api/ebay-search`;
+const SOLD_EBAY_SEARCH_API_URL = `${LOCAL_BACKEND_BASE_URL}/api/ebay-sold`;
 const LOOSE_ITEM_IMAGE_SEARCH_URL = `${LOCAL_BACKEND_BASE_URL}/api/ebay/search-by-image`;
 
 const APP_THRIFT_FALLBACK_STORES = [
@@ -462,7 +466,7 @@ function buildLocalThriftFallbackPins(params: {
     .filter((pin) => {
       const numericDistance = Number(pin.distanceMiles);
       if (!Number.isFinite(numericDistance)) return true;
-      return numericDistance <= Math.max(params.radiusMiles, 10);
+      return numericDistance <= params.radiusMiles;
     })
     .sort((a, b) => {
       const aDistance = Number.isFinite(a.distanceMiles as number)
@@ -992,12 +996,110 @@ function getEstateSalesNetAreaFromPlace(
   return matchedArea?.path || 'IL/Chicago';
 }
 
+function getStateAbbreviation(region?: string | null) {
+  const value = String(region || '').trim();
+  if (!value) return '';
+
+  if (/^[A-Za-z]{2}$/.test(value)) {
+    return value.toUpperCase();
+  }
+
+  const stateLookup: Record<string, string> = {
+    alabama: 'AL',
+    alaska: 'AK',
+    arizona: 'AZ',
+    arkansas: 'AR',
+    california: 'CA',
+    colorado: 'CO',
+    connecticut: 'CT',
+    delaware: 'DE',
+    florida: 'FL',
+    georgia: 'GA',
+    hawaii: 'HI',
+    idaho: 'ID',
+    illinois: 'IL',
+    indiana: 'IN',
+    iowa: 'IA',
+    kansas: 'KS',
+    kentucky: 'KY',
+    louisiana: 'LA',
+    maine: 'ME',
+    maryland: 'MD',
+    massachusetts: 'MA',
+    michigan: 'MI',
+    minnesota: 'MN',
+    mississippi: 'MS',
+    missouri: 'MO',
+    montana: 'MT',
+    nebraska: 'NE',
+    nevada: 'NV',
+    'new hampshire': 'NH',
+    'new jersey': 'NJ',
+    'new mexico': 'NM',
+    'new york': 'NY',
+    'north carolina': 'NC',
+    'north dakota': 'ND',
+    ohio: 'OH',
+    oklahoma: 'OK',
+    oregon: 'OR',
+    pennsylvania: 'PA',
+    'rhode island': 'RI',
+    'south carolina': 'SC',
+    'south dakota': 'SD',
+    tennessee: 'TN',
+    texas: 'TX',
+    utah: 'UT',
+    vermont: 'VT',
+    virginia: 'VA',
+    washington: 'WA',
+    'west virginia': 'WV',
+    wisconsin: 'WI',
+    wyoming: 'WY',
+    'district of columbia': 'DC',
+  };
+
+  return stateLookup[value.toLowerCase()] || '';
+}
+
+function slugEstateSalesCity(city?: string | null) {
+  return String(city || '')
+    .trim()
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function getEstateSalesNetPathFromPlace(
+  place?: Location.LocationGeocodedAddress | null,
+) {
+  const stateAbbreviation = getStateAbbreviation(place?.region);
+  const citySlug = slugEstateSalesCity(place?.city);
+  const postalCode = String(place?.postalCode || '')
+    .trim()
+    .replace(/[^0-9]/g, '')
+    .slice(0, 5);
+
+  if (stateAbbreviation && citySlug && postalCode) {
+    return `${stateAbbreviation}/${citySlug}/${postalCode}`;
+  }
+
+  if (stateAbbreviation && citySlug) {
+    return `${stateAbbreviation}/${citySlug}`;
+  }
+
+  return getEstateSalesNetAreaFromPlace(place);
+}
+
 async function openEstateSalesNetLink() {
+  const buildEstateSalesUrl = (path: string) => {
+    const safePath = String(path || 'IL/Chicago').replace(/^\/+|\/+$/g, '');
+    return `https://www.estatesales.net/${safePath}`;
+  };
+
   try {
     const permissionResult = await Location.requestForegroundPermissionsAsync();
 
     if (permissionResult.status !== 'granted') {
-      await openExternalLink('https://www.estatesales.net/IL/Chicago');
+      await openExternalLink(buildEstateSalesUrl('IL/Chicago'));
       return;
     }
 
@@ -1007,8 +1109,8 @@ async function openEstateSalesNetLink() {
       longitude: position.coords.longitude,
     });
     const place = reverse?.[0];
-    const estateSalesPath = getEstateSalesNetAreaFromPlace(place);
-    const url = `https://www.estatesales.net/${estateSalesPath}`;
+    const estateSalesPath = getEstateSalesNetPathFromPlace(place);
+    const url = buildEstateSalesUrl(estateSalesPath);
 
     await openExternalLink(url);
   } catch (error) {
@@ -1017,12 +1119,50 @@ async function openEstateSalesNetLink() {
   }
 }
 
-async function openCraigslistGarageSalesLink() {
+async function openCraigslistGarageSalesLink(options?: {
+  dayFilter?: GarageSaleDayFilter;
+  radiusMiles?: GarageSaleRadiusMiles;
+}) {
+  const formatLocalDate = (date: Date) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
+  const getSelectedSaleDate = () => {
+    const selectedDate = new Date();
+    if (options?.dayFilter === 'tomorrow') {
+      selectedDate.setDate(selectedDate.getDate() + 1);
+    }
+    return formatLocalDate(selectedDate);
+  };
+
+  const selectedSaleDate = getSelectedSaleDate();
+  const selectedSearchDistanceMiles = options?.radiusMiles || 25;
+
+  const buildFilteredCraigslistUrl = (area: string, postalCode?: string) => {
+    const params = new URLSearchParams();
+    params.set('sale_date', selectedSaleDate);
+
+    const cleanedPostalCode = String(postalCode || '')
+      .trim()
+      .replace(/[^0-9]/g, '')
+      .slice(0, 5);
+
+    if (cleanedPostalCode) {
+      params.set('search_distance', String(selectedSearchDistanceMiles));
+      params.set('postal', cleanedPostalCode);
+    }
+
+    return `https://${area}.craigslist.org/search/gms?${params.toString()}`;
+  };
+
   try {
     const permissionResult = await Location.requestForegroundPermissionsAsync();
 
     if (permissionResult.status !== 'granted') {
-      await openExternalLink('https://chicago.craigslist.org/search/gms');
+      await openExternalLink(buildFilteredCraigslistUrl('chicago'));
       return;
     }
 
@@ -1033,12 +1173,13 @@ async function openCraigslistGarageSalesLink() {
     });
     const place = reverse?.[0];
     const craigslistArea = getCraigslistAreaFromPlace(place);
-    const url = `https://${craigslistArea}.craigslist.org/search/gms`;
+    const postalCode = place?.postalCode;
+    const url = buildFilteredCraigslistUrl(craigslistArea, postalCode);
 
     await openExternalLink(url);
   } catch (error) {
     console.log('Craigslist garage sale link error:', error);
-    await openExternalLink('https://chicago.craigslist.org/search/gms');
+    await openExternalLink(buildFilteredCraigslistUrl('chicago'));
   }
 }
 
@@ -1292,6 +1433,52 @@ async function searchEbay(
       backendPayload?.message ||
       backendPayload?.error ||
       `Backend eBay search failed with status ${backendResponse.status}`;
+    throw new Error(backendMessage);
+  }
+
+  const backendItems = Array.isArray(backendPayload?.itemSummaries)
+    ? backendPayload.itemSummaries
+    : [];
+
+  return {
+    itemSummaries: backendItems,
+    exactItemSummaries: Array.isArray(backendPayload?.exactItemSummaries)
+      ? backendPayload.exactItemSummaries
+      : backendItems,
+    similarItemSummaries: Array.isArray(backendPayload?.similarItemSummaries)
+      ? backendPayload.similarItemSummaries
+      : [],
+    exactQuery: backendPayload?.exactQuery,
+    broaderQuery: backendPayload?.broaderQuery,
+  };
+}
+
+async function searchEbaySold(
+  query: string,
+  limit = 20,
+): Promise<EbaySearchResponse> {
+  const safeLimit = Math.max(1, Math.min(limit, 50));
+  const cleanedQuery = buildLiveEbayQuery(query);
+  const backendUrl = `${SOLD_EBAY_SEARCH_API_URL}?q=${encodeURIComponent(cleanedQuery)}&limit=${safeLimit}`;
+
+  const backendResponse = await fetch(backendUrl, {
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+
+  let backendPayload: any = null;
+  try {
+    backendPayload = await backendResponse.json();
+  } catch (error) {
+    console.log('Backend eBay sold search did not return JSON.', error);
+  }
+
+  if (!backendResponse.ok) {
+    const backendMessage =
+      backendPayload?.message ||
+      backendPayload?.error ||
+      `Backend eBay sold search failed with status ${backendResponse.status}`;
     throw new Error(backendMessage);
   }
 
@@ -1893,16 +2080,42 @@ function getMedianPrice(values: number[]): number | null {
   return (prices[middle - 1] + prices[middle]) / 2;
 }
 
+function getCleanMarketCompPrices(items: EbaySearchItem[]): number[] {
+  const prices = items
+    .map((item) => getEbayItemPriceValue(item))
+    .filter((value): value is number => value !== null)
+    .filter((value) => value >= 3 && value <= 500)
+    .sort((a, b) => a - b);
+
+  if (prices.length < 5) return prices;
+
+  const median = getMedianPrice(prices);
+  if (!median || median <= 0) return prices;
+
+  // Drop obvious noise before pricing: damaged/parts-like lows, bundles, and inflated highs.
+  // This is intentionally strict because sold-comps can contain weird bundle or typo sales.
+  const lowerBound = median * 0.6;
+  const upperBound = median * 1.6;
+  const filtered = prices.filter(
+    (price) => price >= lowerBound && price <= upperBound,
+  );
+
+  if (filtered.length >= 3) return filtered;
+
+  // Fallback to trimming both ends so one oddball price does not own the estimate.
+  if (prices.length >= 5) {
+    return prices.slice(1, prices.length - 1);
+  }
+
+  return prices;
+}
+
 function getSuggestedPriceRange(
   product: BarcodeProduct | null,
   condition: ListingCondition = 'Used',
   marketItems: EbaySearchItem[] = [],
 ): SuggestedPriceRange {
-  const marketPrices = marketItems
-    .map((item) => getEbayItemPriceValue(item))
-    .filter((value): value is number => value !== null)
-    .filter((value) => value >= 3 && value <= 500)
-    .sort((a, b) => a - b);
+  const marketPrices = getCleanMarketCompPrices(marketItems);
 
   if (marketPrices.length >= 3) {
     const trimmedPrices =
@@ -1918,9 +2131,9 @@ function getSuggestedPriceRange(
       low,
       high,
       target,
-      label: `Median comp price: ${formatPrice(target)}\nRange: ${formatPrice(low)}-${formatPrice(high)}`,
+      label: `Sold comp price: ${formatPrice(target)}\nRange: ${formatPrice(low)}-${formatPrice(high)}`,
       helperText:
-        'Price data only. Check Sold listings to confirm before listing.',
+        'Based on sold comp pricing. Review Sold Listings to confirm before posting.',
       source: 'market',
     };
   }
@@ -1996,8 +2209,8 @@ function getSuggestedPriceRange(
     low,
     high,
     target,
-    label: `Category estimate: ${formatPrice(target)}\nRange: ${formatPrice(low)}-${formatPrice(high)}`,
-    helperText: `${reason} Check sold listings to confirm before listing.`,
+    label: `Fallback estimate: ${formatPrice(target)}\nRange: ${formatPrice(low)}-${formatPrice(high)}`,
+    helperText: `No usable sold comps found yet. ${reason} Tap Sold Listings to review manually before listing.`,
     source: 'category',
   };
 }
@@ -3208,6 +3421,221 @@ function calculatePointDistanceMiles(
   return round2(earthRadiusMiles * c);
 }
 
+function normalizeThriftStoreText(value?: string | null): string {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/\bthe\b/g, ' ')
+    .replace(/\bst\.?\b/g, ' saint ')
+    .replace(/\bave\.?\b/g, ' avenue ')
+    .replace(/\brd\.?\b/g, ' road ')
+    .replace(/\bdr\.?\b/g, ' drive ')
+    .replace(/\bblvd\.?\b/g, ' boulevard ')
+    .replace(/\bste\.?\b/g, ' suite ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeThriftStoreName(value?: string | null): string {
+  return normalizeThriftStoreText(value)
+    .replace(
+      /\bsalvation army family store and donation center\b/g,
+      'salvation army',
+    )
+    .replace(/\bsalvation army family store\b/g, 'salvation army')
+    .replace(/\bsalvation army thrift store\b/g, 'salvation army')
+    .replace(/\bsalvation army store\b/g, 'salvation army')
+    .replace(/\bgoodwill store and donation center\b/g, 'goodwill')
+    .replace(/\bgoodwill store\b/g, 'goodwill')
+    .replace(/\bgoodwill industries\b/g, 'goodwill')
+    .replace(/\bfamily store\b/g, ' ')
+    .replace(/\bdonation center\b/g, ' ')
+    .replace(/\bdonation centre\b/g, ' ')
+    .replace(/\bthrift store\b/g, ' ')
+    .replace(/\bresale shop\b/g, ' ')
+    .replace(/\bsecond hand store\b/g, ' ')
+    .replace(/\bstore\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getThriftNameTokens(value?: string | null): string[] {
+  return normalizeThriftStoreName(value)
+    .split(' ')
+    .filter((part) => part.length >= 3);
+}
+
+function haveStrongThriftNameMatch(
+  aTitle?: string | null,
+  bTitle?: string | null,
+): boolean {
+  const aName = normalizeThriftStoreName(aTitle);
+  const bName = normalizeThriftStoreName(bTitle);
+
+  if (!aName || !bName) return false;
+  if (aName === bName) return true;
+  if (aName.includes(bName) || bName.includes(aName)) return true;
+
+  const aTokens = getThriftNameTokens(aTitle);
+  const bTokens = getThriftNameTokens(bTitle);
+  const sharedTokens = aTokens.filter((token) => bTokens.includes(token));
+
+  return sharedTokens.length >= 2;
+}
+
+function normalizeThriftStreetAddress(value?: string | null): string {
+  return normalizeThriftStoreText(value)
+    .replace(/\bunit\s+[a-z0-9-]+\b/g, ' ')
+    .replace(/\bsuite\s+[a-z0-9-]+\b/g, ' ')
+    .replace(/\bapt\s+[a-z0-9-]+\b/g, ' ')
+    .replace(/\bdepartment\s+store\b/g, ' ')
+    .replace(/\busa\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getThriftPinQualityScore(pin: GarageSaleMapPin): number {
+  let score = 0;
+
+  if (pin.openingHours && pin.openingHours !== 'Hours not listed') score += 8;
+  if (pin.phone) score += 5;
+  if (pin.website && !/google\.com\/search/i.test(pin.website)) score += 5;
+  if (pin.displayAddress && !/tap map/i.test(pin.displayAddress)) score += 4;
+  if (pin.addressLabel && !/address not provided/i.test(pin.addressLabel))
+    score += 4;
+  if (/verified/i.test(String(pin.source || ''))) score += 3;
+  if (/fallback/i.test(String(pin.source || ''))) score += 2;
+
+  return score;
+}
+
+function areLikelySameThriftStore(
+  a: GarageSaleMapPin,
+  b: GarageSaleMapPin,
+): boolean {
+  if (a.saleType !== 'thrift' || b.saleType !== 'thrift') return false;
+  if (!haveStrongThriftNameMatch(a.title, b.title)) return false;
+
+  const aAddress = normalizeThriftStreetAddress(
+    a.displayAddress || a.addressLabel || a.mapAddress || a.mapsQuery,
+  );
+  const bAddress = normalizeThriftStreetAddress(
+    b.displayAddress || b.addressLabel || b.mapAddress || b.mapsQuery,
+  );
+
+  if (aAddress && bAddress) {
+    const aStreetNumber = aAddress.match(/\b\d{2,6}\b/)?.[0] || '';
+    const bStreetNumber = bAddress.match(/\b\d{2,6}\b/)?.[0] || '';
+    const sameStreetNumber = aStreetNumber && aStreetNumber === bStreetNumber;
+    const aStreetWords = aAddress
+      .split(' ')
+      .filter((part) => part.length > 3 && !/^\d+$/.test(part));
+    const bStreetWords = bAddress
+      .split(' ')
+      .filter((part) => part.length > 3 && !/^\d+$/.test(part));
+    const sharedStreetWords = aStreetWords.filter((part) =>
+      bStreetWords.includes(part),
+    );
+    const sameStreetText =
+      aAddress.includes(bAddress) ||
+      bAddress.includes(aAddress) ||
+      (sameStreetNumber && sharedStreetWords.length >= 1);
+
+    if (sameStreetText) return true;
+  }
+
+  const distanceBetweenPins = calculatePointDistanceMiles(
+    a.latitude,
+    a.longitude,
+    b.latitude,
+    b.longitude,
+  );
+
+  // OpenStreetMap can return the same large store as a shop node, a building/way,
+  // and a fallback record. For thrift stores with the same brand/name, anything
+  // this close is effectively the same place to the user.
+  return (
+    Number.isFinite(distanceBetweenPins) && Number(distanceBetweenPins) <= 0.35
+  );
+}
+
+function mergeThriftPins(
+  primary: GarageSaleMapPin,
+  secondary: GarageSaleMapPin,
+): GarageSaleMapPin {
+  const best =
+    getThriftPinQualityScore(secondary) > getThriftPinQualityScore(primary)
+      ? secondary
+      : primary;
+  const other = best === primary ? secondary : primary;
+
+  const openingHours = best.openingHours || other.openingHours || '';
+  const timeLabel =
+    openingHours ||
+    (best.timeLabel && best.timeLabel !== 'Hours not listed'
+      ? best.timeLabel
+      : other.timeLabel || best.timeLabel || 'Hours not listed');
+
+  const addressLabel =
+    best.addressLabel && best.addressLabel !== 'Address not provided'
+      ? best.addressLabel
+      : other.addressLabel || best.addressLabel;
+  const displayAddress =
+    best.displayAddress && !/tap map/i.test(best.displayAddress)
+      ? best.displayAddress
+      : other.displayAddress || best.displayAddress;
+  const mapAddress = best.mapAddress || other.mapAddress;
+  const mapsQuery = best.mapsQuery || other.mapsQuery;
+  const website =
+    best.website && !/google\.com\/search/i.test(best.website)
+      ? best.website
+      : other.website || best.website;
+  const sourceParts = [best.source, other.source]
+    .filter(Boolean)
+    .map((value) => String(value).trim())
+    .filter((value, index, arr) => value && arr.indexOf(value) === index);
+
+  return {
+    ...best,
+    addressLabel,
+    displayAddress,
+    mapAddress,
+    mapsQuery,
+    query:
+      `${best.title} ${mapsQuery || displayAddress || addressLabel}`.trim(),
+    openingHours,
+    timeLabel,
+    phone: best.phone || other.phone,
+    website,
+    source: sourceParts.join(' + '),
+    notes: best.notes || other.notes,
+  };
+}
+
+function dedupeThriftStorePins(pins: GarageSaleMapPin[]): GarageSaleMapPin[] {
+  const deduped: GarageSaleMapPin[] = [];
+
+  pins.forEach((pin) => {
+    if (pin.saleType !== 'thrift') {
+      deduped.push(pin);
+      return;
+    }
+
+    const existingIndex = deduped.findIndex((existing) =>
+      areLikelySameThriftStore(existing, pin),
+    );
+
+    if (existingIndex >= 0) {
+      deduped[existingIndex] = mergeThriftPins(deduped[existingIndex], pin);
+    } else {
+      deduped.push(pin);
+    }
+  });
+
+  return deduped;
+}
+
 function getGarageSaleDayFilterLabel(dayFilter: GarageSaleDayFilter) {
   switch (dayFilter) {
     case 'today':
@@ -3772,10 +4200,7 @@ function shouldShowGarageSaleProbableBadge(pin: GarageSaleMapPin) {
 }
 
 function getGarageSaleCompactMeta(pin: GarageSaleMapPin) {
-  return [
-    pin.saleType === 'estate' ? 'Estate Sale' : 'Garage Sale',
-    pin.distanceLabel,
-  ]
+  return [getGarageSaleTypeLabel(pin.saleType), pin.distanceLabel]
     .filter(Boolean)
     .join(' • ');
 }
@@ -6023,6 +6448,33 @@ export default function HomeScreen() {
     });
   };
 
+  useEffect(() => {
+    let isMounted = true;
+
+    AsyncStorage.getItem(HELPER_TIPS_STORAGE_KEY)
+      .then((storedValue) => {
+        if (!isMounted || storedValue === null) return;
+        setHelperTipsEnabled(storedValue === 'true');
+      })
+      .catch((error) => {
+        console.log('Helper tips preference load error:', error);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleHelperTipsToggle = (value: boolean) => {
+    setHelperTipsEnabled(value);
+    AsyncStorage.setItem(
+      HELPER_TIPS_STORAGE_KEY,
+      value ? 'true' : 'false',
+    ).catch((error) => {
+      console.log('Helper tips preference save error:', error);
+    });
+  };
+
   const scrollGarageSaleCardToTop = (
     saleId: string,
     attempt = 0,
@@ -6051,6 +6503,7 @@ export default function HomeScreen() {
   const [step, setStep] = useState<AppStep>('referencePicker');
   const [homeMode, setHomeMode] = useState<HomeMode>('boxFinder');
   const [homeScanMode, setHomeScanMode] = useState<HomeScanMode>('list');
+  const [helperTipsEnabled, setHelperTipsEnabled] = useState(true);
   const [weatherData, setWeatherData] = useState<SourcingWeather | null>(null);
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherError, setWeatherError] = useState<string | null>(null);
@@ -6119,6 +6572,12 @@ export default function HomeScreen() {
     type: 'success' | 'error' | 'info';
     message: string;
   } | null>(null);
+  const [bugReportMessage, setBugReportMessage] = useState('');
+  const [bugReportEmail, setBugReportEmail] = useState('');
+  const [bugReportType, setBugReportType] = useState<'bug' | 'suggestion'>(
+    'bug',
+  );
+  const [isSubmittingBugReport, setIsSubmittingBugReport] = useState(false);
 
   const [listingPlatform, setListingPlatform] =
     useState<ListingPlatform>('ebay');
@@ -6163,7 +6622,7 @@ export default function HomeScreen() {
   const [garageSalesError, setGarageSalesError] = useState<string | null>(null);
   const [garageFinderMode, setGarageFinderMode] = useState<FinderMode>('sales');
   const [garageSaleRadiusMiles, setGarageSaleRadiusMiles] =
-    useState<GarageSaleRadiusMiles>(5);
+    useState<GarageSaleRadiusMiles>(25);
   const [garageSaleDayFilter, setGarageSaleDayFilter] =
     useState<GarageSaleDayFilter>(getTodayDayFilter());
   const [visibleGarageSalesCount, setVisibleGarageSalesCount] = useState(10);
@@ -6180,6 +6639,7 @@ export default function HomeScreen() {
   const [ebaySimilarResults, setEbaySimilarResults] = useState<
     EbaySearchItem[]
   >([]);
+  const [ebaySoldResults, setEbaySoldResults] = useState<EbaySearchItem[]>([]);
   const [ebayLoading, setEbayLoading] = useState(false);
   const [ebayError, setEbayError] = useState<string | null>(null);
   const [ebayQueryLabel, setEbayQueryLabel] = useState('');
@@ -6194,7 +6654,7 @@ export default function HomeScreen() {
 
     setHomeMode('boxFinder');
     setGarageFinderMode('sales');
-    setGarageSaleRadiusMiles(5);
+    setGarageSaleRadiusMiles(25);
     setGarageSaleDayFilter(getTodayDayFilter());
     setSelectedGarageSalePinId(null);
     setVisibleGarageSalesCount(10);
@@ -6553,8 +7013,8 @@ export default function HomeScreen() {
         'success',
         exists
           ? `${getFinderSavedItemLabel(garageFinderMode)} is showing again`
-          : `${getFinderSavedItemLabel(garageFinderMode)} hidden from this list`,
-        1400,
+          : `${getFinderSavedItemLabel(garageFinderMode)} hidden. Tap Start Fresh to bring it back.`,
+        3000,
       );
     } catch (error) {
       console.log('Failed to toggle garage sale favorite', error);
@@ -6736,6 +7196,13 @@ export default function HomeScreen() {
       setGarageSalesError(null);
 
       if (garageFinderMode === 'thrift') {
+        console.log('List Assist thrift search location/radius:', {
+          latitude: weatherData?.latitude,
+          longitude: weatherData?.longitude,
+          radiusMiles: garageSaleRadiusMiles,
+          locationLabel: weatherData?.locationLabel,
+        });
+
         if (
           !Number.isFinite(weatherData?.latitude as number) ||
           !Number.isFinite(weatherData?.longitude as number)
@@ -6750,7 +7217,7 @@ export default function HomeScreen() {
         const thriftCacheTtlMs = 6 * 60 * 60 * 1000;
         const cacheLatitude = Number(weatherData?.latitude).toFixed(3);
         const cacheLongitude = Number(weatherData?.longitude).toFixed(3);
-        const thriftCacheKey = `listassist_thrift_cache_${cacheLatitude}_${cacheLongitude}_${garageSaleRadiusMiles}`;
+        const thriftCacheKey = `listassist_thrift_cache_v5_google_${cacheLatitude}_${cacheLongitude}_${garageSaleRadiusMiles}`;
 
         if (forceRefresh) {
           await AsyncStorage.removeItem(thriftCacheKey);
@@ -6783,10 +7250,18 @@ export default function HomeScreen() {
           return;
         }
 
+        const thriftResultLimit =
+          garageSaleRadiusMiles >= 50
+            ? 75
+            : garageSaleRadiusMiles >= 25
+              ? 50
+              : 30;
         const params = new URLSearchParams({
           latitude: String(weatherData?.latitude),
           longitude: String(weatherData?.longitude),
           radiusMiles: String(garageSaleRadiusMiles),
+          limit: String(thriftResultLimit),
+          maxResults: String(thriftResultLimit),
         });
 
         const response = await fetch(
@@ -6936,52 +7411,44 @@ export default function HomeScreen() {
               source,
             } satisfies GarageSaleMapPin;
           })
-          .filter((pin): pin is GarageSaleMapPin => pin !== null)
-          .filter(
-            (pin, index, arr) =>
-              index ===
-              arr.findIndex(
-                (other) =>
-                  other.title === pin.title &&
-                  other.addressLabel === pin.addressLabel,
-              ),
-          )
-          .sort((a, b) => {
-            const aDistance = Number.isFinite(a.distanceMiles as number)
-              ? Number(a.distanceMiles)
-              : 9999;
-            const bDistance = Number.isFinite(b.distanceMiles as number)
-              ? Number(b.distanceMiles)
-              : 9999;
-            return aDistance - bDistance || a.title.localeCompare(b.title);
-          });
+          .filter((pin): pin is GarageSaleMapPin => pin !== null);
 
-        if (!thriftPins.length) {
-          const fallbackPins = buildLocalThriftFallbackPins({
-            originLatitude: weatherData?.latitude,
-            originLongitude: weatherData?.longitude,
-            radiusMiles: garageSaleRadiusMiles,
-          });
+        const dedupedBackendThriftPins = dedupeThriftStorePins(thriftPins);
 
-          if (fallbackPins.length) {
-            applyGarageSalePins(fallbackPins);
-            setGarageSalesError(null);
-            return;
-          }
+        const fallbackPins = buildLocalThriftFallbackPins({
+          originLatitude: weatherData?.latitude,
+          originLongitude: weatherData?.longitude,
+          radiusMiles: garageSaleRadiusMiles,
+        });
 
+        console.log('List Assist thrift backend count:', {
+          requestedLimit: thriftResultLimit,
+          backendStores: stores.length,
+          mappedPins: thriftPins.length,
+          dedupedBackendPins: dedupedBackendThriftPins.length,
+          fallbackPins: fallbackPins.length,
+          radiusMiles: garageSaleRadiusMiles,
+        });
+
+        const combinedThriftPins = filterGarageSalePinsByRadius(
+          dedupeThriftStorePins([...dedupedBackendThriftPins, ...fallbackPins]),
+          garageSaleRadiusMiles,
+        );
+
+        if (!combinedThriftPins.length) {
           setGarageSalePins([]);
           setGarageSalesError(
-            'No nearby thrift stores were found for this area yet.',
+            `No thrift stores were found within ${garageSaleRadiusMiles} miles. Try a larger radius.`,
           );
           return;
         }
 
         await AsyncStorage.setItem(
           thriftCacheKey,
-          JSON.stringify({ timestamp: Date.now(), pins: thriftPins }),
+          JSON.stringify({ timestamp: Date.now(), pins: combinedThriftPins }),
         );
 
-        applyGarageSalePins(thriftPins);
+        applyGarageSalePins(combinedThriftPins);
         setGarageSalesError(null);
         return;
       }
@@ -7392,6 +7859,20 @@ export default function HomeScreen() {
       const result = await searchEbay(query, 10);
       console.log('eBay live search result:', result);
 
+      let soldItems: EbaySearchItem[] = [];
+      try {
+        const soldResult = await searchEbaySold(query, 20);
+        console.log('eBay sold search result:', soldResult);
+        soldItems = Array.isArray(soldResult?.itemSummaries)
+          ? soldResult.itemSummaries
+          : [];
+      } catch (soldError) {
+        console.log(
+          'eBay sold search failed, live results still loaded:',
+          soldError,
+        );
+      }
+
       const items = Array.isArray(result?.itemSummaries)
         ? result.itemSummaries
         : [];
@@ -7405,6 +7886,7 @@ export default function HomeScreen() {
       setEbayResults(items);
       setEbayExactResults(exactItems);
       setEbaySimilarResults(similarItems);
+      setEbaySoldResults(soldItems);
       setEbayQueryLabel(result?.exactQuery || query);
       setEbayBroaderQueryLabel(result?.broaderQuery || '');
 
@@ -7413,13 +7895,14 @@ export default function HomeScreen() {
           ? 'eBay search complete'
           : 'eBay test complete',
         similarItems.length
-          ? `Found ${exactItems.length} exact and ${similarItems.length} similar item(s).`
-          : `Found ${items.length} item(s) for "${query}".`,
+          ? `Found ${exactItems.length} exact, ${similarItems.length} similar, and ${soldItems.length} sold comp(s).`
+          : `Found ${items.length} live item(s) and ${soldItems.length} sold comp(s) for "${query}".`,
       );
     } catch (error) {
       console.error('eBay live search failed:', error);
       setEbayExactResults([]);
       setEbaySimilarResults([]);
+      setEbaySoldResults([]);
       setEbayError('Could not load eBay results.');
       Alert.alert('eBay Error', 'Could not load eBay results.');
     } finally {
@@ -7761,6 +8244,7 @@ Barcode not found, try Box instead.`,
         'List Assist could not identify that box front yet. Box not found, try Item instead.',
     });
     setBarcodeProduct(null);
+    setEbaySoldResults([]);
     setPackageFrontCandidateProduct(null);
     setUserError('');
     resetPackageFrontLookup();
@@ -7915,6 +8399,7 @@ Barcode not found, try Box instead.`,
     }
 
     setBarcodeProduct(null);
+    setEbaySoldResults([]);
     setPackageFrontCandidateProduct(null);
     resetBarcodeScannerState();
     setUserError('');
@@ -7947,6 +8432,7 @@ Barcode not found, try Box instead.`,
     }
 
     setBarcodeProduct(null);
+    setEbaySoldResults([]);
     resetBarcodeScannerState();
     resetPackageFrontLookup();
     resetLooseItemLookup();
@@ -10045,6 +10531,235 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
     );
   };
 
+  const submitBugReport = async () => {
+    const trimmedMessage = bugReportMessage.trim();
+    const trimmedEmail = bugReportEmail.trim();
+
+    if (trimmedMessage.length < 5) {
+      Alert.alert(
+        'Add a few details',
+        'Please tell me what happened or what you would like to see added.',
+      );
+      return;
+    }
+
+    if (trimmedEmail && !/^\S+@\S+\.\S+$/.test(trimmedEmail)) {
+      Alert.alert('Check email', 'That email address does not look right.');
+      return;
+    }
+
+    try {
+      setIsSubmittingBugReport(true);
+
+      const response = await fetch(`${LOCAL_BACKEND_BASE_URL}/api/bug-report`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: bugReportType,
+          message: trimmedMessage,
+          email: trimmedEmail,
+          appName: 'List Assist',
+          appVersion: '1.0.0',
+          screen: step,
+          homeMode,
+          homeScanMode,
+          finderMode: garageFinderMode,
+          radiusMiles: garageSaleRadiusMiles,
+          createdAt: new Date().toISOString(),
+        }),
+      });
+
+      let payload: any = null;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        throw new Error(payload?.error || 'Bug report failed');
+      }
+
+      setBugReportMessage('');
+      setBugReportEmail('');
+      setBugReportType('bug');
+      setSuccessMessage('Thanks — your report was sent.');
+      setStep('referencePicker');
+      scrollToTop();
+      setTimeout(() => setSuccessMessage(''), 2500);
+    } catch (error) {
+      console.log('Bug report submit error:', error);
+      Alert.alert(
+        'Could not send',
+        'The report did not send. Please try again when you have a connection.',
+      );
+    } finally {
+      setIsSubmittingBugReport(false);
+    }
+  };
+
+  const renderBugReport = () => {
+    const isSuggestion = bugReportType === 'suggestion';
+
+    return (
+      <SafeAreaView style={styles.screen}>
+        <ScrollView
+          ref={activeScrollRef}
+          style={styles.flexFill}
+          contentContainerStyle={styles.packageFrontScrollContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator
+          contentInsetAdjustmentBehavior="automatic"
+        >
+          <Text style={styles.title}>Report a Bug / Suggestion</Text>
+
+          <View style={styles.resultCard}>
+            <Text style={styles.resultValueSmall}>How can I help?</Text>
+            <Text style={[styles.resultDescription, { marginTop: 8 }]}>
+              Send a bug, problem, or idea straight from List Assist. Your email
+              is optional, but include it if you want a follow-up.
+            </Text>
+
+            <View
+              style={{
+                flexDirection: 'row',
+                backgroundColor: '#E5E7EB',
+                borderRadius: 999,
+                padding: 4,
+                marginTop: 18,
+              }}
+            >
+              <TouchableOpacity
+                style={{
+                  flex: 1,
+                  paddingVertical: 10,
+                  borderRadius: 999,
+                  alignItems: 'center',
+                  backgroundColor: !isSuggestion ? '#DC2626' : 'transparent',
+                }}
+                onPress={() => setBugReportType('bug')}
+                activeOpacity={0.8}
+              >
+                <Text
+                  style={{
+                    color: !isSuggestion ? '#fff' : '#374151',
+                    fontWeight: '800',
+                  }}
+                >
+                  Bug
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={{
+                  flex: 1,
+                  paddingVertical: 10,
+                  borderRadius: 999,
+                  alignItems: 'center',
+                  backgroundColor: isSuggestion ? '#2563EB' : 'transparent',
+                }}
+                onPress={() => setBugReportType('suggestion')}
+                activeOpacity={0.8}
+              >
+                <Text
+                  style={{
+                    color: isSuggestion ? '#fff' : '#374151',
+                    fontWeight: '800',
+                  }}
+                >
+                  Suggestion
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <View style={styles.resultCard}>
+            <Text style={styles.resultLabel}>Message</Text>
+            <TextInput
+              value={bugReportMessage}
+              onChangeText={setBugReportMessage}
+              placeholder={
+                isSuggestion
+                  ? 'What would make List Assist better?'
+                  : 'What happened? What screen were you on?'
+              }
+              placeholderTextColor="#9CA3AF"
+              multiline
+              textAlignVertical="top"
+              style={{
+                minHeight: 150,
+                borderWidth: 1,
+                borderColor: '#D1D5DB',
+                borderRadius: 16,
+                padding: 14,
+                marginTop: 10,
+                fontSize: 16,
+                lineHeight: 22,
+                color: '#111827',
+                backgroundColor: '#F9FAFB',
+              }}
+            />
+
+            <Text style={[styles.resultLabel, { marginTop: 18 }]}>
+              Email optional
+            </Text>
+            <TextInput
+              value={bugReportEmail}
+              onChangeText={setBugReportEmail}
+              placeholder="you@example.com"
+              placeholderTextColor="#9CA3AF"
+              autoCapitalize="none"
+              keyboardType="email-address"
+              style={{
+                borderWidth: 1,
+                borderColor: '#D1D5DB',
+                borderRadius: 16,
+                padding: 14,
+                marginTop: 10,
+                fontSize: 16,
+                color: '#111827',
+                backgroundColor: '#F9FAFB',
+              }}
+            />
+          </View>
+
+          <TouchableOpacity
+            style={[
+              styles.primaryButton,
+              {
+                marginTop: 4,
+                backgroundColor: isSubmittingBugReport ? '#94A3B8' : '#2563EB',
+              },
+            ]}
+            onPress={submitBugReport}
+            disabled={isSubmittingBugReport}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.primaryButtonText}>
+              {isSubmittingBugReport ? 'Sending...' : 'Send Report'}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.secondaryButton, { marginTop: 12 }]}
+            onPress={() => {
+              setStep('referencePicker');
+              scrollToTop();
+            }}
+            activeOpacity={0.75}
+          >
+            <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
+              Back to Home
+            </Text>
+          </TouchableOpacity>
+        </ScrollView>
+        {renderProcessingOverlay()}
+      </SafeAreaView>
+    );
+  };
+
   // ===== GARAGE SALE PHASE 1: HOME SCREEN UI START =====
   const renderReferencePicker = () => {
     const isSourcingOnly = homeMode === 'dealFinder';
@@ -10217,6 +10932,28 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                   </Text>
                 </TouchableOpacity>
               </View>
+
+              <TouchableOpacity
+                style={[
+                  styles.secondaryButton,
+                  {
+                    marginTop: 6,
+                    backgroundColor: '#EFF6FF',
+                    borderColor: '#BFDBFE',
+                  },
+                ]}
+                onPress={() => {
+                  setStep('bugReport');
+                  scrollToTop();
+                }}
+                activeOpacity={0.75}
+              >
+                <Text
+                  style={[styles.secondaryButtonText, { color: '#1D4ED8' }]}
+                >
+                  🐞 Report a Bug / Suggestion
+                </Text>
+              </TouchableOpacity>
             </>
           ) : (
             <>
@@ -10230,6 +10967,30 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                 <Text style={styles.headerTitle}>List Assist</Text>
               </View>
               <Text style={styles.subtitle}></Text>
+
+              <View style={styles.helperTipsToggleRow}>
+                <View>
+                  <Text style={styles.helperTipsToggleTitle}>Helper Tips</Text>
+                  <Text style={styles.helperTipsToggleSubtitle}>
+                    Show button hints while learning the app
+                  </Text>
+                </View>
+                <Switch
+                  value={helperTipsEnabled}
+                  onValueChange={handleHelperTipsToggle}
+                  trackColor={{ false: '#D1D5DB', true: '#BBF7D0' }}
+                  thumbColor={helperTipsEnabled ? '#22C55E' : '#F9FAFB'}
+                  ios_backgroundColor="#D1D5DB"
+                />
+              </View>
+
+              {helperTipsEnabled ? (
+                <View style={[styles.homeHelperTip, styles.homeHelperTipRight]}>
+                  <Text style={styles.homeHelperTipText}>
+                    ↓ Choose how you want to start
+                  </Text>
+                </View>
+              ) : null}
 
               <View
                 style={{
@@ -10290,9 +11051,15 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               </View>
 
               <View style={styles.resultCard}>
-                <Text style={styles.resultValueSmall}>
-                  Scan Barcode, Box, or Item
-                </Text>
+                {helperTipsEnabled ? (
+                  <View
+                    style={[styles.homeHelperTip, styles.homeHelperTipCenter]}
+                  >
+                    <Text style={styles.homeHelperTipText}>
+                      Scan any barcode, box, or item to get started. ↓
+                    </Text>
+                  </View>
+                ) : null}
 
                 {barcodeFailureState ? (
                   <View
@@ -10310,14 +11077,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                   </View>
                 ) : null}
 
-                <View
-                  style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    gap: 10,
-                    marginTop: 12,
-                  }}
-                >
+                <View style={styles.homeActionButtonRow}>
                   <Animated.View
                     style={{
                       flex: 1,
@@ -10326,14 +11086,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                   >
                     <TouchableOpacity
                       style={[
-                        styles.primaryButton,
-                        {
-                          height: 48,
-                          justifyContent: 'center',
-                          alignItems: 'center',
-                          marginTop: 0,
-                          paddingHorizontal: 8,
-                        },
+                        styles.homeActionButton,
+                        styles.homeBarcodeButton,
                       ]}
                       onPress={() => {
                         setHomeMode('boxFinder');
@@ -10354,13 +11108,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                       }}
                       activeOpacity={0.85}
                     >
-                      <Text
-                        style={styles.splitActionButtonText}
-                        numberOfLines={1}
-                        adjustsFontSizeToFit
-                      >
-                        Barcode
-                      </Text>
+                      <Text style={styles.homeActionButtonIcon}>▦</Text>
+                      <Text style={styles.homeActionButtonText}>Barcode</Text>
                     </TouchableOpacity>
                   </Animated.View>
 
@@ -10371,18 +11120,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                     }}
                   >
                     <TouchableOpacity
-                      style={[
-                        styles.secondaryButton,
-                        {
-                          height: 48,
-                          justifyContent: 'center',
-                          alignItems: 'center',
-                          marginTop: 0,
-                          paddingHorizontal: 8,
-                          backgroundColor: '#0F766E',
-                          borderColor: '#0F766E',
-                        },
-                      ]}
+                      style={[styles.homeActionButton, styles.homeBoxButton]}
                       onPress={() => {
                         setHomeMode('boxFinder');
                         setIsPriceCheckerSession(homeScanMode === 'source');
@@ -10402,13 +11140,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                       }}
                       activeOpacity={0.85}
                     >
-                      <Text
-                        style={[styles.secondaryButtonText, { color: '#fff' }]}
-                        numberOfLines={1}
-                        adjustsFontSizeToFit
-                      >
-                        Box
-                      </Text>
+                      <Text style={styles.homeActionButtonIcon}>▣</Text>
+                      <Text style={styles.homeActionButtonText}>Box</Text>
                     </TouchableOpacity>
                   </Animated.View>
 
@@ -10419,18 +11152,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                     }}
                   >
                     <TouchableOpacity
-                      style={[
-                        styles.secondaryButton,
-                        {
-                          height: 48,
-                          justifyContent: 'center',
-                          alignItems: 'center',
-                          marginTop: 0,
-                          paddingHorizontal: 8,
-                          backgroundColor: '#2DBE60',
-                          borderColor: '#2DBE60',
-                        },
-                      ]}
+                      style={[styles.homeActionButton, styles.homeItemButton]}
                       onPress={() => {
                         setHomeMode('boxFinder');
                         setIsPriceCheckerSession(homeScanMode === 'source');
@@ -10450,13 +11172,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                       }}
                       activeOpacity={0.85}
                     >
-                      <Text
-                        style={[styles.secondaryButtonText, { color: '#fff' }]}
-                        numberOfLines={1}
-                        adjustsFontSizeToFit
-                      >
-                        Item
-                      </Text>
+                      <Text style={styles.homeActionButtonIcon}>🏷</Text>
+                      <Text style={styles.homeActionButtonText}>Item</Text>
                     </TouchableOpacity>
                   </Animated.View>
                 </View>
@@ -10464,7 +11181,13 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
 
               {homeScanMode === 'source' ? (
                 <View style={[styles.resultCard, { marginTop: 18 }]}>
-                  <Text style={styles.sectionLabel}>Find Deals Near You</Text>
+                  <Text style={styles.sectionLabel}>
+                    {helperTipsEnabled && (
+                      <Text style={{ marginBottom: 10, fontWeight: '600' }}>
+                        Find deals near you. ↓
+                      </Text>
+                    )}
+                  </Text>
 
                   <TouchableOpacity
                     style={[
@@ -10542,8 +11265,6 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                 </View>
               ) : (
                 <View style={[styles.resultCard, { marginTop: 22 }]}>
-                  <Text style={styles.sectionLabel}>Seller Resources</Text>
-
                   <View
                     style={{
                       height: 1,
@@ -10553,31 +11274,50 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                     }}
                   />
 
+                  {helperTipsEnabled ? (
+                    <View
+                      style={[styles.homeHelperTip, styles.homeHelperTipCenter]}
+                    >
+                      <Text style={styles.homeHelperTipText}>
+                        Access helpful tools and resources. ↓
+                      </Text>
+                    </View>
+                  ) : null}
+
                   <TouchableOpacity
-                    style={[
-                      styles.secondaryButton,
-                      {
-                        height: 48,
-                        justifyContent: 'center',
-                        alignItems: 'center',
-                      },
-                      {
-                        marginTop: 0,
-                        backgroundColor: '#7C3AED',
-                        borderColor: '#7C3AED',
-                        paddingVertical: 12,
-                      },
-                    ]}
+                    style={styles.homeSellerToolsButton}
                     onPress={() => {
                       setStep('sellerTools');
                       scrollToTop();
                     }}
-                    activeOpacity={0.75}
+                    activeOpacity={0.82}
                   >
-                    <Text
-                      style={[styles.secondaryButtonText, { color: '#fff' }]}
-                    >
+                    <Text style={styles.homeSellerToolsIcon}>🧰</Text>
+                    <Text style={styles.homeSellerToolsText}>
                       Recommended Seller Tools
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.homeSellerToolsButton,
+                      {
+                        marginTop: 14,
+                        backgroundColor: '#EFF6FF',
+                        borderColor: '#BFDBFE',
+                      },
+                    ]}
+                    onPress={() => {
+                      setStep('bugReport');
+                      scrollToTop();
+                    }}
+                    activeOpacity={0.82}
+                  >
+                    <Text style={styles.homeSellerToolsIcon}>🐞</Text>
+                    <Text
+                      style={[styles.homeSellerToolsText, { color: '#1D4ED8' }]}
+                    >
+                      Report a Bug / Suggestion
                     </Text>
                   </TouchableOpacity>
                 </View>
@@ -10785,16 +11525,9 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
   const renderInlineSourceScanCard = (returnStep: AppStep) => {
     return (
       <View style={styles.resultCard}>
-        <Text style={styles.resultDescription}>
-          Scan Barcode, Box, or Item.
-        </Text>
-
-        <View style={styles.priceCheckerScanRow}>
+        <View style={styles.homeActionButtonRow}>
           <TouchableOpacity
-            style={[
-              styles.priceCheckerScanButton,
-              { backgroundColor: '#1E2F4D' },
-            ]}
+            style={[styles.homeActionButton, styles.homeBarcodeButton]}
             onPress={() => {
               setPriceCheckerReturnStep(returnStep);
               setIsPriceCheckerSession(true);
@@ -10803,14 +11536,12 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             }}
             activeOpacity={0.85}
           >
-            <Text style={styles.priceCheckerScanButtonText}>Barcode</Text>
+            <Text style={styles.homeActionButtonIcon}>▦</Text>
+            <Text style={styles.homeActionButtonText}>Barcode</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={[
-              styles.priceCheckerScanButton,
-              { backgroundColor: '#157A74' },
-            ]}
+            style={[styles.homeActionButton, styles.homeBoxButton]}
             onPress={() => {
               setPriceCheckerReturnStep(returnStep);
               setIsPriceCheckerSession(true);
@@ -10819,14 +11550,12 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             }}
             activeOpacity={0.85}
           >
-            <Text style={styles.priceCheckerScanButtonText}>Box</Text>
+            <Text style={styles.homeActionButtonIcon}>▣</Text>
+            <Text style={styles.homeActionButtonText}>Box</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={[
-              styles.priceCheckerScanButton,
-              { backgroundColor: '#24C55A' },
-            ]}
+            style={[styles.homeActionButton, styles.homeItemButton]}
             onPress={() => {
               setPriceCheckerReturnStep(returnStep);
               setIsPriceCheckerSession(true);
@@ -10835,7 +11564,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             }}
             activeOpacity={0.85}
           >
-            <Text style={styles.priceCheckerScanButtonText}>Item</Text>
+            <Text style={styles.homeActionButtonIcon}>🏷️</Text>
+            <Text style={styles.homeActionButtonText}>Item</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -10860,20 +11590,134 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           {renderLandingWeatherCard()}
 
           <View style={styles.resultCard}>
-            <Text style={styles.resultValueSmall}>
-              Craigslist for {locationLabel}
-            </Text>
+            {helperTipsEnabled ? (
+              <View style={[styles.homeHelperTip, styles.homeHelperTipCenter]}>
+                <Text style={styles.homeHelperTipText}>
+                  📍 Craigslist for {locationLabel}
+                </Text>
+              </View>
+            ) : null}
+
+            <View
+              style={{
+                marginTop: helperTipsEnabled ? 14 : 0,
+                marginBottom: 14,
+                gap: 12,
+              }}
+            >
+              {helperTipsEnabled ? (
+                <View
+                  style={[styles.homeHelperTip, styles.homeHelperTipCenter]}
+                >
+                  <Text style={styles.homeHelperTipText}>
+                    Choose the day you want to source.
+                  </Text>
+                </View>
+              ) : null}
+
+              <View
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: 8,
+                }}
+              >
+                {garageSaleDayOptions.map((dayOption) => {
+                  const isActive = garageSaleDayFilter === dayOption;
+
+                  return (
+                    <TouchableOpacity
+                      key={`craigslist-day-${dayOption}`}
+                      style={{
+                        flex: 1,
+                        paddingVertical: 10,
+                        borderRadius: 999,
+                        backgroundColor: isActive ? '#0f172a' : '#f8fafc',
+                        borderWidth: 1,
+                        borderColor: isActive ? '#0f172a' : '#cbd5e1',
+                        alignItems: 'center',
+                      }}
+                      onPress={() => setGarageSaleDayFilter(dayOption)}
+                      activeOpacity={0.8}
+                    >
+                      <Text
+                        style={{
+                          color: isActive ? '#ffffff' : '#334155',
+                          fontWeight: '700',
+                          fontSize: 14,
+                        }}
+                      >
+                        {dayOption === 'today' ? 'Today' : 'Tomorrow'}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+
+              {helperTipsEnabled ? (
+                <View
+                  style={[styles.homeHelperTip, styles.homeHelperTipCenter]}
+                >
+                  <Text style={styles.homeHelperTipText}>
+                    Choose the radius from your location.
+                  </Text>
+                </View>
+              ) : null}
+
+              <View
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: 8,
+                }}
+              >
+                {[5, 10, 25, 50].map((radius) => {
+                  const typedRadius = radius as GarageSaleRadiusMiles;
+                  const isActive = garageSaleRadiusMiles === typedRadius;
+
+                  return (
+                    <TouchableOpacity
+                      key={`craigslist-radius-${radius}`}
+                      style={{
+                        flex: 1,
+                        paddingVertical: 10,
+                        borderRadius: 999,
+                        backgroundColor: isActive ? '#2563eb' : '#f8fafc',
+                        borderWidth: 1,
+                        borderColor: isActive ? '#2563eb' : '#cbd5e1',
+                        alignItems: 'center',
+                      }}
+                      onPress={() => setGarageSaleRadiusMiles(typedRadius)}
+                      activeOpacity={0.8}
+                    >
+                      <Text
+                        style={{
+                          color: isActive ? '#ffffff' : '#334155',
+                          fontWeight: '700',
+                          fontSize: 14,
+                        }}
+                      >
+                        {radius} mi
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
 
             <TouchableOpacity
               style={[
                 styles.primaryButton,
                 {
                   backgroundColor: '#1E3A8A',
-                  marginTop: 18,
+                  marginTop: 0,
                 },
               ]}
               onPress={() => {
-                void openCraigslistGarageSalesLink();
+                void openCraigslistGarageSalesLink({
+                  dayFilter: garageSaleDayFilter,
+                  radiusMiles: garageSaleRadiusMiles,
+                });
               }}
               activeOpacity={0.75}
             >
@@ -10908,16 +11752,34 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           {renderLandingWeatherCard()}
 
           <View style={styles.resultCard}>
-            <Text style={styles.resultValueSmall}>
-              EstateSales.net for {locationLabel}
-            </Text>
+            {helperTipsEnabled ? (
+              <View style={[styles.homeHelperTip, styles.homeHelperTipCenter]}>
+                <Text style={styles.homeHelperTipText}>
+                  📍 EstateSales.net for {locationLabel}
+                </Text>
+              </View>
+            ) : null}
+
+            {helperTipsEnabled ? (
+              <View
+                style={[
+                  styles.homeHelperTip,
+                  styles.homeHelperTipCenter,
+                  { marginTop: 14, marginBottom: 14 },
+                ]}
+              >
+                <Text style={styles.homeHelperTipText}>
+                  Open to filter by day and more
+                </Text>
+              </View>
+            ) : null}
 
             <TouchableOpacity
               style={[
                 styles.primaryButton,
                 {
                   backgroundColor: '#2563EB',
-                  marginTop: 18,
+                  marginTop: 0,
                 },
               ]}
               onPress={() => {
@@ -11692,7 +12554,10 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
       ? [...garageSalePins, ...savedPins]
       : fallbackPins;
     const basePins = dedupeRouteStops(liveAndSavedPins) as GarageSaleMapPin[];
-    const displayPins = basePins;
+    const hiddenSaleIds = new Set(
+      savedGarageSales.flatMap((saved) => [saved.id, `saved-${saved.id}`]),
+    );
+    const displayPins = basePins.filter((pin) => !hiddenSaleIds.has(pin.id));
 
     const selectedPin =
       displayPins.find((pin) => pin.id === selectedGarageSalePinId) ||
@@ -12183,330 +13048,399 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           </View>
 
           <View style={styles.resultCard}>
-            <Text style={styles.resultLabel}>
-              {garageFinderMode === 'thrift' ? 'Store List' : 'Sales List'}
-            </Text>
-            <Text style={styles.resultDescription}>
-              Showing the first{' '}
-              {Math.min(visibleGarageSalesCount, displayPins.length)} of{' '}
-              {displayPins.length} qualifying{' '}
-              {garageFinderMode === 'thrift' ? 'stores' : 'sales'}.
-            </Text>
+            <View style={styles.premiumListHeaderRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.resultLabel}>
+                  {garageFinderMode === 'thrift' ? 'Store List' : 'Sales List'}
+                </Text>
+                <Text style={styles.resultDescription}>
+                  Showing{' '}
+                  {Math.min(visibleGarageSalesCount, displayPins.length)} of{' '}
+                  {displayPins.length} qualifying{' '}
+                  {garageFinderMode === 'thrift' ? 'stores' : 'sales'} nearby.
+                </Text>
+              </View>
+              <View style={styles.premiumRadiusBadge}>
+                <Text style={styles.premiumRadiusBadgeText}>
+                  {garageSaleRadiusMiles} mi
+                </Text>
+              </View>
+            </View>
+
+            {garageFinderMode === 'thrift' && displayPins.length ? (
+              <View style={styles.premiumInsightRow}>
+                <View style={styles.premiumInsightPill}>
+                  <Text style={styles.premiumInsightLabel}>Closest</Text>
+                  <Text style={styles.premiumInsightValue}>
+                    {displayPins[0]?.distanceLabel || 'Nearby'}
+                  </Text>
+                </View>
+                <View style={styles.premiumInsightPill}>
+                  <Text style={styles.premiumInsightLabel}>Results</Text>
+                  <Text style={styles.premiumInsightValue}>
+                    {displayPins.length} stores
+                  </Text>
+                </View>
+                <View style={styles.premiumInsightPill}>
+                  <Text style={styles.premiumInsightLabel}>Sorted</Text>
+                  <Text style={styles.premiumInsightValue}>Nearest first</Text>
+                </View>
+              </View>
+            ) : null}
 
             <View style={{ marginTop: 14, gap: 12 }}>
-              {displayPins.slice(0, visibleGarageSalesCount).map((sale) => {
-                const isHidden = savedGarageSales.some(
-                  (item) => item.id === sale.id,
-                );
-                const isSelected = selectedPin?.id === sale.id;
-                const thriftWebsiteUrl = String(sale.website || '').trim();
-                const thriftSearchUrl = buildThriftStoreWebsiteSearchUrl(sale);
-                const saleViewUrl =
-                  garageFinderMode === 'thrift'
-                    ? thriftWebsiteUrl || thriftSearchUrl || undefined
-                    : sale.craigslistUrl ||
-                      buildGarageSaleFallbackViewUrl(sale);
-                const saleViewButtonLabel = 'View';
+              {displayPins
+                .slice(0, visibleGarageSalesCount)
+                .map((sale, saleIndex) => {
+                  const isHidden = savedGarageSales.some(
+                    (item) => item.id === sale.id,
+                  );
+                  const isSelected = selectedPin?.id === sale.id;
+                  const thriftWebsiteUrl = String(sale.website || '').trim();
+                  const thriftSearchUrl =
+                    buildThriftStoreWebsiteSearchUrl(sale);
+                  const saleViewUrl =
+                    garageFinderMode === 'thrift'
+                      ? thriftWebsiteUrl || thriftSearchUrl || undefined
+                      : sale.craigslistUrl ||
+                        buildGarageSaleFallbackViewUrl(sale);
+                  const saleViewButtonLabel =
+                    garageFinderMode === 'thrift' ? 'Website' : 'View';
 
-                return (
-                  <TouchableOpacity
-                    key={`sale-list-${sale.id}`}
-                    onLayout={(event) => {
-                      garageSaleCardLayoutsRef.current[sale.id] =
-                        event.nativeEvent.layout.y;
-                    }}
-                    style={[
-                      styles.resultCard,
-                      {
-                        marginTop: 0,
-                        borderWidth: 1,
-                        borderColor: isSelected ? '#2563eb' : '#dbe4f0',
-                        backgroundColor: isSelected ? '#eff6ff' : '#ffffff',
-                      },
-                    ]}
-                    onPress={() => {
-                      setSelectedGarageSalePinId(sale.id);
-                      scrollGarageSaleCardToTop(sale.id);
-                      if (
-                        Number.isFinite(sale.latitude) &&
-                        Number.isFinite(sale.longitude)
-                      ) {
-                        garageSalesMapRef.current?.animateToRegion(
-                          {
-                            latitude: sale.latitude,
-                            longitude: sale.longitude,
-                            latitudeDelta: Math.max(
-                              garageSalesMapLatitudeDelta * 0.6,
-                              0.02,
-                            ),
-                            longitudeDelta: Math.max(
-                              garageSalesMapLatitudeDelta * 0.6,
-                              0.02,
-                            ),
-                          },
-                          300,
+                  return (
+                    <TouchableOpacity
+                      key={`sale-list-${sale.id}`}
+                      onLayout={(event) => {
+                        garageSaleCardLayoutsRef.current[sale.id] =
+                          event.nativeEvent.layout.y;
+                      }}
+                      style={[
+                        styles.resultCard,
+                        {
+                          marginTop: 0,
+                          borderWidth: 1,
+                          borderColor: isSelected ? '#2563eb' : '#dbe4f0',
+                          backgroundColor: isSelected ? '#eff6ff' : '#ffffff',
+                        },
+                      ]}
+                      onPress={() => {
+                        setSelectedGarageSalePinId(sale.id);
+                        scrollGarageSaleCardToTop(sale.id);
+                        if (
+                          Number.isFinite(sale.latitude) &&
+                          Number.isFinite(sale.longitude)
+                        ) {
+                          garageSalesMapRef.current?.animateToRegion(
+                            {
+                              latitude: sale.latitude,
+                              longitude: sale.longitude,
+                              latitudeDelta: Math.max(
+                                garageSalesMapLatitudeDelta * 0.6,
+                                0.02,
+                              ),
+                              longitudeDelta: Math.max(
+                                garageSalesMapLatitudeDelta * 0.6,
+                                0.02,
+                              ),
+                            },
+                            300,
+                          );
+                        }
+                      }}
+                      activeOpacity={0.85}
+                    >
+                      {(() => {
+                        const displayAddress =
+                          sale.displayAddress ||
+                          buildGarageSaleDisplayAddress({
+                            street: sale.street,
+                            crossStreet: sale.crossStreet,
+                            addressLabel: sale.addressLabel,
+                            mapAddress: sale.mapAddress,
+                            mapsQuery: sale.mapsQuery,
+                            city: sale.city,
+                            state: sale.state,
+                            zip: sale.zip,
+                          });
+                        const showProbableBadge =
+                          shouldShowGarageSaleProbableBadge(sale);
+                        const compactMeta = getGarageSaleCompactMeta(sale);
+                        const dateLabel = getGarageSaleDateLabel(
+                          sale,
+                          garageSaleDayFilter,
                         );
-                      }
-                    }}
-                    activeOpacity={0.85}
-                  >
-                    {(() => {
-                      const displayAddress =
-                        sale.displayAddress ||
-                        buildGarageSaleDisplayAddress({
-                          street: sale.street,
-                          crossStreet: sale.crossStreet,
-                          addressLabel: sale.addressLabel,
-                          mapAddress: sale.mapAddress,
-                          mapsQuery: sale.mapsQuery,
-                          city: sale.city,
-                          state: sale.state,
-                          zip: sale.zip,
-                        });
-                      const showProbableBadge =
-                        shouldShowGarageSaleProbableBadge(sale);
-                      const compactMeta = getGarageSaleCompactMeta(sale);
-                      const dateLabel = getGarageSaleDateLabel(
-                        sale,
-                        garageSaleDayFilter,
-                      );
-                      const timeLabel =
-                        garageFinderMode === 'thrift'
-                          ? getThriftStoreHoursLabel(sale)
-                          : getGarageSaleDisplayTimeLabel(
-                              sale,
-                              garageSaleDayFilter,
-                            );
-                      const openStatusLabel =
-                        garageFinderMode === 'thrift'
-                          ? getThriftStoreOpenStatusLabel(sale)
-                          : '';
+                        const timeLabel =
+                          garageFinderMode === 'thrift'
+                            ? getThriftStoreHoursLabel(sale)
+                            : getGarageSaleDisplayTimeLabel(
+                                sale,
+                                garageSaleDayFilter,
+                              );
+                        const openStatusLabel =
+                          garageFinderMode === 'thrift'
+                            ? getThriftStoreOpenStatusLabel(sale)
+                            : '';
 
-                      return (
-                        <>
-                          <Text style={styles.resultValueSmall}>
-                            {sale.title}
-                          </Text>
-                          {showProbableBadge ? (
-                            <Text
-                              style={[
-                                styles.resultDescription,
-                                {
-                                  marginTop: 6,
-                                  color: '#b45309',
-                                  fontWeight: '600',
-                                },
-                              ]}
-                            >
-                              Probable Sale
+                        return (
+                          <>
+                            {garageFinderMode === 'thrift' ? (
+                              <View style={styles.premiumStoreTopRow}>
+                                <View style={styles.premiumRankBadge}>
+                                  <Text style={styles.premiumRankBadgeText}>
+                                    #{saleIndex + 1}
+                                  </Text>
+                                </View>
+                                <View style={styles.premiumDistanceBadge}>
+                                  <Text style={styles.premiumDistanceBadgeText}>
+                                    {sale.distanceLabel || 'Nearby'}
+                                  </Text>
+                                </View>
+                                {isSelected ? (
+                                  <View style={styles.premiumSelectedBadge}>
+                                    <Text
+                                      style={styles.premiumSelectedBadgeText}
+                                    >
+                                      Selected
+                                    </Text>
+                                  </View>
+                                ) : null}
+                              </View>
+                            ) : null}
+                            <Text style={styles.resultValueSmall}>
+                              {sale.title}
                             </Text>
-                          ) : null}
-                          <Text
-                            style={[styles.resultDescription, { marginTop: 6 }]}
-                          >
-                            {compactMeta}
-                          </Text>
-                          {openStatusLabel ? (
-                            <Text
-                              style={[
-                                styles.resultDescription,
-                                {
-                                  marginTop: 6,
-                                  color:
-                                    openStatusLabel === 'Open now'
-                                      ? '#15803d'
-                                      : '#b91c1c',
-                                  fontWeight: '700',
-                                },
-                              ]}
-                            >
-                              {openStatusLabel}
-                            </Text>
-                          ) : null}
-                          {sale.isApproximateLocation ? (
-                            <Text
-                              style={[
-                                styles.resultDescription,
-                                {
-                                  marginTop: 6,
-                                  color: '#1d4ed8',
-                                  fontWeight: '600',
-                                },
-                              ]}
-                            >
-                              Approximate location from listing area
-                            </Text>
-                          ) : null}
-                          {dateLabel && dateLabel !== 'Date unavailable' ? (
-                            <Text
-                              style={[
-                                styles.resultDescription,
-                                { marginTop: 6 },
-                              ]}
-                            >
-                              Date: {dateLabel}
-                            </Text>
-                          ) : null}
-                          {timeLabel && timeLabel !== 'Time not listed' ? (
-                            <Text
-                              style={[
-                                styles.resultDescription,
-                                { marginTop: 6 },
-                              ]}
-                            >
-                              {garageFinderMode === 'thrift' ? 'Hours' : 'Time'}
-                              : {timeLabel}
-                            </Text>
-                          ) : null}
-                          <Text
-                            style={[styles.resultDescription, { marginTop: 6 }]}
-                          >
-                            Address: {displayAddress}
-                          </Text>
-                          {garageFinderMode === 'thrift' && sale.phone ? (
-                            <TouchableOpacity
-                              onPress={() => {
-                                void openPhoneNumber(sale.phone);
-                              }}
-                              activeOpacity={0.7}
-                            >
+                            {showProbableBadge ? (
                               <Text
                                 style={[
                                   styles.resultDescription,
                                   {
                                     marginTop: 6,
-                                    color: '#2563eb',
-                                    textDecorationLine: 'underline',
+                                    color: '#b45309',
+                                    fontWeight: '600',
                                   },
                                 ]}
                               >
-                                Phone: {sale.phone}
+                                Probable Sale
                               </Text>
-                            </TouchableOpacity>
-                          ) : null}
-                          {garageFinderMode === 'thrift' ? (
+                            ) : null}
+                            {garageFinderMode === 'thrift' ? (
+                              <Text style={styles.premiumStoreSubtitle}>
+                                {compactMeta}
+                              </Text>
+                            ) : (
+                              <Text
+                                style={[
+                                  styles.resultDescription,
+                                  { marginTop: 6 },
+                                ]}
+                              >
+                                {compactMeta}
+                              </Text>
+                            )}
+                            {openStatusLabel ? (
+                              <Text
+                                style={[
+                                  styles.resultDescription,
+                                  {
+                                    marginTop: 6,
+                                    color:
+                                      openStatusLabel === 'Open now'
+                                        ? '#15803d'
+                                        : '#b91c1c',
+                                    fontWeight: '700',
+                                  },
+                                ]}
+                              >
+                                {openStatusLabel}
+                              </Text>
+                            ) : null}
+                            {sale.isApproximateLocation ? (
+                              <Text
+                                style={[
+                                  styles.resultDescription,
+                                  {
+                                    marginTop: 6,
+                                    color: '#1d4ed8',
+                                    fontWeight: '600',
+                                  },
+                                ]}
+                              >
+                                Approximate location from listing area
+                              </Text>
+                            ) : null}
+                            {dateLabel && dateLabel !== 'Date unavailable' ? (
+                              <Text
+                                style={[
+                                  styles.resultDescription,
+                                  { marginTop: 6 },
+                                ]}
+                              >
+                                Date: {dateLabel}
+                              </Text>
+                            ) : null}
+                            {timeLabel && timeLabel !== 'Time not listed' ? (
+                              <Text
+                                style={[
+                                  styles.resultDescription,
+                                  { marginTop: 6 },
+                                ]}
+                              >
+                                {garageFinderMode === 'thrift'
+                                  ? 'Hours'
+                                  : 'Time'}
+                                : {timeLabel}
+                              </Text>
+                            ) : null}
                             <Text
                               style={[
                                 styles.resultDescription,
                                 { marginTop: 6 },
                               ]}
-                              numberOfLines={1}
                             >
-                              Website:{' '}
-                              {sale.website
-                                ? sale.website.replace(/^https?:\/\//, '')
-                                : 'Not listed — Tap View for more info'}
+                              Address: {displayAddress}
                             </Text>
-                          ) : null}
-                          {garageFinderMode === 'thrift' && sale.source ? (
-                            <Text
-                              style={[
-                                styles.resultDescription,
-                                { marginTop: 6, color: '#64748b' },
-                              ]}
-                            >
-                              Source: {sale.source}
-                            </Text>
-                          ) : null}
-                        </>
-                      );
-                    })()}
+                            {garageFinderMode === 'thrift' && sale.phone ? (
+                              <TouchableOpacity
+                                onPress={() => {
+                                  void openPhoneNumber(sale.phone);
+                                }}
+                                activeOpacity={0.7}
+                              >
+                                <Text
+                                  style={[
+                                    styles.resultDescription,
+                                    {
+                                      marginTop: 6,
+                                      color: '#2563eb',
+                                      textDecorationLine: 'underline',
+                                    },
+                                  ]}
+                                >
+                                  Phone: {sale.phone}
+                                </Text>
+                              </TouchableOpacity>
+                            ) : null}
+                            {garageFinderMode === 'thrift' ? (
+                              <Text
+                                style={[
+                                  styles.resultDescription,
+                                  { marginTop: 6 },
+                                ]}
+                                numberOfLines={1}
+                              >
+                                Website:{' '}
+                                {sale.website
+                                  ? sale.website.replace(/^https?:\/\//, '')
+                                  : 'Not listed — Tap View for more info'}
+                              </Text>
+                            ) : null}
+                            {garageFinderMode === 'thrift' && sale.source ? (
+                              <Text
+                                style={[
+                                  styles.resultDescription,
+                                  { marginTop: 6, color: '#64748b' },
+                                ]}
+                              >
+                                Source: {sale.source}
+                              </Text>
+                            ) : null}
+                          </>
+                        );
+                      })()}
 
-                    <View style={styles.saleActionRow}>
-                      <TouchableOpacity
-                        style={[
-                          styles.saleActionButton,
-                          styles.saleActionButtonView,
-                          !saleViewUrl && styles.saleActionButtonDisabled,
-                        ]}
-                        onPress={() =>
-                          saleViewUrl && openExternalLink(saleViewUrl)
-                        }
-                        activeOpacity={saleViewUrl ? 0.75 : 1}
-                        disabled={!saleViewUrl}
-                      >
-                        <Text style={styles.saleActionIcon}>🔗</Text>
-                        <Text
+                      <View style={styles.saleActionRow}>
+                        <TouchableOpacity
                           style={[
-                            styles.saleActionText,
-                            styles.saleActionTextLight,
+                            styles.saleActionButton,
+                            styles.saleActionButtonView,
+                            !saleViewUrl && styles.saleActionButtonDisabled,
                           ]}
+                          onPress={() =>
+                            saleViewUrl && openExternalLink(saleViewUrl)
+                          }
+                          activeOpacity={saleViewUrl ? 0.75 : 1}
+                          disabled={!saleViewUrl}
                         >
-                          {saleViewButtonLabel}
-                        </Text>
-                      </TouchableOpacity>
+                          <Text style={styles.saleActionIcon}>🔗</Text>
+                          <Text
+                            style={[
+                              styles.saleActionText,
+                              styles.saleActionTextLight,
+                            ]}
+                          >
+                            {saleViewButtonLabel}
+                          </Text>
+                        </TouchableOpacity>
 
-                      <TouchableOpacity
-                        style={[
-                          styles.saleActionButton,
-                          styles.saleActionButtonHide,
-                        ]}
-                        onPress={() =>
-                          void toggleSavedGarageSale({
-                            id: sale.id,
-                            title: sale.title,
-                            subtitle: sale.subtitle,
-                            query: sale.query,
-                            latitude: sale.latitude,
-                            longitude: sale.longitude,
-                            mapsQuery: sale.mapsQuery,
-                            addressLabel: sale.addressLabel,
-                            saleType: sale.saleType,
-                            craigslistUrl: sale.craigslistUrl,
-                            dayLabel: sale.dayLabel,
-                            timeLabel:
-                              garageFinderMode === 'thrift'
-                                ? getThriftStoreHoursLabel(sale)
-                                : getGarageSaleDisplayTimeLabel(
-                                    sale,
-                                    garageSaleDayFilter,
-                                  ),
-                            notes: sale.notes,
-                            distanceLabel: sale.distanceLabel,
-                            phone: sale.phone,
-                            website: sale.website,
-                            source: sale.source,
-                            openingHours: sale.openingHours,
-                          })
-                        }
-                        activeOpacity={0.75}
-                      >
-                        <Text style={styles.saleActionIcon}>🙈</Text>
-                        <Text style={styles.saleActionText}>
-                          {isHidden ? 'Show' : 'Hide'}
-                        </Text>
-                      </TouchableOpacity>
-
-                      <TouchableOpacity
-                        style={[
-                          styles.saleActionButton,
-                          styles.saleActionButtonMap,
-                        ]}
-                        onPress={() =>
-                          openExternalLink(
-                            buildGarageSaleMapsUrl({
-                              selectedPin: sale,
-                              userLatitude: weatherData?.latitude,
-                              userLongitude: weatherData?.longitude,
-                            }) || undefined,
-                          )
-                        }
-                        activeOpacity={0.75}
-                      >
-                        <Text style={styles.saleActionIcon}>🗺️</Text>
-                        <Text
+                        <TouchableOpacity
                           style={[
-                            styles.saleActionText,
-                            styles.saleActionTextLight,
+                            styles.saleActionButton,
+                            styles.saleActionButtonHide,
                           ]}
+                          onPress={() =>
+                            void toggleSavedGarageSale({
+                              id: sale.id,
+                              title: sale.title,
+                              subtitle: sale.subtitle,
+                              query: sale.query,
+                              latitude: sale.latitude,
+                              longitude: sale.longitude,
+                              mapsQuery: sale.mapsQuery,
+                              addressLabel: sale.addressLabel,
+                              saleType: sale.saleType,
+                              craigslistUrl: sale.craigslistUrl,
+                              dayLabel: sale.dayLabel,
+                              timeLabel:
+                                garageFinderMode === 'thrift'
+                                  ? getThriftStoreHoursLabel(sale)
+                                  : getGarageSaleDisplayTimeLabel(
+                                      sale,
+                                      garageSaleDayFilter,
+                                    ),
+                              notes: sale.notes,
+                              distanceLabel: sale.distanceLabel,
+                              phone: sale.phone,
+                              website: sale.website,
+                              source: sale.source,
+                              openingHours: sale.openingHours,
+                            })
+                          }
+                          activeOpacity={0.75}
                         >
-                          Map
-                        </Text>
-                      </TouchableOpacity>
-                    </View>
-                  </TouchableOpacity>
-                );
-              })}
+                          <Text style={styles.saleActionIcon}>🙈</Text>
+                          <Text style={styles.saleActionText}>Hide</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={[
+                            styles.saleActionButton,
+                            styles.saleActionButtonMap,
+                          ]}
+                          onPress={() =>
+                            openExternalLink(
+                              buildGarageSaleMapsUrl({
+                                selectedPin: sale,
+                                userLatitude: weatherData?.latitude,
+                                userLongitude: weatherData?.longitude,
+                              }) || undefined,
+                            )
+                          }
+                          activeOpacity={0.75}
+                        >
+                          <Text style={styles.saleActionIcon}>🗺️</Text>
+                          <Text
+                            style={[
+                              styles.saleActionText,
+                              styles.saleActionTextLight,
+                            ]}
+                          >
+                            Map
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
             </View>
 
             {displayPins.length > visibleGarageSalesCount ||
@@ -12534,7 +13468,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                 activeOpacity={0.75}
               >
                 <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-                  More Sales
+                  {garageFinderMode === 'thrift' ? 'More Stores' : 'More Sales'}
                 </Text>
               </TouchableOpacity>
             ) : null}
@@ -12804,22 +13738,26 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
         <SafeAreaView style={styles.cameraOverlay}>
           <View style={styles.cameraTopBar}>
             <View style={styles.cameraBadgeStack}>
-              <Text style={styles.cameraInfoLabel}>Scan Item</Text>
+              <Text style={styles.cameraInfoLabel}>Scan Barcode</Text>
             </View>
 
             <View style={styles.cameraTopSpacer} />
           </View>
 
           <View style={styles.cameraGuideWrap}>
+            {helperTipsEnabled ? (
+              <View style={{ marginBottom: 18, paddingHorizontal: 18 }}>
+                <Text style={styles.guideText}>
+                  Center the barcode inside the guide box.
+                </Text>
+                <Text style={styles.guideSubText}>
+                  Autofocus is on. Move closer first, then hold steady for a
+                  moment. If barcode lookup misses, List Assist will send you to
+                  package-front mode.
+                </Text>
+              </View>
+            ) : null}
             <View style={styles.guideBox} />
-            <Text style={styles.guideText}>
-              Center the barcode inside the guide box.
-            </Text>
-            <Text style={styles.guideSubText}>
-              Autofocus is on. Move closer first, then hold steady for a moment.
-              If barcode lookup misses, List Assist will send you to
-              package-front mode.
-            </Text>
             {isBarcodeLookupLoading ? (
               <View style={styles.lookupStatusCard}>
                 <ActivityIndicator size="small" color="#ffffff" />
@@ -12919,13 +13857,17 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
 
           <View style={styles.cameraGuideWrap}>
             <View style={[styles.guideBox, styles.guideBoxPhotoLarge]} />
-            <Text style={styles.guideText}>
-              Fill the frame with the package front.
-            </Text>
-            <Text style={styles.guideSubText}>
-              Get close, keep the front edges visible, then hold steady. Plain
-              background is best. Avoid glare and shadows.
-            </Text>
+            {helperTipsEnabled ? (
+              <>
+                <Text style={styles.guideText}>
+                  Fill the frame with the package front.
+                </Text>
+                <Text style={styles.guideSubText}>
+                  Get close, keep the front edges visible, then hold steady.
+                  Plain background is best. Avoid glare and shadows.
+                </Text>
+              </>
+            ) : null}
           </View>
 
           <View style={styles.cameraBottomBar}>
@@ -13190,11 +14132,17 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
 
           <View style={styles.cameraGuideWrap}>
             <View style={[styles.guideBox, styles.guideBoxPhotoLarge]} />
-            <Text style={styles.guideText}>Fill the frame with the item.</Text>
-            <Text style={styles.guideSubText}>
-              Get close and keep the item edges visible. Plain background is
-              best. Avoid glare and shadows.
-            </Text>
+            {helperTipsEnabled ? (
+              <>
+                <Text style={styles.guideText}>
+                  Fill the frame with the item.
+                </Text>
+                <Text style={styles.guideSubText}>
+                  Get close and keep the item edges visible. Plain background is
+                  best. Avoid glare and shadows.
+                </Text>
+              </>
+            ) : null}
           </View>
 
           <View style={styles.cameraBottomBar}>
@@ -13836,10 +14784,6 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           <Text style={styles.title}>Price Checker</Text>
 
           <View style={styles.resultCard}>
-            <Text style={styles.resultDescription}>
-              Scan Barcode, Box, or Item.
-            </Text>
-
             <View style={styles.priceCheckerScanRow}>
               <TouchableOpacity
                 style={[
@@ -13881,6 +14825,63 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
     );
   };
 
+  useEffect(() => {
+    if (step !== 'priceCheckerResult' && step !== 'listingBuilder') return;
+
+    const looseItemPrimaryTitle = (looseItemMatches[0]?.title || '').trim();
+    const looseItemResolvedQuery = buildLiveEbayQuery(
+      looseItemPrimaryTitle || looseItemSearchText,
+      null,
+    ).trim();
+
+    const marketQuery = (
+      looseItemResolvedQuery ||
+      getDealSearchTerms({
+        product: barcodeProduct,
+        packageFrontSearchText,
+        packageFrontDetectedText,
+      })
+    ).trim();
+
+    if (!marketQuery) {
+      setEbaySoldResults([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadSoldCompsForPriceCard = async () => {
+      try {
+        const soldResult = await searchEbaySold(marketQuery, 30);
+        if (cancelled) return;
+
+        const soldItems = Array.isArray(soldResult?.itemSummaries)
+          ? soldResult.itemSummaries
+          : [];
+
+        setEbaySoldResults(soldItems);
+      } catch (error) {
+        if (cancelled) return;
+        console.log('Price card sold comp lookup failed:', error);
+        setEbaySoldResults([]);
+      }
+    };
+
+    void loadSoldCompsForPriceCard();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    step,
+    barcodeProduct,
+    packageFrontSearchText,
+    packageFrontDetectedText,
+    looseItemMatches,
+    looseItemSearchText,
+    listingCondition,
+  ]);
+
   const renderPriceCheckerResult = () => {
     const looseItemPrimaryTitle = (looseItemMatches[0]?.title || '').trim();
     const looseItemResolvedQuery = buildLiveEbayQuery(
@@ -13897,11 +14898,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
       })
     ).trim();
 
-    const marketPriceItems = ebayExactResults.length
-      ? ebayExactResults
-      : ebayResults.length
-        ? ebayResults
-        : looseItemMatches;
+    const marketPriceItems = ebaySoldResults.length ? ebaySoldResults : [];
     const suggestedPrice = getSuggestedPriceRange(
       barcodeProduct,
       listingCondition,
@@ -14127,6 +15124,11 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
     const hasListingMarketQuery = Boolean(
       listingMarketQuery || (barcodeProduct?.barcode || '').trim(),
     );
+    const listingSuggestedPrice = getSuggestedPriceRange(
+      barcodeProduct,
+      listingCondition,
+      ebaySoldResults.length ? ebaySoldResults : [],
+    );
 
     return (
       <SafeAreaView style={styles.screen}>
@@ -14136,7 +15138,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           keyboardShouldPersistTaps="handled"
         >
           <Text style={styles.title}>Build the Listing</Text>
-          {draft.priceSuggestion ? (
+          {listingSuggestedPrice.label ? (
             <View
               style={[
                 styles.resultCard,
@@ -14155,10 +15157,10 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                 Price Data
               </Text>
               <Text style={[styles.resultValue, { color: '#7C2D12' }]}>
-                {draft.priceSuggestion}
+                {listingSuggestedPrice.label}
               </Text>
               <Text style={[styles.helperText, { color: '#9A3412' }]}>
-                Check Sold Listings to confirm price before listing.
+                {listingSuggestedPrice.helperText}
               </Text>
             </View>
           ) : null}
@@ -14407,6 +15409,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
   else if (step === 'priceCheckerChooser') screen = renderPriceCheckerChooser();
   else if (step === 'priceCheckerResult') screen = renderPriceCheckerResult();
   else if (step === 'listingBuilder') screen = renderListingBuilder();
+  else if (step === 'bugReport') screen = renderBugReport();
 
   return (
     <>
@@ -14466,6 +15469,149 @@ function clamp(value: number, min: number, max: number) {
 }
 
 const styles = StyleSheet.create({
+  helperTipsToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 18,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginTop: 2,
+    marginBottom: 14,
+  },
+  helperTipsToggleTitle: {
+    color: '#0F172A',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  helperTipsToggleSubtitle: {
+    color: '#64748B',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  homeHelperTip: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#DCFCE7',
+    borderRadius: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 12,
+    shadowColor: '#000000',
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
+  },
+  homeHelperTipRight: {
+    alignSelf: 'flex-end',
+    maxWidth: 260,
+  },
+  homeHelperTipCenter: {
+    alignSelf: 'center',
+    maxWidth: 310,
+    marginTop: 8,
+  },
+  homeHelperTipText: {
+    color: '#0F172A',
+    fontSize: 14,
+    fontWeight: '800',
+    lineHeight: 19,
+    textAlign: 'center',
+  },
+  homeActionHelperText: {
+    color: '#334155',
+    fontSize: 16,
+    fontWeight: '700',
+    lineHeight: 22,
+    textAlign: 'center',
+    marginBottom: 4,
+  },
+  homeActionButtonRow: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginTop: 16,
+  },
+  homeActionButton: {
+    flex: 1,
+    minHeight: 118,
+    borderRadius: 20,
+    paddingVertical: 16,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000000',
+    shadowOpacity: 0.16,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 5 },
+    elevation: 4,
+  },
+  homeBarcodeButton: {
+    backgroundColor: '#071A35',
+    borderColor: '#071A35',
+  },
+  homeBoxButton: {
+    backgroundColor: '#0B7A75',
+    borderColor: '#0B7A75',
+  },
+  homeItemButton: {
+    backgroundColor: '#28B44B',
+    borderColor: '#28B44B',
+  },
+  homeActionButtonIcon: {
+    color: '#FFFFFF',
+    fontSize: 34,
+    fontWeight: '900',
+    marginBottom: 10,
+    lineHeight: 38,
+    textAlign: 'center',
+  },
+  homeActionButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '800',
+    lineHeight: 20,
+    textAlign: 'center',
+    includeFontPadding: false,
+  },
+  homeSellerToolsButton: {
+    minHeight: 64,
+    borderRadius: 20,
+    paddingVertical: 16,
+    paddingHorizontal: 18,
+    marginTop: 2,
+    backgroundColor: '#6D28D9',
+    borderColor: '#6D28D9',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    shadowColor: '#000000',
+    shadowOpacity: 0.16,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 5 },
+    elevation: 4,
+  },
+  homeSellerToolsIcon: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    marginRight: 10,
+    lineHeight: 26,
+  },
+  homeSellerToolsText: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: '800',
+    lineHeight: 22,
+    textAlign: 'center',
+    includeFontPadding: false,
+  },
+
   headerRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -15607,6 +16753,99 @@ const styles = StyleSheet.create({
     minHeight: 52,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  premiumListHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  premiumRadiusBadge: {
+    backgroundColor: '#ecfdf5',
+    borderColor: '#99f6e4',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  premiumRadiusBadgeText: {
+    color: '#0f766e',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  premiumInsightRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 12,
+  },
+  premiumInsightPill: {
+    flex: 1,
+    backgroundColor: '#f8fafc',
+    borderColor: '#e2e8f0',
+    borderWidth: 1,
+    borderRadius: 16,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  premiumInsightLabel: {
+    color: '#64748b',
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.3,
+  },
+  premiumInsightValue: {
+    color: '#0f172a',
+    fontSize: 13,
+    fontWeight: '900',
+    marginTop: 3,
+  },
+  premiumStoreTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 8,
+    flexWrap: 'wrap',
+  },
+  premiumRankBadge: {
+    backgroundColor: '#0f172a',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  premiumRankBadgeText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  premiumDistanceBadge: {
+    backgroundColor: '#ecfdf5',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  premiumDistanceBadgeText: {
+    color: '#047857',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  premiumSelectedBadge: {
+    backgroundColor: '#dbeafe',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  premiumSelectedBadgeText: {
+    color: '#1d4ed8',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  premiumStoreSubtitle: {
+    color: '#475569',
+    fontSize: 14,
+    fontWeight: '700',
+    lineHeight: 20,
+    marginTop: 4,
   },
   saleActionRow: {
     flexDirection: 'row',

@@ -1,16 +1,17 @@
 {
   "expo": {
-    "name": "Box_Wizard_App",
+    "name": "List Assist",
     "slug": "Box_Wizard_App",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "boxwizardapp",
+    "scheme": "listassistapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.danahauser.boxwizard",
+      "bundleIdentifier": "com.danahauser.listassist",
+      "buildNumber": "1",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -23,7 +24,8 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.danahauser.listassist"
     },
     "web": {
       "output": "static",
@@ -53,6 +55,7 @@
       "eas": {
         "projectId": "4b6a137e-d511-4e8d-a510-d05e671c4046"
       }
-    }
+    },
+    "owner": "bruhaus"
   }
 }
