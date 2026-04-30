@@ -7,6 +7,7 @@
 // - Distance sorting
 // - Better labels: Thrift Store, Resale Shop, Consignment Shop, Antiques / Resale, Used Goods Store
 // - In-memory cache to keep it fast and reduce Google API calls
+// - Wider 25/50 mile coverage using multiple search origins
 
 const GOOGLE_TEXT_SEARCH_URL =
   'https://places.googleapis.com/v1/places:searchText';
@@ -14,7 +15,8 @@ const GOOGLE_TEXT_SEARCH_URL =
 const DEFAULT_RADIUS_MILES = 25;
 const DEFAULT_LIMIT = 50;
 const MAX_RADIUS_MILES = 50;
-const MAX_LIMIT = 75;
+const MAX_LIMIT = 100;
+const EARTH_RADIUS_MILES = 3958.8;
 const REQUEST_TIMEOUT_MS = Number(process.env.THRIFT_ROUTE_TIMEOUT_MS || 18000);
 const GOOGLE_CACHE_TTL_MS =
   Number(process.env.GOOGLE_PLACES_CACHE_TTL_DAYS || 7) * 24 * 60 * 60 * 1000;
@@ -75,7 +77,7 @@ function normalizeAddress(value = '') {
 }
 
 function calculateDistanceMiles(lat1, lon1, lat2, lon2) {
-  const earthRadiusMiles = 3958.8;
+  const earthRadiusMiles = EARTH_RADIUS_MILES;
   const toRadians = (degrees) => (degrees * Math.PI) / 180;
   const dLat = toRadians(lat2 - lat1);
   const dLon = toRadians(lon2 - lon1);
@@ -93,26 +95,33 @@ function withTimeout(ms = REQUEST_TIMEOUT_MS) {
   return { signal: controller.signal, done: () => clearTimeout(timeout) };
 }
 
+function cleanOpeningHoursText(value = '') {
+  return String(value || '')
+    .replace(/\u202f/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/10 AM\s*AM/g, '10 AM')
+    .replace(/11 AM\s*AM/g, '11 AM')
+    .replace(/12 PM\s*PM/g, '12 PM')
+    .replace(/1 PM\s*PM/g, '1 PM')
+    .replace(/2 PM\s*PM/g, '2 PM')
+    .replace(/3 PM\s*PM/g, '3 PM')
+    .replace(/4 PM\s*PM/g, '4 PM')
+    .replace(/5 PM\s*PM/g, '5 PM')
+    .replace(/6 PM\s*PM/g, '6 PM')
+    .replace(/7 PM\s*PM/g, '7 PM')
+    .replace(/8 PM\s*PM/g, '8 PM')
+    .replace(/9 PM\s*PM/g, '9 PM')
+    .replace(/10 AM\s*PM/g, '10 PM')
+    .replace(/11 AM\s*PM/g, '11 PM')
+    .trim();
+}
+
 function formatOpeningHours(value = '') {
   const hours = Array.isArray(value)
-    ? value.join('; ')
-    : String(value || '').trim();
+    ? value.map(cleanOpeningHoursText).join('; ')
+    : cleanOpeningHoursText(value);
   if (!hours) return '';
-  return hours
-    .replace(/09:00/g, '9 AM')
-    .replace(/10:00/g, '10 AM')
-    .replace(/11:00/g, '11 AM')
-    .replace(/12:00/g, '12 PM')
-    .replace(/13:00/g, '1 PM')
-    .replace(/14:00/g, '2 PM')
-    .replace(/15:00/g, '3 PM')
-    .replace(/16:00/g, '4 PM')
-    .replace(/17:00/g, '5 PM')
-    .replace(/18:00/g, '6 PM')
-    .replace(/19:00/g, '7 PM')
-    .replace(/20:00/g, '8 PM')
-    .replace(/21:00/g, '9 PM')
-    .replace(/22:00/g, '10 PM');
+  return hours;
 }
 
 function getStoreKind(title = '', address = '', types = []) {
@@ -170,7 +179,8 @@ function looksLikeUsefulStore(place = {}) {
   );
 }
 
-function buildSearchQueries() {
+function buildSearchQueries(radiusMiles = DEFAULT_RADIUS_MILES) {
+  const queryLimit = getEffectiveQueryLimit(radiusMiles);
   return [
     'thrift store',
     'resale shop',
@@ -182,11 +192,72 @@ function buildSearchQueries() {
     'Habitat for Humanity ReStore',
     'Savers thrift store',
     'charity shop',
-  ].slice(0, GOOGLE_QUERY_LIMIT);
+  ].slice(0, queryLimit);
+}
+
+function getOffsetCoordinate(
+  latitude,
+  longitude,
+  distanceMiles,
+  bearingDegrees,
+) {
+  const angularDistance = distanceMiles / EARTH_RADIUS_MILES;
+  const bearing = (bearingDegrees * Math.PI) / 180;
+  const lat1 = (latitude * Math.PI) / 180;
+  const lon1 = (longitude * Math.PI) / 180;
+
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(angularDistance) +
+      Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing),
+  );
+  const lon2 =
+    lon1 +
+    Math.atan2(
+      Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+      Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2),
+    );
+
+  return {
+    latitude: (lat2 * 180) / Math.PI,
+    longitude: (lon2 * 180) / Math.PI,
+  };
+}
+
+function getSearchOrigins(latitude, longitude, radiusMiles) {
+  const origins = [{ latitude, longitude, label: 'center' }];
+
+  // For larger radius searches, Google Text Search tends to favor the closest
+  // cluster and can under-fill the selected area. These extra origins spread
+  // coverage across the selected radius, then results are deduped and sorted
+  // from the user's true location.
+  if (radiusMiles >= 25) {
+    const ringDistance = radiusMiles >= 50 ? 28 : 14;
+    const bearings =
+      radiusMiles >= 50
+        ? [0, 45, 90, 135, 180, 225, 270, 315]
+        : [0, 90, 180, 270];
+
+    for (const bearing of bearings) {
+      origins.push({
+        ...getOffsetCoordinate(latitude, longitude, ringDistance, bearing),
+        label: `ring-${bearing}`,
+      });
+    }
+  }
+
+  return origins;
+}
+
+function getEffectiveQueryLimit(radiusMiles) {
+  const requested = GOOGLE_QUERY_LIMIT;
+  if (radiusMiles >= 50)
+    return Math.max(requested, Math.min(10, requested + 3));
+  if (radiusMiles >= 25) return Math.max(requested, Math.min(8, requested + 2));
+  return requested;
 }
 
 function getCacheKey(latitude, longitude, radiusMiles, limit) {
-  return `google_places_thrift_v5__${Number(latitude).toFixed(3)}__${Number(longitude).toFixed(3)}__${radiusMiles}__${limit}__${GOOGLE_QUERY_LIMIT}`;
+  return `google_places_thrift_v6_wide__${Number(latitude).toFixed(3)}__${Number(longitude).toFixed(3)}__${radiusMiles}__${limit}__${GOOGLE_QUERY_LIMIT}`;
 }
 
 function getCached(key) {
@@ -468,35 +539,42 @@ async function fetchStores(latitude, longitude, radiusMiles, limit) {
   const cached = getCached(cacheKey);
   if (cached) return { ...cached, cacheHit: true };
 
-  const radiusMeters = Math.round(radiusMiles * 1609.344);
-  const queries = buildSearchQueries();
-  const perQueryLimit = Math.max(
-    5,
-    Math.min(20, Math.ceil(limit / queries.length) + 8),
+  const queries = buildSearchQueries(radiusMiles);
+  const origins = getSearchOrigins(latitude, longitude, radiusMiles);
+  const searchRadiusMeters = Math.round(
+    Math.min(radiusMiles, radiusMiles >= 25 ? 18 : radiusMiles) * 1609.344,
   );
+  const perQueryLimit =
+    radiusMiles >= 25
+      ? 20
+      : Math.max(10, Math.min(20, Math.ceil(limit / queries.length) + 8));
   const allStores = [];
   const errors = [];
 
-  for (const query of queries) {
-    try {
-      const data = await fetchGooglePlacesQuery({
-        apiKey,
-        query,
-        latitude,
-        longitude,
-        radiusMeters,
-        maxResultCount: perQueryLimit,
-      });
+  for (const origin of origins) {
+    for (const query of queries) {
+      try {
+        const data = await fetchGooglePlacesQuery({
+          apiKey,
+          query,
+          latitude: origin.latitude,
+          longitude: origin.longitude,
+          radiusMeters: searchRadiusMeters,
+          maxResultCount: perQueryLimit,
+        });
 
-      const places = Array.isArray(data?.places) ? data.places : [];
-      for (const place of places) {
-        const store = parseGooglePlace(place, latitude, longitude);
-        if (!store) continue;
-        if (store.distanceMiles <= radiusMiles) allStores.push(store);
+        const places = Array.isArray(data?.places) ? data.places : [];
+        for (const place of places) {
+          // Always calculate distance from the true user location, not the
+          // expanded coverage point.
+          const store = parseGooglePlace(place, latitude, longitude);
+          if (!store) continue;
+          if (store.distanceMiles <= radiusMiles) allStores.push(store);
+        }
+      } catch (error) {
+        errors.push(error.message);
+        console.warn('Thrift Google query failed:', error.message);
       }
-    } catch (error) {
-      errors.push(error.message);
-      console.warn('Thrift Google query failed:', error.message);
     }
   }
 
@@ -514,6 +592,7 @@ async function fetchStores(latitude, longitude, radiusMiles, limit) {
     errors,
     cacheHit: false,
     queriesUsed: queries,
+    searchOriginsUsed: origins.map((origin) => origin.label),
   };
 
   setCached(cacheKey, payload);
@@ -553,10 +632,12 @@ async function thriftStoresHandler(req, res) {
       source: 'Google Places',
       googlePlacesEnabled: Boolean(process.env.GOOGLE_MAPS_API_KEY),
       googleQueryLimit: GOOGLE_QUERY_LIMIT,
+      effectiveGoogleQueryLimit: getEffectiveQueryLimit(radiusMiles),
       radiusMiles,
       limit,
       cacheHit: Boolean(result.cacheHit),
       warnings: result.errors || [],
+      searchOriginsUsed: result.searchOriginsUsed || [],
     });
   } catch (error) {
     console.error('Thrift stores route error:', error);
