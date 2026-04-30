@@ -196,6 +196,11 @@ type ListingDraft = {
   fullDescription: string;
   keywords: string;
   priceSuggestion?: string;
+  itemSpecifics?: string;
+  suggestedCategory?: string;
+  pricingRecommendation?: string;
+  shippingRecommendation?: string;
+  photoNotes?: string;
 };
 
 type SavedListingDraft = {
@@ -1395,7 +1400,7 @@ function buildLiveEbayQuery(
   query = query.replace(/\s+/g, ' ').trim();
 
   if (/voxx ?bliss|voxxlife/i.test(query) && /insole|sole/i.test(query)) {
-    return 'VOXXBLISS Insoles';
+    return 'Voxx Bliss Insoles';
   }
 
   if (barcode) {
@@ -1499,6 +1504,53 @@ async function searchEbaySold(
   };
 }
 
+async function searchEbaySoldSmart(
+  query: string,
+  product: BarcodeProduct | null = null,
+  limit = 30,
+): Promise<EbaySearchResponse> {
+  const attempts = dedupeWordsKeepOrder([
+    buildLiveEbayQuery(query, product?.barcode),
+    query,
+    product?.title || '',
+    normalizeComparableTitle(product?.title || query),
+    normalizeComparableTitle(product?.title || query)
+      .replace(/voxx life/g, 'voxx')
+      .replace(/wellness/g, '')
+      .replace(/hpt/g, '')
+      .replace(/neuro point/g, '')
+      .trim(),
+  ]).filter(Boolean);
+
+  let bestResult: EbaySearchResponse = { itemSummaries: [] };
+  let bestUsableCount = 0;
+
+  for (const attempt of attempts) {
+    try {
+      const result = await searchEbaySold(attempt, limit);
+      const items = Array.isArray(result?.itemSummaries)
+        ? result.itemSummaries
+        : [];
+      const usableCount = getUsableSoldCompItems(product, items).length;
+
+      if (items.length > (bestResult.itemSummaries?.length || 0)) {
+        bestResult = result;
+      }
+
+      if (usableCount > bestUsableCount) {
+        bestResult = result;
+        bestUsableCount = usableCount;
+      }
+
+      if (usableCount >= 3) return result;
+    } catch (error) {
+      console.log('Smart sold search attempt failed:', attempt, error);
+    }
+  }
+
+  return bestResult;
+}
+
 type EbaySearchSummary = {
   count: number;
   lowestPrice: number | null;
@@ -1514,20 +1566,33 @@ type LooseItemLookupApiResponse = {
 };
 
 async function lookupLooseItemFromPhoto(
-  uri: string,
+  uriOrUris: string | string[],
   manualHint?: string,
 ): Promise<LooseItemLookupApiResponse> {
+  const photoUris = (Array.isArray(uriOrUris) ? uriOrUris : [uriOrUris])
+    .map((uri) => String(uri || '').trim())
+    .filter(Boolean)
+    .slice(0, 3);
+
+  if (!photoUris.length) {
+    throw new Error('Loose item image lookup failed: no photos supplied');
+  }
+
   const form = new FormData();
-  form.append('file', {
-    uri,
-    name: 'loose-item.jpg',
-    type: 'image/jpeg',
-  } as any);
+  photoUris.forEach((uri, index) => {
+    const fieldName = index === 0 ? 'file' : 'files';
+    form.append(fieldName, {
+      uri,
+      name: `loose-item-${index + 1}.jpg`,
+      type: 'image/jpeg',
+    } as any);
+  });
 
   const trimmedHint = (manualHint ?? '').trim();
   if (trimmedHint) {
     form.append('hint', trimmedHint);
   }
+  form.append('photoCount', String(photoUris.length));
 
   const response = await fetch(LOOSE_ITEM_IMAGE_SEARCH_URL, {
     method: 'POST',
@@ -1538,7 +1603,7 @@ async function lookupLooseItemFromPhoto(
   try {
     payload = (await response.json()) as LooseItemLookupApiResponse;
   } catch (error) {
-    console.log('Loose item lookup response was not JSON', error);
+    console.log('Loose item lookup response was not JSON.', error);
   }
 
   if (!response.ok) {
@@ -1907,143 +1972,505 @@ function enforceTitleLength(title: string, max = 80) {
 }
 
 function buildSEOKeywordParts(product: BarcodeProduct | null) {
-  const rawTitle = cleanListingText(product?.title || '');
-  const category = inferListingCategory(rawTitle);
-  const brand = extractBrandFromTitle(rawTitle);
+  const rawTitle = cleanListingText(product?.title || '')
+    .replace(/\bmen\s+s\b/gi, 'Mens')
+    .replace(/\bwomen\s+s\b/gi, 'Womens')
+    .replace(/\s+/g, ' ')
+    .trim();
 
-  const partsByCategory: Record<string, string[]> = {
-    electronics: [
-      brand,
-      'HappyLight',
-      'Compact',
-      'Lamp',
-      '10,000 Lux',
-      'UV-Free',
-      'Light Therapy',
-    ],
-    clothing: [brand, 'Size', 'Color', 'Style', 'Used'],
-    toys: [brand, 'Toy', 'Collectible', 'Vintage'],
-    general: [brand],
-  };
-
-  const base = partsByCategory[category] || partsByCategory.general;
-  const titleWords = rawTitle
+  const words = rawTitle
     .split(' ')
+    .map((word) => word.trim())
     .filter(Boolean)
-    .filter((word) => !LISTING_JUNK_WORDS.has(word.toLowerCase()));
+    .filter((word) => !LISTING_JUNK_WORDS.has(word.toLowerCase()))
+    .filter(
+      (word) =>
+        ![
+          'the',
+          'and',
+          'with',
+          'for',
+          'from',
+          'item',
+          'listing',
+          'draft',
+        ].includes(word.toLowerCase()),
+    );
 
-  return dedupeWordsKeepOrder([...base, ...titleWords]);
+  return dedupeWordsKeepOrder(words);
 }
 
+function titleCaseListingWord(word: string) {
+  const cleaned = String(word || '').trim();
+  if (!cleaned) return '';
+
+  const upperBrands = ['LEGO', 'VHS', 'DVD', 'CD', 'VCR', 'TV', 'USB', 'UPC'];
+  if (upperBrands.includes(cleaned.toUpperCase())) return cleaned.toUpperCase();
+
+  // Preserve brands or model-style words that are already intentionally capitalized.
+  if (/^[A-Z0-9]{3,}$/.test(cleaned)) return cleaned;
+  if (/\d/.test(cleaned)) return cleaned;
+
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1).toLowerCase();
+}
+
+function getListingSourceText(params: {
+  product: BarcodeProduct | null;
+  packageFrontSearchText?: string | null;
+  packageFrontDetectedText?: string | null;
+}) {
+  return [
+    params.product?.title,
+    params.packageFrontSearchText,
+    params.packageFrontDetectedText,
+    params.product?.barcode,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getPromptStyleCondition(condition: ListingCondition) {
+  if (condition === 'Open Box') return 'Open Box';
+  if (condition === 'For Parts') return 'For Parts';
+  if (condition === 'New') return 'New';
+  return 'Used';
+}
+
+function getConditionSentence(condition: ListingCondition) {
+  if (condition === 'New') {
+    return 'New and unused condition overall.';
+  }
+  if (condition === 'Open Box') {
+    return 'Open box condition overall. Item may show light handling from storage or inspection.';
+  }
+  if (condition === 'For Parts') {
+    return 'For parts or repair condition overall. Functionality is not guaranteed.';
+  }
+  return 'Used condition overall. May show normal signs of wear from prior use.';
+}
+
+function detectProductSignals(sourceText: string) {
+  const normalized = normalizeSearchText(sourceText);
+  return {
+    normalized,
+    isVoxxBliss:
+      /voxx\s*(life|bliss|sports)|hpt|neuro|wellness insole|enhanced wellness/i.test(
+        sourceText,
+      ),
+    isInsole: /insole|orthotic|shoe insert|arch support/i.test(sourceText),
+    isLamp: /lamp|light therapy|happylight|10\s*,?000\s*lux|uv free/i.test(
+      sourceText,
+    ),
+    isClothing:
+      /(shirt|jacket|jeans|pants|hoodie|dress|shoe|sneaker|boot|hat|cap)/i.test(
+        sourceText,
+      ),
+    isToy: /(toy|lego|figure|doll|plush|game|puzzle|train|hot wheels)/i.test(
+      sourceText,
+    ),
+    isVintage: /vintage|antique|mid century|retro|collectible/i.test(
+      sourceText,
+    ),
+    sizeLargeMens: /large|men.?s\s*7\s*[-–]\s*13|7\s*[-–]\s*13/i.test(
+      sourceText,
+    ),
+  };
+}
+
+function buildPromptStyleTitle(params: {
+  product: BarcodeProduct | null;
+  condition: ListingCondition;
+  packageFrontSearchText?: string | null;
+  packageFrontDetectedText?: string | null;
+}) {
+  const {
+    product,
+    condition,
+    packageFrontSearchText,
+    packageFrontDetectedText,
+  } = params;
+  const sourceText = getListingSourceText({
+    product,
+    packageFrontSearchText,
+    packageFrontDetectedText,
+  });
+  const signals = detectProductSignals(sourceText);
+  const conditionKeyword = getPromptStyleCondition(condition);
+
+  if (signals.isVoxxBliss) {
+    const voxxTitle = [
+      'VoxxLife',
+      'VoxxBliss',
+      'Wellness',
+      'Insoles',
+      signals.sizeLargeMens ? 'Size Large Men 7-13' : '',
+      signals.normalized.includes('neuro') || signals.normalized.includes('hpt')
+        ? 'Neuro Point'
+        : 'HPT',
+      conditionKeyword === 'Used' ? '' : conditionKeyword,
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    return enforceTitleLength(voxxTitle, 80);
+  }
+
+  const cleanedTitle = cleanListingText(
+    product?.title ||
+      packageFrontSearchText ||
+      packageFrontDetectedText ||
+      'Item',
+  )
+    .replace(/\bmen\s+s\b/gi, 'Mens')
+    .replace(/\bwomen\s+s\b/gi, 'Womens')
+    .replace(/\bchildren\s+s\b/gi, 'Childrens')
+    .replace(/\bretail box\b/gi, '')
+    .replace(/\bpackage\b/gi, '')
+    .replace(/\bpackaging\b/gi, '')
+    .replace(/\bbrand new\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const tokens = buildSEOKeywordParts({
+    ...(product || {
+      barcode: '',
+      title: cleanedTitle,
+      length: 0,
+      width: 0,
+      height: 0,
+      source: 'Listing scan',
+    }),
+    title: cleanedTitle,
+  });
+  const brand = extractBrandFromTitle(cleanedTitle);
+  const preferredTokens = dedupeWordsKeepOrder([
+    brand,
+    ...tokens.filter(
+      (token) =>
+        !['used', 'new', 'open', 'box', 'condition', 'sealed'].includes(
+          token.toLowerCase(),
+        ),
+    ),
+  ])
+    .map(titleCaseListingWord)
+    .slice(0, 12);
+
+  let title = preferredTokens.join(' ').trim() || cleanedTitle || 'Item';
+
+  if (
+    conditionKeyword !== 'Used' &&
+    !new RegExp(`\\b${conditionKeyword}\\b`, 'i').test(title)
+  ) {
+    title += ` ${conditionKeyword}`;
+  }
+
+  title = title
+    .replace(/[“”\"'’]/g, '')
+    .replace(/[()[\]{}]/g, '')
+    .replace(/\s+-\s+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return enforceTitleLength(title, 80);
+}
+
+function buildPromptStyleItemSpecifics(params: {
+  product: BarcodeProduct | null;
+  condition: ListingCondition;
+  sourceText: string;
+}) {
+  const { product, condition, sourceText } = params;
+  const signals = detectProductSignals(sourceText);
+  const title = product?.title || sourceText || 'Item';
+  const brand = signals.isVoxxBliss
+    ? 'VoxxLife (VoxxSports Inc.)'
+    : extractBrandFromTitle(title) || 'Unbranded';
+  const color = signals.isVoxxBliss
+    ? 'Blue / White'
+    : signals.isLamp
+      ? 'White / Neutral, if shown in photos'
+      : 'See photos';
+  const model = signals.isVoxxBliss
+    ? 'VoxxBliss Enhanced Wellness Insoles'
+    : cleanListingText(title);
+  const size = signals.isVoxxBliss
+    ? "Large — Men's 7–13 (trim-to-fit)"
+    : product?.length && product?.width && product?.height
+      ? `${product.length} in x ${product.width} in x ${product.height} in`
+      : 'See photos';
+  const era = signals.isVintage
+    ? 'Vintage / era shown in photos'
+    : 'Current / modern production';
+  const identifiers = signals.isVoxxBliss
+    ? 'Enhanced with Voxx HPT (Human Performance Technology); Designed in Canada / Made in China if shown on package'
+    : product?.barcode
+      ? `UPC / Barcode: ${product.barcode}`
+      : 'None visible from current scan';
+
+  return [
+    `Brand: ${brand}`,
+    `Model / Item Name: ${model}`,
+    `Condition: ${getPromptStyleCondition(condition)}`,
+    `Color: ${color}`,
+    `Dimensions or Size: ${size}`,
+    `Era / Decade: ${era}`,
+    `Unique Identifiers: ${identifiers}`,
+  ].join('\n');
+}
+
+function buildPromptStyleDescription(params: {
+  title: string;
+  product: BarcodeProduct | null;
+  condition: ListingCondition;
+  measurements: Measurements;
+  isCylinder: boolean;
+  sourceText: string;
+}) {
+  const { title, product, condition, measurements, isCylinder, sourceText } =
+    params;
+  const signals = detectProductSignals(sourceText || title);
+  const dimensionText =
+    buildDimensionsText(measurements, isCylinder) ||
+    (product?.length && product?.width && product?.height
+      ? `${product.length} in x ${product.width} in x ${product.height} in`
+      : '');
+  const conditionText = getPromptStyleCondition(condition);
+
+  if (signals.isVoxxBliss) {
+    const opener =
+      condition === 'New'
+        ? `This is a new pair of VoxxLife VoxxBliss Enhanced Wellness Insoles in Size Large Men's 7–13. The insoles are in the original retail box; please review the photos for exact package condition.`
+        : `This is a pair of VoxxLife VoxxBliss Enhanced Wellness Insoles in Size Large Men's 7–13 in ${conditionText.toLowerCase()} condition. Please review the photos for exact cosmetic condition and included contents.`;
+
+    return [
+      opener,
+      'VoxxBliss insoles are designed for buyers looking for a drug-free, non-invasive wellness insole with Voxx HPT neuro-point activation technology.',
+      '',
+      '⸻',
+      '',
+      'Key Features:',
+      '• Voxx HPT Neuro-Point Activation technology built into the insole surface',
+      '• Trim-to-fit design for a more customized shoe fit',
+      '• Compatible with sneakers, boots, and work shoes',
+      '• Targets comfort, stability, and everyday foot support',
+      "• Size Large covers Men's 7–13",
+      '• Designed for a drug-free, non-invasive wellness approach',
+      ...(dimensionText
+        ? [`• Approximate package dimensions: ${dimensionText}`]
+        : []),
+      '',
+      '⸻',
+      '',
+      'Condition:',
+      getConditionSentence(condition),
+      condition === 'New'
+        ? '• Insoles appear unused based on the available listing information'
+        : '• May show normal signs of wear from prior use or storage',
+      '• Box or packaging condition is shown in the photos',
+      '• Includes only what is shown in photos',
+      '',
+      '⸻',
+      '',
+      'Sizing Notes:',
+      "• Size Large fits Men's 7–13",
+      '• Trim-to-fit design — use an existing insole as a template if needed',
+      '• Check the manufacturer size chart if you are between sizes',
+    ].join('\n');
+  }
+
+  const category = inferListingCategory(sourceText || title);
+  const brand = extractBrandFromTitle(title);
+  const featureCandidates = dedupeWordsKeepOrder([
+    brand ? `${brand} brand item` : '',
+    signals.isVintage
+      ? 'Vintage or collectible appeal if confirmed by photos'
+      : '',
+    signals.isLamp
+      ? 'Useful for desk, tabletop, or everyday lighting needs'
+      : '',
+    category === 'electronics'
+      ? 'Electronic item for everyday use or replacement'
+      : '',
+    category === 'clothing' ? 'Wearable item with visible style details' : '',
+    category === 'toys' ? 'Good for collecting, display, or play' : '',
+    dimensionText ? `Approximate dimensions: ${dimensionText}` : '',
+    product?.barcode ? `UPC / Barcode: ${product.barcode}` : '',
+    'Photos show the actual item included in this listing',
+    'See photos for exact item details',
+  ]).filter(Boolean);
+
+  while (featureCandidates.length < 4) {
+    const next = [
+      'Useful replacement, collector, or everyday item depending on buyer need',
+      'Listing photos show the actual item condition',
+      'Includes only the item or accessories shown in photos',
+    ].find((item) => !featureCandidates.includes(item));
+    if (!next) break;
+    featureCandidates.push(next);
+  }
+
+  const useCaseSentence =
+    category === 'electronics'
+      ? 'This is a practical pick for someone replacing a similar item, completing a setup, or looking for a useful backup.'
+      : category === 'clothing'
+        ? 'This works well for everyday wear, resale, or anyone looking for this style and size.'
+        : category === 'toys'
+          ? 'This appeals to collectors, gift buyers, or anyone looking for the specific item shown.'
+          : 'This is a good option for buyers looking for the specific item shown without paying full retail.';
+
+  return [
+    `This listing is for ${title} in ${conditionText.toLowerCase()} condition. Please review the photos carefully, as they show the actual item and included contents.`,
+    useCaseSentence,
+    '',
+    '⸻',
+    '',
+    'Key Features:',
+    ...featureCandidates.slice(0, 7).map((item) => `• ${item}`),
+    '',
+    '⸻',
+    '',
+    'Condition:',
+    getConditionSentence(condition),
+    '• Please review photos for exact cosmetic condition',
+    '• Any visible wear, marks, labels, packaging, or included parts are shown in the photos',
+    '• Includes only what is shown in photos',
+    ...(dimensionText
+      ? ['', '⸻', '', 'Details:', `• Approximate dimensions: ${dimensionText}`]
+      : []),
+  ].join('\n');
+}
+
+function buildPromptStyleCategory(sourceText: string) {
+  const signals = detectProductSignals(sourceText);
+  if (signals.isVoxxBliss || signals.isInsole) {
+    return 'Sporting Goods > Fitness, Running & Yoga > Insoles & Orthotics';
+  }
+  if (signals.isLamp) {
+    return 'Home & Garden > Lamps, Lighting & Ceiling Fans > Lamps';
+  }
+  if (signals.isClothing) {
+    return 'Clothing, Shoes & Accessories > Specialty category based on item type';
+  }
+  if (signals.isToy) {
+    return 'Toys & Hobbies > Action Figures, Toys & Collectibles > Other Toys & Hobbies';
+  }
+  if (signals.isVintage) {
+    return 'Collectibles > Specialty category based on item type';
+  }
+  return 'Everything Else > Other';
+}
+
+function buildPromptStylePricing(params: {
+  product: BarcodeProduct | null;
+  condition: ListingCondition;
+  soldItems?: EbaySearchItem[];
+}) {
+  const suggested = getSuggestedPriceRange(
+    params.product,
+    params.condition,
+    params.soldItems || [],
+  );
+  const target = suggested.target;
+  const auctionStart = target
+    ? roundPriceTo99(Math.max(4.99, target * 0.45))
+    : null;
+
+  return [
+    `Suggested Buy It Now price: ${suggested.label}`,
+    `Suggested starting auction price: ${
+      auctionStart
+        ? formatPrice(auctionStart)
+        : 'Use auction only if you want to move it quickly'
+    }`,
+    `Market note: ${suggested.helperText}`,
+  ].join('\n');
+}
+
+function buildPromptStyleShipping(params: {
+  product: BarcodeProduct | null;
+  sourceText: string;
+}) {
+  const { product, sourceText } = params;
+  const signals = detectProductSignals(sourceText);
+  const weightOz = Number(product?.weightOz || 0);
+  const weightClass =
+    weightOz && weightOz <= 16
+      ? 'Under 1 lb'
+      : weightOz <= 80
+        ? '1-5 lbs'
+        : '5-20 lbs';
+  const fragile =
+    signals.isLamp || /glass|ceramic|porcelain|breakable/i.test(sourceText);
+  const service =
+    weightClass === 'Under 1 lb'
+      ? 'USPS Ground Advantage'
+      : 'UPS Ground or USPS Ground Advantage';
+
+  return [
+    `Estimated weight class: ${weightClass}`,
+    `Fragile: ${fragile ? 'Yes' : 'No'}`,
+    `Recommended service: ${service}`,
+    `Flat rate or calculated: ${
+      weightClass === 'Under 1 lb' && !fragile
+        ? 'Flat rate can work well if kept competitive; calculated shipping is safer if box size varies.'
+        : 'Calculated shipping is recommended so the buyer pays accurately based on distance and package size.'
+    }`,
+  ].join('\n');
+}
+
+function buildPromptStylePhotoNotes(params: { sourceText: string }) {
+  const signals = detectProductSignals(params.sourceText);
+  const missing = signals.isVoxxBliss
+    ? [
+        'Top-down flat lay of both insoles out of the box',
+        'Close-up of the HPT neuro-point pattern on the insole surface',
+        'Close-up of the Size Large / Men 7–13 label',
+        'Photo of UPC, lot number, or box end panel if visible',
+      ]
+    : [
+        'Clear front hero shot on a clean background',
+        'Back, bottom, label, tag, model number, or maker mark close-up',
+        'Close-up of any wear, damage, or included accessories',
+        'Size reference photo when scale is not obvious',
+      ];
+
+  return [
+    'Hero Shot:',
+    'Use the clearest front-facing photo as the main image. Crop tight on the item and remove background clutter so it stands out in search results.',
+    '',
+    'Per-Photo Notes:',
+    '• Crop tight on the subject and keep the item centered',
+    '• Brighten slightly if the image looks dim or gray',
+    '• Do not use blurry, dark, or duplicate photos as main images',
+    '',
+    'Missing Shots:',
+    ...missing.map((item) => `• ${item}`),
+  ].join('\n');
+}
 function buildBestListingTitle(
   product: BarcodeProduct | null,
   condition: ListingCondition,
 ) {
-  if (!product) return '';
-
-  const category = inferListingCategory(product.title || '');
-  const seoParts = buildSEOKeywordParts(product);
-  let title = '';
-
-  if (category === 'electronics') {
-    const preferred = seoParts.filter((part) =>
-      [
-        'Verilux',
-        'HappyLight',
-        'Compact',
-        'Lamp',
-        '10,000 Lux',
-        'UV-Free',
-        'Light Therapy',
-      ].includes(part),
-    );
-    title = preferred.join(' ');
-  } else if (category === 'clothing') {
-    title = seoParts.slice(0, 8).join(' ');
-  } else if (category === 'toys') {
-    title = seoParts.slice(0, 8).join(' ');
-  } else {
-    title = seoParts.slice(0, 10).join(' ');
-  }
-
-  title = title
-    .replace(/Verilux Verilux/g, 'Verilux')
-    .replace(/Compact Compact/g, 'Compact');
-
-  if (condition === 'For Parts' && !/parts|repair/i.test(title)) {
-    title += ' Parts Repair';
-  } else if (condition === 'Open Box' && !/open box/i.test(title)) {
-    title += ' Open Box';
-  }
-
-  return enforceTitleLength(title, 80);
+  return buildPromptStyleTitle({ product, condition });
 }
 
 function buildBestListingDescription(
   product: BarcodeProduct | null,
   condition: ListingCondition,
 ) {
-  if (!product) return '';
+  const sourceText = getListingSourceText({ product });
+  const title = buildPromptStyleTitle({ product, condition });
 
-  const cleanTitle =
-    buildBestListingTitle(product, condition) ||
-    cleanListingText(product.title || 'Item');
-  const category = inferListingCategory(product.title || '');
-
-  const lines = [
-    `${cleanTitle} in ${String(condition).toLowerCase()} condition.`.replace(
-      'for parts condition',
-      'for parts or repair condition.',
-    ),
-  ];
-
-  if (category === 'electronics') {
-    if (/happylight|light therapy|lamp/i.test(product.title || '')) {
-      lines.push(
-        '',
-        '- Provides up to 10,000 lux of UV-free light',
-        '- Compact design, ideal for desk or tabletop use',
-        '- Good choice for focus, energy, and seasonal light therapy',
-      );
-    } else {
-      lines.push(
-        '',
-        '- Tested for basic function when possible',
-        '- Normal cosmetic wear from prior use',
-        '- Please review photos for exact condition and included items',
-      );
-    }
-  } else if (category === 'clothing') {
-    lines.push(
-      '',
-      '- Please review photos for size, color, and overall condition',
-      '- Normal wear may be present from prior use',
-      '- See pictures for exact item details',
-    );
-  } else if (category === 'toys') {
-    lines.push(
-      '',
-      '- Shows normal wear from prior use or storage',
-      '- Great for display, collecting, or play',
-      '- Review photos for exact condition and completeness',
-    );
-  } else {
-    lines.push(
-      '',
-      '- Please review photos for exact condition and included contents',
-      '- Normal signs of prior use may be present',
-    );
-  }
-
-  lines.push(
-    '',
-    `Condition: ${condition}`,
-    'Includes: Item shown in photos',
-    '',
-    'Please review all photos for exact condition before purchase.',
-  );
-
-  return lines.join('\n');
+  return buildPromptStyleDescription({
+    title,
+    product,
+    condition,
+    measurements: EMPTY_MEASUREMENTS,
+    isCylinder: false,
+    sourceText,
+  });
 }
 
 type SuggestedPriceRange = {
@@ -2080,8 +2507,138 @@ function getMedianPrice(values: number[]): number | null {
   return (prices[middle - 1] + prices[middle]) / 2;
 }
 
-function getCleanMarketCompPrices(items: EbaySearchItem[]): number[] {
-  const prices = items
+function normalizeComparableTitle(value?: string | null): string {
+  return normalizeSearchText(value)
+    .replace(/voxxlife/g, 'voxx life')
+    .replace(/voxxsports/g, 'voxx sports')
+    .replace(/voxxbliss/g, 'voxx bliss')
+    .replace(/bliss soles/g, 'bliss insoles')
+    .replace(/sole\b/g, 'insole')
+    .replace(/soles\b/g, 'insoles')
+    .replace(/orthotics/g, 'orthotic')
+    .replace(/neuro point activation/g, 'neuro point')
+    .replace(/enhanced wellness/g, 'wellness')
+    .replace(/men s/g, 'mens')
+    .replace(/7 13/g, 'large')
+    .replace(/size l\b/g, 'large')
+    .replace(/\bl\b/g, 'large')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getComparableTokens(value?: string | null): string[] {
+  const stopWords = new Set([
+    'the',
+    'and',
+    'with',
+    'for',
+    'new',
+    'used',
+    'open',
+    'box',
+    'brand',
+    'preowned',
+    'pre',
+    'owned',
+    'men',
+    'mens',
+    'women',
+    'womens',
+    'size',
+  ]);
+
+  return normalizeComparableTitle(value)
+    .split(' ')
+    .filter((token) => token.length > 2)
+    .filter((token) => !stopWords.has(token));
+}
+
+function scoreSoldCompMatch(
+  product: BarcodeProduct | null,
+  item: EbaySearchItem,
+): number {
+  const productText = normalizeComparableTitle(product?.title || '');
+  const itemText = normalizeComparableTitle(item?.title || '');
+
+  if (!itemText) return 0;
+  if (!productText) return getEbayItemPriceValue(item) ? 45 : 0;
+
+  const productTokens = new Set(getComparableTokens(productText));
+  const itemTokens = new Set(getComparableTokens(itemText));
+  let score = 0;
+
+  productTokens.forEach((token) => {
+    if (itemTokens.has(token)) score += 12;
+  });
+
+  const bothHave = (pattern: RegExp) =>
+    pattern.test(productText) && pattern.test(itemText);
+  const itemHas = (pattern: RegExp) => pattern.test(itemText);
+  const productHas = (pattern: RegExp) => pattern.test(productText);
+
+  if (bothHave(/voxx/)) score += 30;
+  if (bothHave(/bliss/)) score += 28;
+  if (bothHave(/insole|orthotic/)) score += 24;
+  if (bothHave(/large/)) score += 10;
+  if (bothHave(/hpt|neuro/)) score += 8;
+
+  if (
+    productHas(/voxx/) &&
+    productHas(/bliss/) &&
+    itemHas(/voxx/) &&
+    itemHas(/bliss/)
+  ) {
+    score += 25;
+  }
+  if (productHas(/insole|orthotic/) && itemHas(/sole|insole|orthotic/)) {
+    score += 18;
+  }
+
+  if (productHas(/voxx/) && !itemHas(/voxx|bliss/)) score -= 35;
+  if (productHas(/insole|orthotic/) && !itemHas(/sole|insole|orthotic/))
+    score -= 25;
+  if (/pair|2 pack|lot of|bundle|set of/i.test(item.title || '')) score -= 10;
+
+  return Math.max(0, Math.min(100, score));
+}
+
+function getUsableSoldCompItems(
+  product: BarcodeProduct | null,
+  items: EbaySearchItem[],
+): EbaySearchItem[] {
+  const pricedItems = items.filter((item) => {
+    const price = getEbayItemPriceValue(item);
+    return price !== null && price >= 3 && price <= 500;
+  });
+
+  if (!pricedItems.length) return [];
+  if (!product?.title) return pricedItems;
+
+  const scoredItems = pricedItems
+    .map((item) => ({ item, score: scoreSoldCompMatch(product, item) }))
+    .sort((a, b) => b.score - a.score);
+
+  const strongMatches = scoredItems
+    .filter(({ score }) => score >= 55)
+    .map(({ item }) => item);
+
+  if (strongMatches.length >= 2) return strongMatches;
+
+  const workableMatches = scoredItems
+    .filter(({ score }) => score >= 40)
+    .map(({ item }) => item);
+
+  if (workableMatches.length >= 2) return workableMatches;
+
+  return [];
+}
+
+function getCleanMarketCompPrices(
+  items: EbaySearchItem[],
+  product: BarcodeProduct | null = null,
+): number[] {
+  const usableItems = product ? getUsableSoldCompItems(product, items) : items;
+  const prices = usableItems
     .map((item) => getEbayItemPriceValue(item))
     .filter((value): value is number => value !== null)
     .filter((value) => value >= 3 && value <= 500)
@@ -2115,9 +2672,11 @@ function getSuggestedPriceRange(
   condition: ListingCondition = 'Used',
   marketItems: EbaySearchItem[] = [],
 ): SuggestedPriceRange {
-  const marketPrices = getCleanMarketCompPrices(marketItems);
+  const usableMarketItems = getUsableSoldCompItems(product, marketItems);
+  const marketPrices = getCleanMarketCompPrices(marketItems, product);
+  const marketCompCount = usableMarketItems.length;
 
-  if (marketPrices.length >= 3) {
+  if (marketPrices.length >= 2) {
     const trimmedPrices =
       marketPrices.length >= 6
         ? marketPrices.slice(1, marketPrices.length - 1)
@@ -2133,7 +2692,9 @@ function getSuggestedPriceRange(
       target,
       label: `Sold comp price: ${formatPrice(target)}\nRange: ${formatPrice(low)}-${formatPrice(high)}`,
       helperText:
-        'Based on sold comp pricing. Review Sold Listings to confirm before posting.',
+        marketCompCount >= 3
+          ? `Based on ${marketCompCount} matching sold comps. Review Sold Listings to confirm before posting.`
+          : `Based on ${marketCompCount} similar sold comps. Review Sold Listings to confirm before posting.`,
       source: 'market',
     };
   }
@@ -2210,7 +2771,7 @@ function getSuggestedPriceRange(
     high,
     target,
     label: `Fallback estimate: ${formatPrice(target)}\nRange: ${formatPrice(low)}-${formatPrice(high)}`,
-    helperText: `No usable sold comps found yet. ${reason} Tap Sold Listings to review manually before listing.`,
+    helperText: `No strong sold-comp match was returned by the in-app lookup yet. ${reason} Tap Sold Listings to review eBay manually before listing.`,
     source: 'category',
   };
 }
@@ -5324,7 +5885,7 @@ function buildPremiumShortDescription(params: {
   condition: ListingCondition;
 }): string {
   const { title, condition } = params;
-  return `${title}. Pre-filled with List Assist so you can review, tweak, and post faster. Condition: ${condition}.`;
+  return `${title} in ${condition.toLowerCase()} condition.`;
 }
 
 function buildPremiumFullDescription(params: {
@@ -5338,20 +5899,28 @@ function buildPremiumFullDescription(params: {
   const highlights = buildListingHighlights(detectedText);
   const possibleUpc = extractBarcodeFromText(detectedText || manualHint || '');
 
-  const detailLines = [
-    `Condition: ${condition}`,
-    manualHint ? `Helper words used: ${manualHint}` : '',
-    possibleUpc ? `UPC: ${possibleUpc}` : '',
-    ...highlights.map((line) => `Package details: ${line}`),
+  const featureLines = [
+    ...highlights.slice(0, 4).map((line) => `• ${line}`),
+    possibleUpc ? `• UPC: ${possibleUpc}` : '',
+    '• See photos for exact item details',
   ].filter(Boolean);
 
+  const safeFeatureLines = featureLines.length
+    ? featureLines
+    : ['• See photos for exact item details'];
+
   return [
-    `${title}.`,
+    `${title} in ${condition.toLowerCase()} condition.`,
     '',
-    'This listing draft was pre-filled using package-front scanning and smart matching to save time.',
-    'Please review title, specifics, included contents, and item condition before posting.',
+    'Key Features:',
+    ...safeFeatureLines,
     '',
-    detailLines.join('\n'),
+    'Condition:',
+    `${condition} condition overall.`,
+    '• Please review photos for exact cosmetic condition',
+    '• Includes only what is shown in photos',
+    '',
+    'Please review all photos before purchase.',
   ]
     .filter(Boolean)
     .join('\n');
@@ -5377,6 +5946,117 @@ function enhanceListingDraftForDisplay(params: {
     fullDescription,
     keywords: '',
     priceSuggestion,
+  };
+}
+
+function buildProEbayListingDraft(params: {
+  condition: ListingCondition;
+  product: BarcodeProduct | null;
+  measurements: Measurements;
+  isCylinder: boolean;
+  packageFrontSearchText: string;
+  packageFrontDetectedText?: string | null;
+  soldItems?: EbaySearchItem[];
+}): ListingDraft {
+  const {
+    condition,
+    product,
+    measurements,
+    isCylinder,
+    packageFrontSearchText,
+    packageFrontDetectedText,
+    soldItems,
+  } = params;
+
+  const sourceText = getListingSourceText({
+    product,
+    packageFrontSearchText,
+    packageFrontDetectedText,
+  });
+  const fallbackProduct: BarcodeProduct | null =
+    product || sourceText
+      ? {
+          barcode: '',
+          title: cleanListingText(sourceText || 'Item'),
+          length: Number(measurements.length || 0),
+          width: Number(measurements.width || 0),
+          height: Number(measurements.depth || 0),
+          source: 'Listing scan',
+          confidence: 'medium',
+        }
+      : null;
+  const listingProduct = product || fallbackProduct;
+  const title = buildPromptStyleTitle({
+    product: listingProduct,
+    condition,
+    packageFrontSearchText,
+    packageFrontDetectedText,
+  });
+  const fullDescription = buildPromptStyleDescription({
+    title,
+    product: listingProduct,
+    condition,
+    measurements,
+    isCylinder,
+    sourceText: sourceText || title,
+  });
+  const suggestedCategory = buildPromptStyleCategory(sourceText || title);
+  const pricingRecommendation = buildPromptStylePricing({
+    product: listingProduct,
+    condition,
+    soldItems,
+  });
+  const shippingRecommendation = buildPromptStyleShipping({
+    product: listingProduct,
+    sourceText: sourceText || title,
+  });
+  const itemSpecifics = buildPromptStyleItemSpecifics({
+    product: listingProduct,
+    condition,
+    sourceText: sourceText || title,
+  });
+  const photoNotes = buildPromptStylePhotoNotes({
+    sourceText: sourceText || title,
+  });
+
+  const titleTokens = new Set(tokenizeSearchText(title));
+  const keywordCandidates = dedupeWordsKeepOrder(
+    tokenizeSearchText(sourceText || title)
+      .filter((word) => word.length > 2)
+      .filter((word) => !titleTokens.has(word))
+      .filter(
+        (word) =>
+          ![
+            'used',
+            'new',
+            'open',
+            'box',
+            'for',
+            'parts',
+            'repair',
+            'with',
+            'and',
+            'the',
+          ].includes(word),
+      )
+      .map((word) => word.replace(/^./, (char) => char.toUpperCase())),
+  ).slice(0, 5);
+
+  return {
+    titleOptions: title ? [title] : [],
+    shortDescription: '',
+    fullDescription,
+    keywords: keywordCandidates.join(', '),
+    priceSuggestion: getSuggestedPriceRange(
+      listingProduct,
+      condition,
+      soldItems || [],
+    ).label,
+    itemSpecifics,
+    suggestedCategory,
+    pricingRecommendation,
+    shippingRecommendation,
+    photoNotes,
   };
 }
 
@@ -6548,6 +7228,7 @@ export default function HomeScreen() {
   const [looseItemPhotoUri, setLooseItemPhotoUri] = useState<string | null>(
     null,
   );
+  const [looseItemPhotoUris, setLooseItemPhotoUris] = useState<string[]>([]);
   const [looseItemSearchText, setLooseItemSearchText] = useState('');
   const [looseItemLookupNote, setLooseItemLookupNote] = useState<string | null>(
     null,
@@ -6578,12 +7259,18 @@ export default function HomeScreen() {
     'bug',
   );
   const [isSubmittingBugReport, setIsSubmittingBugReport] = useState(false);
+  const [helpfulFeedbackCompleted, setHelpfulFeedbackCompleted] = useState<
+    Record<string, boolean>
+  >({});
 
   const [listingPlatform, setListingPlatform] =
     useState<ListingPlatform>('ebay');
   const [listingCondition, setListingCondition] =
     useState<ListingCondition>('Used');
   const [listingDraft, setListingDraft] = useState<ListingDraft | null>(null);
+  const [listingSectionExpanded, setListingSectionExpanded] = useState<
+    Record<string, boolean>
+  >({});
   const [priceCheckerReturnStep, setPriceCheckerReturnStep] =
     useState<AppStep>('referencePicker');
   const [isPriceCheckerSession, setIsPriceCheckerSession] = useState(false);
@@ -6593,6 +7280,40 @@ export default function HomeScreen() {
   const [savedGarageSales, setSavedGarageSales] = useState<
     GarageSaleFavorite[]
   >([]);
+
+  useEffect(() => {
+    // Keep the Listing Builder synced with the current scanned item and
+    // automatically use the stronger Pro eBay listing format. This removes the
+    // extra Generate Pro Listing tap and keeps title/description current when
+    // the user changes condition.
+    const nextDraft = buildProEbayListingDraft({
+      condition: listingCondition,
+      product: barcodeProduct,
+      measurements,
+      isCylinder,
+      packageFrontSearchText,
+      packageFrontDetectedText,
+    });
+
+    setListingDraft(nextDraft);
+  }, [
+    barcodeProduct?.barcode,
+    barcodeProduct?.title,
+    barcodeProduct?.source,
+    barcodeProduct?.confidence,
+    barcodeProduct?.length,
+    barcodeProduct?.width,
+    barcodeProduct?.height,
+    barcodeProduct?.weightOz,
+    isCylinder,
+    listingCondition,
+    listingPlatform,
+    measurements.length,
+    measurements.width,
+    measurements.depth,
+    packageFrontDetectedText,
+    packageFrontSearchText,
+  ]);
   const [selectedGarageSalePinId, setSelectedGarageSalePinId] = useState<
     string | null
   >(null);
@@ -6670,6 +7391,7 @@ export default function HomeScreen() {
     setMeasurements(EMPTY_MEASUREMENTS);
     setSelectedFitModeKey('closest');
     setBarcodeProduct(null);
+    setListingDraft(null);
     setPendingBarcodeLinkProduct(null);
     resetBarcodeScannerState();
     setUserError('');
@@ -7861,7 +8583,7 @@ export default function HomeScreen() {
 
       let soldItems: EbaySearchItem[] = [];
       try {
-        const soldResult = await searchEbaySold(query, 20);
+        const soldResult = await searchEbaySoldSmart(query, barcodeProduct, 30);
         console.log('eBay sold search result:', soldResult);
         soldItems = Array.isArray(soldResult?.itemSummaries)
           ? soldResult.itemSummaries
@@ -8409,6 +9131,7 @@ Barcode not found, try Box instead.`,
 
   const resetLooseItemLookup = () => {
     setLooseItemPhotoUri(null);
+    setLooseItemPhotoUris([]);
     setLooseItemSearchText('');
     setLooseItemLookupNote(null);
     setLooseItemMatches([]);
@@ -8769,21 +9492,17 @@ Barcode not found, try Box instead.`,
         fullDescription: [
           `${listingCondition} ${smartTitle || fallbackProductTitle}.`,
           '',
-          'Suggested Item Details:',
+          'Key Features:',
           `• Suggested item: ${product.title}`,
-          `• Confidence: ${product.confidence ?? 'medium'}`,
-          `• Source: ${product.source}`,
-          packageFrontSearchText
-            ? `• Helper words entered: ${packageFrontSearchText}`
-            : '',
+          `• ${confidenceLabel} match`,
+          detectedPreview ? `• Visible package text: ${detectedPreview}` : '',
           '',
-          'Detected Package Text:',
-          detectedPreview || 'No detected package text was available.',
+          'Condition:',
+          `${listingCondition} condition overall.`,
+          '• Please review photos for exact cosmetic condition',
+          '• Includes only what is shown in photos',
           '',
-          'Notes:',
-          `• ${noteLine}`,
-          '• This draft was prefilled so you can quickly edit the title and description instead of rescanning.',
-          '• Please review all wording, item specifics, condition, and included contents before posting.',
+          'Please review all photos before purchase.',
         ]
           .filter(Boolean)
           .join('\n')
@@ -8921,6 +9640,7 @@ Barcode not found, try Box instead.`,
     ).trim();
 
     setLooseItemPhotoUri(params.photoUri);
+    setLooseItemPhotoUris([params.photoUri]);
     setLooseItemSearchText(imageHelperText);
     setLooseItemSelectedMatch(null);
     setLooseItemMatches([]);
@@ -9138,29 +9858,52 @@ Barcode not found, try Box instead.`,
 
   const runLooseItemLookup = async (
     manualHint?: string,
-    photoUriOverride?: string,
+    photoUriOverride?: string | string[],
   ) => {
-    const lookupPhotoUri = photoUriOverride ?? looseItemPhotoUri;
-    if (!lookupPhotoUri) return;
+    const lookupPhotoUris = (
+      Array.isArray(photoUriOverride)
+        ? photoUriOverride
+        : photoUriOverride
+          ? [photoUriOverride]
+          : looseItemPhotoUris.length
+            ? looseItemPhotoUris
+            : looseItemPhotoUri
+              ? [looseItemPhotoUri]
+              : []
+    )
+      .map((uri) => String(uri || '').trim())
+      .filter(Boolean)
+      .slice(0, 3);
+
+    if (!lookupPhotoUris.length) return;
 
     const helperText = (manualHint ?? looseItemSearchText).trim();
     setLooseItemSearchText(helperText);
+    setLooseItemPhotoUris(lookupPhotoUris);
+    setLooseItemPhotoUri(lookupPhotoUris[0]);
     setIsLooseItemLookupLoading(true);
-    beginProcessing('Searching eBay for likely matches...');
+    beginProcessing(
+      lookupPhotoUris.length > 1
+        ? `Searching eBay with ${lookupPhotoUris.length} item angles...`
+        : 'Searching eBay for likely matches...',
+    );
 
     try {
-      const result = await lookupLooseItemFromPhoto(lookupPhotoUri, helperText);
+      const result = await lookupLooseItemFromPhoto(
+        lookupPhotoUris,
+        helperText,
+      );
       const matches = (result.itemSummaries ?? []).slice(0, 8);
       setLooseItemMatches(matches);
       setLooseItemLookupNote(
         result.note ??
           (matches.length
             ? helperText
-              ? `Top photo match found using your photo and "${helperText}". Opening results now.`
-              : 'Top photo match found. Opening results now.'
+              ? `Top photo match found using ${lookupPhotoUris.length} photo${lookupPhotoUris.length === 1 ? '' : 's'} and "${helperText}". Opening results now.`
+              : `Top photo match found using ${lookupPhotoUris.length} photo${lookupPhotoUris.length === 1 ? '' : 's'}. Opening results now.`
             : helperText
-              ? `No strong matches came back for this photo and "${helperText}". Try a different photo or refine the wording below.`
-              : 'No strong matches came back. Try better lighting, a cleaner background, or add a few exact words.'),
+              ? `No strong matches came back for these photos and "${helperText}". Try a different angle or refine the wording below.`
+              : 'No strong matches came back. Try better lighting, a cleaner background, another angle, or add a few exact words.'),
       );
       setLooseItemSelectedMatch(null);
       setUserError('');
@@ -9172,6 +9915,45 @@ Barcode not found, try Box instead.`,
       }
     } catch (error) {
       console.log('runLooseItemLookup backend unavailable:', error);
+
+      // If a multi-angle upload hits a backend/multipart snag, do not make the
+      // user start over. Retry automatically with the front photo only, which is
+      // the original stable flow.
+      if (lookupPhotoUris.length > 1) {
+        try {
+          const retryResult = await lookupLooseItemFromPhoto(
+            lookupPhotoUris[0],
+            helperText,
+          );
+          const retryMatches = (retryResult.itemSummaries ?? []).slice(0, 8);
+          setLooseItemMatches(retryMatches);
+          setLooseItemLookupNote(
+            retryResult.note ??
+              (retryMatches.length
+                ? 'Extra angle search had trouble, so List Assist used the front photo and found matches.'
+                : 'Extra angle search had trouble, so List Assist retried with the front photo only. No strong matches came back yet.'),
+          );
+          setLooseItemSelectedMatch(null);
+          setUserError(
+            retryMatches.length
+              ? 'Extra angles had trouble, so the front photo result is being used.'
+              : 'Extra angles had trouble. Try one clear front photo or add helper words.',
+          );
+          if (retryMatches.length) {
+            await applyLooseItemMatch(retryMatches[0]);
+          } else {
+            setStep('looseItemPreview');
+            scrollToTop();
+          }
+          return;
+        } catch (retryError) {
+          console.log(
+            'runLooseItemLookup front-photo retry failed:',
+            retryError,
+          );
+        }
+      }
+
       const fallbackMatches = helperText
         ? buildLooseItemMockMatches(helperText).slice(0, 8)
         : [];
@@ -9219,17 +10001,18 @@ Barcode not found, try Box instead.`,
         return;
       }
 
-      setLooseItemPhotoUri(photo.uri);
-      setLooseItemSearchText('');
+      const nextUris = [...looseItemPhotoUris, photo.uri].slice(0, 3);
+      setLooseItemPhotoUris(nextUris);
+      setLooseItemPhotoUri(nextUris[0]);
       setLooseItemLookupNote(
-        'Searching eBay for likely matches from your photo...',
+        nextUris.length < 3
+          ? `${nextUris.length} photo${nextUris.length === 1 ? '' : 's'} ready. Add another angle if it helps, or search now.`
+          : 'Three photos ready. Search now to use all angles.',
       );
       setLooseItemMatches([]);
       setLooseItemSelectedMatch(null);
+      setStep('looseItemPreview');
       scrollToTop();
-      setTimeout(() => {
-        runLooseItemLookup('', photo.uri);
-      }, 0);
     } catch (error) {
       console.error('takeLooseItemPhoto error:', error);
       Alert.alert('Error', 'There was a problem taking the picture.');
@@ -10212,7 +10995,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             activeOpacity={0.75}
           >
             <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-              Retake Photo
+              Retake All Photos
             </Text>
           </TouchableOpacity>
         </ScrollView>
@@ -10261,7 +11044,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             activeOpacity={0.75}
           >
             <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-              Retake Photo
+              Retake All Photos
             </Text>
           </TouchableOpacity>
         </ScrollView>
@@ -10933,6 +11716,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                 </TouchableOpacity>
               </View>
 
+              {renderSmartSuggestions('sourcing')}
+
               <TouchableOpacity
                 style={[
                   styles.secondaryButton,
@@ -10969,18 +11754,20 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               <Text style={styles.subtitle}></Text>
 
               <View style={styles.helperTipsToggleRow}>
-                <View>
+                <View style={styles.helperTipsToggleTextWrap}>
                   <Text style={styles.helperTipsToggleTitle}>Helper Tips</Text>
                   <Text style={styles.helperTipsToggleSubtitle}>
-                    Show button hints while learning the app
+                    Show button hints and smart suggestions while learning the
+                    app
                   </Text>
                 </View>
                 <Switch
+                  style={styles.helperTipsToggleSwitch}
                   value={helperTipsEnabled}
                   onValueChange={handleHelperTipsToggle}
-                  trackColor={{ false: '#D1D5DB', true: '#BBF7D0' }}
-                  thumbColor={helperTipsEnabled ? '#22C55E' : '#F9FAFB'}
-                  ios_backgroundColor="#D1D5DB"
+                  trackColor={{ false: '#E5E7EB', true: '#34C759' }}
+                  thumbColor="#FFFFFF"
+                  ios_backgroundColor="#E5E7EB"
                 />
               </View>
 
@@ -11049,6 +11836,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                   </Text>
                 </TouchableOpacity>
               </View>
+
+              {renderSmartSuggestions('home')}
 
               <View style={styles.resultCard}>
                 {helperTipsEnabled ? (
@@ -13711,6 +14500,183 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
     );
   };
 
+  const getSmartSuggestions = (context: string): string[] => {
+    if (context === 'home') {
+      if (homeScanMode === 'source') {
+        return [
+          'Use Barcode first when the item has packaging. It usually gives the cleanest match.',
+          'Use Item when there is no box or barcode, then add a few helper words if the results drift.',
+          'After scanning, check sold listings before you buy so you are not guessing on value.',
+        ];
+      }
+
+      return [
+        'Use Barcode for sealed retail items, Box for package sizing, and Item for loose products.',
+        'Turn Helper Tips off once the buttons feel familiar.',
+        'For the best listing draft, scan the barcode first and then use Box if you need shipping size.',
+      ];
+    }
+
+    if (context === 'sourcing') {
+      return [
+        'Start with the closest results, then widen the radius only if the list feels thin.',
+        'Tap Map when the address is missing; directions still work from the store coordinates.',
+        'Ask sellers if they have items you do not see. That one question can uncover better inventory.',
+      ];
+    }
+
+    if (context === 'barcodeFailure') {
+      return [
+        'Try the barcode again if it was blurry, shiny, curved, or partly cut off.',
+        'Use Photo Scan when the barcode lookup misses but the front of the package is readable.',
+        'Add a short product hint later if the photo search needs help.',
+      ];
+    }
+
+    if (context === 'packageFrontConfirm') {
+      return [
+        'Confirm the product only if the title matches the item in front of you.',
+        'If the match feels too broad, retake the photo closer and flatter.',
+        'Use the helper words box for brand, model, size, color, or item type.',
+      ];
+    }
+
+    if (context === 'priceCheckerResult') {
+      return [
+        'Sold listings matter more than active listings when deciding what something is worth.',
+        'Treat very high or very low comps as noise unless the condition matches yours.',
+        'When in doubt, price near the middle and leave room for offers.',
+      ];
+    }
+
+    if (context === 'listingBuilder') {
+      return [
+        'Use the strongest title first, then remove any words that do not match the item.',
+        'Mention flaws clearly. Honest listings reduce returns and complaints.',
+        'Copy the draft, then adjust condition, measurements, and included items before posting.',
+      ];
+    }
+
+    return [
+      'Slow down and use the most specific scan option available.',
+      'When results look weak, add a few helper words or try a cleaner photo.',
+      'Report confusing results so they can be improved.',
+    ];
+  };
+
+  const renderSmartSuggestions = (context: string) => {
+    if (!helperTipsEnabled) return null;
+
+    const suggestions = getSmartSuggestions(context);
+
+    if (!suggestions.length) return null;
+
+    return (
+      <View style={styles.smartSuggestionCard}>
+        <View style={styles.smartSuggestionHeaderRow}>
+          <Text style={styles.smartSuggestionIcon}>💡</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.smartSuggestionTitle}>Smart Suggestions</Text>
+            <Text style={styles.smartSuggestionSubtitle}>
+              Quick tips for this screen
+            </Text>
+          </View>
+        </View>
+
+        {suggestions.map((suggestion, index) => (
+          <View
+            key={`${context}-suggestion-${index}`}
+            style={styles.smartSuggestionRow}
+          >
+            <Text style={styles.smartSuggestionBullet}>•</Text>
+            <Text style={styles.smartSuggestionText}>{suggestion}</Text>
+          </View>
+        ))}
+      </View>
+    );
+  };
+
+  const getHelpfulFeedbackLabel = (context: string) => {
+    if (context === 'priceCheckerResult') return 'price checker results';
+    if (context === 'listingBuilder') return 'listing builder';
+    if (context === 'compCheck') return 'market check';
+    return 'this screen';
+  };
+
+  const buildNotHelpfulReportMessage = (context: string) => {
+    const contextLabel = getHelpfulFeedbackLabel(context);
+    const itemTitle =
+      barcodeProduct?.title ||
+      looseItemMatches[0]?.title ||
+      packageFrontSearchText ||
+      looseItemSearchText ||
+      'No item title captured';
+
+    return [
+      `The ${contextLabel} was not helpful.`,
+      '',
+      `Item: ${itemTitle}`,
+      `Screen: ${context}`,
+      `Mode: ${homeScanMode}`,
+      '',
+      'What felt wrong or confusing:',
+    ].join('\n');
+  };
+
+  const handleHelpfulFeedback = (context: string, wasHelpful: boolean) => {
+    const key = `${context}-${homeScanMode}`;
+    setHelpfulFeedbackCompleted((previous) => ({
+      ...previous,
+      [key]: true,
+    }));
+
+    if (wasHelpful) {
+      void triggerSavedHaptic();
+      showVisualFeedback('success', 'Thanks — glad it helped.', 1600);
+      return;
+    }
+
+    void triggerTickHaptic();
+    setBugReportType('bug');
+    setBugReportMessage(buildNotHelpfulReportMessage(context));
+    setStep('bugReport');
+    scrollToTop();
+  };
+
+  const renderHelpfulFeedback = (context: string) => {
+    const key = `${context}-${homeScanMode}`;
+    if (helpfulFeedbackCompleted[key]) return null;
+
+    return (
+      <View style={styles.helpfulFeedbackCard}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.helpfulFeedbackTitle}>Was this helpful?</Text>
+          <Text style={styles.helpfulFeedbackSubtitle}>
+            Quick feedback helps improve List Assist.
+          </Text>
+        </View>
+
+        <View style={styles.helpfulFeedbackButtonRow}>
+          <TouchableOpacity
+            style={[styles.helpfulFeedbackButton, styles.helpfulFeedbackYes]}
+            onPress={() => handleHelpfulFeedback(context, true)}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.helpfulFeedbackYesText}>Yes</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.helpfulFeedbackButton, styles.helpfulFeedbackNo]}
+            onPress={() => handleHelpfulFeedback(context, false)}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.helpfulFeedbackNoText}>No</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  };
+
   const renderBarcodeScanner = () => {
     return (
       <View style={styles.cameraScreen}>
@@ -13808,6 +14774,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               item that the camera can still recognize.
             </Text>
           </View>
+
+          {renderSmartSuggestions('barcodeFailure')}
 
           <TouchableOpacity
             style={styles.primaryButton}
@@ -13978,7 +14946,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             activeOpacity={0.75}
           >
             <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-              Retake Photo
+              Retake All Photos
             </Text>
           </TouchableOpacity>
 
@@ -14100,7 +15068,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             activeOpacity={0.75}
           >
             <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-              Retake Photo
+              Retake All Photos
             </Text>
           </TouchableOpacity>
 
@@ -14112,6 +15080,12 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
   };
 
   const renderLooseItemCamera = () => {
+    const nextPhotoNumber = Math.min(looseItemPhotoUris.length + 1, 3);
+    const cameraTitle =
+      nextPhotoNumber === 1
+        ? 'Scan Front of Item'
+        : `Scan Angle ${nextPhotoNumber}`;
+
     return (
       <View style={styles.cameraScreen}>
         <CameraView
@@ -14124,7 +15098,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
         <SafeAreaView style={styles.cameraOverlay}>
           <View style={styles.cameraTopBar}>
             <View style={styles.cameraBadgeStack}>
-              <Text style={styles.cameraInfoLabel}>Scan Item</Text>
+              <Text style={styles.cameraInfoLabel}>{cameraTitle}</Text>
             </View>
 
             <View style={styles.cameraTopSpacer} />
@@ -14135,11 +15109,13 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             {helperTipsEnabled ? (
               <>
                 <Text style={styles.guideText}>
-                  Fill the frame with the item.
+                  {nextPhotoNumber === 1
+                    ? 'Start with the front or main view.'
+                    : 'Capture another useful angle.'}
                 </Text>
                 <Text style={styles.guideSubText}>
                   Get close and keep the item edges visible. Plain background is
-                  best. Avoid glare and shadows.
+                  best. Add up to 3 photos total, but extra angles are optional.
                 </Text>
               </>
             ) : null}
@@ -14164,7 +15140,15 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
   };
 
   const renderLooseItemPreview = () => {
-    if (!looseItemPhotoUri) return null;
+    const previewUris = looseItemPhotoUris.length
+      ? looseItemPhotoUris
+      : looseItemPhotoUri
+        ? [looseItemPhotoUri]
+        : [];
+
+    if (!previewUris.length) return null;
+
+    const canAddMoreAngles = previewUris.length < 3;
 
     return (
       <SafeAreaView style={styles.screen}>
@@ -14175,25 +15159,35 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator
         >
-          <Text style={styles.title}>Find from Photo</Text>
+          <Text style={styles.title}>Find from Photos</Text>
           <Text style={styles.subtitle}>
-            We’ll search eBay using this item photo. If live photo search is
-            offline, add a few helper words like brand, model, or item type.
+            Start with the front photo. Add up to two optional angles if they
+            show labels, markings, the side, bottom, or back.
           </Text>
 
           {renderUserError()}
 
-          <Image
-            source={{ uri: looseItemPhotoUri }}
-            style={styles.packageFrontPreviewImage}
-            resizeMode="contain"
-          />
+          <View style={{ gap: 10 }}>
+            {previewUris.map((uri, index) => (
+              <View key={`${uri}-${index}`} style={styles.resultCard}>
+                <Text style={styles.resultLabel}>
+                  {index === 0 ? 'Front / main photo' : `Angle ${index + 1}`}
+                </Text>
+                <Image
+                  source={{ uri }}
+                  style={styles.packageFrontPreviewImage}
+                  resizeMode="contain"
+                />
+              </View>
+            ))}
+          </View>
 
           {isLooseItemLookupLoading ? (
             <View style={styles.lookupStatusCardInline}>
               <ActivityIndicator size="small" color="#111" />
               <Text style={styles.lookupStatusInlineText}>
-                Searching eBay for likely matches...
+                Searching eBay with {previewUris.length} photo
+                {previewUris.length === 1 ? '' : 's'}...
               </Text>
             </View>
           ) : null}
@@ -14205,11 +15199,35 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               isProcessing && styles.buttonDisabled,
             ]}
             disabled={isProcessing}
-            onPress={() => runLooseItemLookup(looseItemSearchText)}
+            onPress={() => runLooseItemLookup(looseItemSearchText, previewUris)}
             activeOpacity={0.75}
           >
-            <Text style={styles.primaryButtonText}>Find Matches</Text>
+            <Text style={styles.primaryButtonText}>
+              Search with {previewUris.length} Photo
+              {previewUris.length === 1 ? '' : 's'}
+            </Text>
           </TouchableOpacity>
+
+          {canAddMoreAngles ? (
+            <TouchableOpacity
+              style={[
+                styles.secondaryButton,
+                { height: 48, justifyContent: 'center', alignItems: 'center' },
+                isProcessing && styles.buttonDisabled,
+              ]}
+              disabled={isProcessing}
+              onPress={() => {
+                setLooseItemLookupNote(null);
+                setStep('looseItemCamera');
+                scrollToTop();
+              }}
+              activeOpacity={0.75}
+            >
+              <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
+                Add Another Angle ({previewUris.length}/3)
+              </Text>
+            </TouchableOpacity>
+          ) : null}
 
           <TouchableOpacity
             style={[
@@ -14222,7 +15240,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             activeOpacity={0.75}
           >
             <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-              Retake Photo
+              Retake All Photos
             </Text>
           </TouchableOpacity>
 
@@ -14243,7 +15261,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               </Text>
             ) : (
               <Text style={styles.resultDescription}>
-                Use a plain background and make the item fill most of the frame.
+                Extra angles are optional. Add one only when it shows useful
+                text, markings, model numbers, or a distinctive side/back view.
               </Text>
             )}
           </View>
@@ -14344,7 +15363,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                   activeOpacity={0.75}
                 >
                   <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-                    No - Retake Photo
+                    No - Retake All Photos
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -14366,7 +15385,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                 activeOpacity={0.75}
               >
                 <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-                  Retake Photo
+                  Retake All Photos
                 </Text>
               </TouchableOpacity>
             )}
@@ -14601,7 +15620,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             activeOpacity={0.75}
           >
             <Text style={[styles.secondaryButtonText, { color: '#fff' }]}>
-              Retake Photo
+              Retake All Photos
             </Text>
           </TouchableOpacity>
 
@@ -14765,6 +15784,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           ) : null}
 
           {renderEbayResultsBlock()}
+          {renderHelpfulFeedback('compCheck')}
         </ScrollView>
       </SafeAreaView>
     );
@@ -14852,7 +15872,11 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
 
     const loadSoldCompsForPriceCard = async () => {
       try {
-        const soldResult = await searchEbaySold(marketQuery, 30);
+        const soldResult = await searchEbaySoldSmart(
+          marketQuery,
+          barcodeProduct,
+          30,
+        );
         if (cancelled) return;
 
         const soldItems = Array.isArray(soldResult?.itemSummaries)
@@ -14970,6 +15994,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             </Text>
           </View>
 
+          {renderSmartSuggestions('priceCheckerResult')}
+
           {marketQuery ? (
             <View
               style={[
@@ -15058,6 +16084,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             </View>
           ) : null}
 
+          {renderHelpfulFeedback('priceCheckerResult')}
+
           <TouchableOpacity
             style={[
               styles.primaryButton,
@@ -15082,25 +16110,17 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
       'For Parts',
     ];
 
-    const baseDraft =
+    const draft =
       listingDraft ??
-      buildListingDraft({
-        platform: listingPlatform,
+      buildProEbayListingDraft({
         condition: listingCondition,
         product: barcodeProduct,
         measurements,
         isCylinder,
         packageFrontSearchText,
-        titleVariantSeed,
+        packageFrontDetectedText,
+        soldItems: ebaySoldResults.length ? ebaySoldResults : [],
       });
-
-    const draft = enhanceListingDraftForDisplay({
-      draft: baseDraft,
-      product: barcodeProduct,
-      condition: listingCondition,
-      detectedText: packageFrontDetectedText,
-      manualHint: packageFrontSearchText,
-    });
 
     const cleanedTitleOptions = dedupeTitleOptions(draft.titleOptions ?? []);
     const bestTitleIndex = getBestTitleIndex(cleanedTitleOptions, {
@@ -15111,11 +16131,10 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
       isCylinder,
     });
     const bestTitle =
-      buildBestListingTitle(barcodeProduct, listingCondition) ||
       enforceTitleLength(
         cleanedTitleOptions[bestTitleIndex] ?? cleanedTitleOptions[0] ?? '',
         80,
-      );
+      ) || buildBestListingTitle(barcodeProduct, listingCondition);
     const listingConfidence = getListingConfidence(barcodeProduct);
     const listingMarketQuery = buildLiveEbayQuery(
       (barcodeProduct?.title || bestTitle || '').trim(),
@@ -15124,11 +16143,63 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
     const hasListingMarketQuery = Boolean(
       listingMarketQuery || (barcodeProduct?.barcode || '').trim(),
     );
-    const listingSuggestedPrice = getSuggestedPriceRange(
-      barcodeProduct,
-      listingCondition,
-      ebaySoldResults.length ? ebaySoldResults : [],
-    );
+    const renderListingDetailSection = (
+      sectionKey: string,
+      title: string,
+      content?: string,
+      collapsedByDefault = true,
+    ) => {
+      if (!content) return null;
+
+      const isExpanded = collapsedByDefault
+        ? Boolean(listingSectionExpanded[sectionKey])
+        : true;
+
+      return (
+        <View style={styles.resultCard}>
+          <TouchableOpacity
+            onPress={() => {
+              if (!collapsedByDefault) return;
+              setListingSectionExpanded((current) => ({
+                ...current,
+                [sectionKey]: !current[sectionKey],
+              }));
+            }}
+            activeOpacity={collapsedByDefault ? 0.75 : 1}
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+            }}
+          >
+            <Text style={[styles.sectionTitle, { flex: 1 }]}>{title}</Text>
+            {collapsedByDefault ? (
+              <Text
+                style={{
+                  fontSize: 22,
+                  fontWeight: '800',
+                  color: '#64748B',
+                  lineHeight: 24,
+                }}
+              >
+                {isExpanded ? '−' : '+'}
+              </Text>
+            ) : null}
+          </TouchableOpacity>
+          {isExpanded ? (
+            <Text
+              style={[
+                styles.resultDescription,
+                collapsedByDefault ? { marginTop: 8 } : null,
+              ]}
+            >
+              {content}
+            </Text>
+          ) : null}
+        </View>
+      );
+    };
 
     return (
       <SafeAreaView style={styles.screen}>
@@ -15138,32 +16209,34 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           keyboardShouldPersistTaps="handled"
         >
           <Text style={styles.title}>Build the Listing</Text>
-          {listingSuggestedPrice.label ? (
-            <View
+          {renderSmartSuggestions('listingBuilder')}
+
+          <View
+            style={[
+              styles.resultCard,
+              {
+                backgroundColor: '#FFF7ED',
+                borderColor: '#F59E0B',
+                shadowColor: '#7C2D12',
+                shadowOpacity: 0.06,
+                shadowRadius: 8,
+                shadowOffset: { width: 0, height: 3 },
+                elevation: 2,
+              },
+            ]}
+          >
+            <Text style={[styles.sectionTitle, { color: '#9A3412' }]}>
+              Item
+            </Text>
+            <Text
               style={[
-                styles.resultCard,
-                {
-                  backgroundColor: '#FFF7ED',
-                  borderColor: '#F59E0B',
-                  shadowColor: '#7C2D12',
-                  shadowOpacity: 0.06,
-                  shadowRadius: 8,
-                  shadowOffset: { width: 0, height: 3 },
-                  elevation: 2,
-                },
+                styles.resultValueSmall,
+                { color: '#7C2D12', marginBottom: 0 },
               ]}
             >
-              <Text style={[styles.sectionTitle, { color: '#9A3412' }]}>
-                Price Data
-              </Text>
-              <Text style={[styles.resultValue, { color: '#7C2D12' }]}>
-                {listingSuggestedPrice.label}
-              </Text>
-              <Text style={[styles.helperText, { color: '#9A3412' }]}>
-                {listingSuggestedPrice.helperText}
-              </Text>
-            </View>
-          ) : null}
+              {bestTitle || barcodeProduct?.title || 'Scanned item'}
+            </Text>
+          </View>
 
           {hasListingMarketQuery ? (
             <View
@@ -15247,6 +16320,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
             </View>
           ) : null}
 
+          {renderHelpfulFeedback('listingBuilder')}
+
           <View style={styles.resultCard}>
             <Text style={styles.sectionTitle}>Condition</Text>
             <View style={styles.chipRow}>
@@ -15261,16 +16336,6 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                     ]}
                     onPress={() => {
                       setListingCondition(option);
-                      const nextDraft = buildListingDraft({
-                        platform: listingPlatform,
-                        condition: option,
-                        product: barcodeProduct,
-                        measurements,
-                        isCylinder,
-                        packageFrontSearchText,
-                        titleVariantSeed,
-                      });
-                      setListingDraft(nextDraft);
                     }}
                     activeOpacity={0.75}
                   >
@@ -15334,6 +16399,41 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               <Text style={styles.primaryButtonText}>Copy Description</Text>
             </TouchableOpacity>
           </View>
+
+          {renderListingDetailSection(
+            'suggestedCategory',
+            'Suggested Category',
+            draft.suggestedCategory,
+            false,
+          )}
+
+          {renderListingDetailSection(
+            'pricingRecommendation',
+            'Pricing Recommendation',
+            draft.pricingRecommendation,
+            true,
+          )}
+
+          {renderListingDetailSection(
+            'itemSpecifics',
+            'Item Specifics',
+            draft.itemSpecifics,
+            true,
+          )}
+
+          {renderListingDetailSection(
+            'shippingRecommendation',
+            'Shipping Recommendation',
+            draft.shippingRecommendation,
+            true,
+          )}
+
+          {renderListingDetailSection(
+            'photoNotes',
+            'Photo Enhancement Notes',
+            draft.photoNotes,
+            true,
+          )}
 
           <TouchableOpacity
             style={[
@@ -15478,9 +16578,20 @@ const styles = StyleSheet.create({
     borderColor: '#E5E7EB',
     borderRadius: 18,
     paddingVertical: 10,
-    paddingHorizontal: 14,
+    paddingLeft: 14,
+    paddingRight: 10,
     marginTop: 2,
     marginBottom: 14,
+    overflow: 'hidden',
+  },
+  helperTipsToggleTextWrap: {
+    flex: 1,
+    flexShrink: 1,
+    paddingRight: 12,
+  },
+  helperTipsToggleSwitch: {
+    flexShrink: 0,
+    transform: [{ scaleX: 0.92 }, { scaleY: 0.92 }],
   },
   helperTipsToggleTitle: {
     color: '#0F172A',
@@ -18010,6 +19121,110 @@ const styles = StyleSheet.create({
   feedbackToastTextInfo: {
     color: '#1d4ed8',
   },
+  smartSuggestionCard: {
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    borderRadius: 18,
+    backgroundColor: '#EFF6FF',
+    padding: 16,
+    marginBottom: 12,
+  },
+  smartSuggestionHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 10,
+  },
+  smartSuggestionIcon: {
+    fontSize: 24,
+    lineHeight: 28,
+  },
+  smartSuggestionTitle: {
+    fontSize: 17,
+    fontWeight: '900',
+    color: '#1E3A8A',
+  },
+  smartSuggestionSubtitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#475569',
+    marginTop: 2,
+  },
+  smartSuggestionRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+    marginTop: 6,
+  },
+  smartSuggestionBullet: {
+    fontSize: 17,
+    lineHeight: 22,
+    color: '#2563EB',
+    fontWeight: '900',
+  },
+  smartSuggestionText: {
+    flex: 1,
+    fontSize: 14,
+    lineHeight: 21,
+    color: '#334155',
+    fontWeight: '600',
+  },
+
+  helpfulFeedbackCard: {
+    borderWidth: 1,
+    borderColor: '#BBF7D0',
+    borderRadius: 18,
+    backgroundColor: '#F0FDF4',
+    padding: 16,
+    marginTop: 12,
+    marginBottom: 14,
+  },
+  helpfulFeedbackTitle: {
+    fontSize: 18,
+    lineHeight: 24,
+    fontWeight: '900',
+    color: '#14532D',
+  },
+  helpfulFeedbackSubtitle: {
+    marginTop: 4,
+    fontSize: 14,
+    lineHeight: 20,
+    fontWeight: '700',
+    color: '#166534',
+  },
+  helpfulFeedbackButtonRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 14,
+  },
+  helpfulFeedbackButton: {
+    flex: 1,
+    minHeight: 46,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  helpfulFeedbackYes: {
+    backgroundColor: '#16A34A',
+    borderColor: '#16A34A',
+  },
+  helpfulFeedbackNo: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#86EFAC',
+  },
+  helpfulFeedbackYesText: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: '#FFFFFF',
+  },
+  helpfulFeedbackNoText: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: '#166534',
+  },
+
   buttonDisabled: {
     opacity: 0.55,
   },

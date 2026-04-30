@@ -280,59 +280,90 @@ app.get('/api/ebay-sold', async (req, res) => {
 });
 app.post(
   '/api/ebay/search-by-image',
-  upload.single('file'),
+  upload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'files', maxCount: 3 },
+  ]),
   async (req, res) => {
     try {
       const hint = cleanHint(req.body?.hint);
       const limit = Math.max(1, Math.min(Number(req.body?.limit || 12), 50));
 
-      if (!req.file || !req.file.buffer) {
+      const uploadedFiles = [
+        ...(Array.isArray(req.files?.file) ? req.files.file : []),
+        ...(Array.isArray(req.files?.files) ? req.files.files : []),
+      ]
+        .filter((file) => file && file.buffer)
+        .slice(0, 3);
+
+      if (!uploadedFiles.length) {
         return res.status(400).json({
           error: 'Missing image upload',
-          message: 'Expected a multipart file field named "file".',
+          message:
+            'Expected one or more multipart image fields named "file" or "files".',
         });
       }
 
       const accessToken = await getEbayAccessToken();
-      const imageBase64 = req.file.buffer.toString('base64');
 
-      const url = new URL(EBAY_BROWSE_IMAGE_SEARCH_URL);
-      url.searchParams.set('limit', String(limit));
+      const runImageSearch = async (file, index) => {
+        try {
+          const imageBase64 = file.buffer.toString('base64');
+          const url = new URL(EBAY_BROWSE_IMAGE_SEARCH_URL);
+          url.searchParams.set('limit', String(limit));
 
-      const ebayResponse = await fetch(url.toString(), {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
-        },
-        body: JSON.stringify({
-          image: imageBase64,
-        }),
-      });
+          const ebayResponse = await fetch(url.toString(), {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+              'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+            },
+            body: JSON.stringify({
+              image: imageBase64,
+            }),
+          });
 
-      const responseText = await ebayResponse.text();
+          const responseText = await ebayResponse.text();
 
-      if (!ebayResponse.ok) {
-        return res.status(ebayResponse.status).json({
-          error: 'eBay image search failed',
-          message: responseText,
-        });
+          if (!ebayResponse.ok) {
+            console.warn(
+              `eBay image search failed for photo ${index + 1}:`,
+              responseText,
+            );
+            return [];
+          }
+
+          try {
+            const imageData = JSON.parse(responseText);
+            return Array.isArray(imageData?.itemSummaries)
+              ? imageData.itemSummaries
+              : [];
+          } catch (parseError) {
+            console.warn(
+              `Could not parse eBay image-search response for photo ${index + 1}:`,
+              responseText,
+            );
+            return [];
+          }
+        } catch (imageSearchError) {
+          console.warn(
+            `eBay image search request failed for photo ${index + 1}:`,
+            imageSearchError?.message || imageSearchError,
+          );
+          return [];
+        }
+      };
+
+      // Run angle searches one at a time instead of in parallel. This is slower by a
+      // second or two, but it is much more reliable on mobile uploads and avoids one
+      // extra-angle failure taking down the whole lookup.
+      const imageSearchGroups = [];
+      for (let index = 0; index < uploadedFiles.length; index += 1) {
+        const group = await runImageSearch(uploadedFiles[index], index);
+        imageSearchGroups.push(group);
       }
-
-      let imageData;
-      try {
-        imageData = JSON.parse(responseText);
-      } catch (parseError) {
-        return res.status(500).json({
-          error: 'Could not parse eBay image-search response',
-          message: responseText,
-        });
-      }
-
-      const imageMatches = Array.isArray(imageData?.itemSummaries)
-        ? imageData.itemSummaries
-        : [];
+      const imageMatches = imageSearchGroups.flat();
 
       // Optional second pass: if we got helper words, blend in a text search too.
       let textMatches = [];
@@ -362,23 +393,32 @@ app.post(
         }
       }
 
-      // Merge image matches first, then text matches, deduped by itemId/title.
-      const seen = new Set();
-      const merged = [...imageMatches, ...textMatches].filter((item) => {
+      // Score duplicates slightly higher when multiple angles return the same item.
+      const scoreMap = new Map();
+      [...imageMatches, ...textMatches].forEach((item, index) => {
         const key = item?.itemId || item?.title;
-        if (!key || seen.has(key)) return false;
-        seen.add(key);
-        return true;
+        if (!key) return;
+
+        const current = scoreMap.get(key) || { item, score: 0 };
+        const isTextMatch = index >= imageMatches.length;
+        current.score += isTextMatch ? 1 : 2;
+        current.item = current.item || item;
+        scoreMap.set(key, current);
       });
+
+      const merged = Array.from(scoreMap.values())
+        .sort((a, b) => b.score - a.score)
+        .map((entry) => entry.item);
 
       const limitedMerged = merged.slice(0, limit);
       const limitedImageMatches = imageMatches.slice(0, limit);
       const limitedTextMatches = textMatches.slice(0, limit);
+      const photoCount = uploadedFiles.length;
 
       return res.json({
         note: hint
-          ? `Image search ran first, then helper words "${hint}" were blended in.`
-          : 'Image search ran successfully.',
+          ? `Image search used ${photoCount} photo${photoCount === 1 ? '' : 's'}, then helper words "${hint}" were blended in.`
+          : `Image search used ${photoCount} photo${photoCount === 1 ? '' : 's'}.`,
         itemSummaries: limitedMerged,
         imageItemSummaries: limitedImageMatches,
         textItemSummaries: limitedTextMatches,
@@ -386,6 +426,7 @@ app.post(
         imageItems: normalizeEbayItems(limitedImageMatches),
         textItems: normalizeEbayItems(limitedTextMatches),
         exactQuery: exactQuery || '',
+        photoCount,
       });
     } catch (error) {
       console.error('Image search server error:', error.message);
