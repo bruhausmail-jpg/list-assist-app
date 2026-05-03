@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v10-estate-true-50-mile-expanded-sweep';
+const ESTATE_ROUTE_VERSION = 'source-assist-v15-default-today-query-fix';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -233,8 +233,13 @@ function extractStatusText(snippet = '') {
 function extractDateText(snippet = '') {
   const text = stripHtml(snippet);
 
+  const monthName = '(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*';
   const patterns = [
-    /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:\s*-\s*\d{1,2})?(?:,\s*\d{4})?/i,
+    // EstateSales.net often renders: "May 1, 2, 3, 4".
+    new RegExp(`\\b${monthName}\\s+\\d{1,2}(?:st|nd|rd|th)?(?:\\s*,\\s*\\d{1,2}(?:st|nd|rd|th)?){1,10}(?:,?\\s*20\\d{2})?`, 'i'),
+    // Handles: "May 2 to May 5", "Apr 30 to May 5", "May 2 - 5".
+    new RegExp(`\\b${monthName}\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s*20\\d{2})?\\s*(?:-|–|to|through|thru)\\s*(?:${monthName}\\s+)?\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s*20\\d{2})?`, 'i'),
+    new RegExp(`\\b${monthName}\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,\\s*\\d{4})?`, 'i'),
     /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?(?:\s*-\s*\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)?/,
   ];
 
@@ -308,9 +313,15 @@ function isCurrentOrUpcoming(snippet = '') {
 
   if (!text) return false;
   if (/sale\s+is\s+over/.test(text)) return false;
+  if (/ended|closed|completed/.test(text) && !/going on now|resumes|starts|today|tomorrow/.test(text)) {
+    return false;
+  }
 
   const positiveSignals = [
     /going on now/,
+    /resumes today/,
+    /resumes tomorrow/,
+    /ends today/,
     /starts today/,
     /starts tomorrow/,
     /starts in \d+ day/,
@@ -324,6 +335,8 @@ function isCurrentOrUpcoming(snippet = '') {
     /\bmon(?:day)?\b/,
     /\btue(?:sday)?\b/,
     /\bwed(?:nesday)?\b/,
+    /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}/,
+    /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/,
   ];
 
   return positiveSignals.some((pattern) => pattern.test(text));
@@ -1205,7 +1218,25 @@ function parseEstateSalesFromHtml(html, requestedZip) {
   const results = [];
   const seenUrls = new Set();
 
-  const linkMatches = [...html.matchAll(/href="(\/IL\/[^"]+\/\d+)"/gi)];
+  // EstateSales.net puts a separate section lower on the page for sales that
+  // did NOT match the active filters, for example "not happening today".
+  // Do not parse those links into the app's Today list.
+  const lowerHtml = String(html || '').toLowerCase();
+  const cutoffCandidates = [
+    lowerHtml.indexOf("below are the sales that didn't quite match"),
+    lowerHtml.indexOf('below are the sales that didn&#39;t quite match'),
+    lowerHtml.indexOf('sales that are not happening today'),
+    lowerHtml.indexOf('sales more than 50 miles away'),
+  ].filter((index) => index > 0);
+  const cutoffIndex = cutoffCandidates.length ? Math.min(...cutoffCandidates) : -1;
+  const searchableHtml = cutoffIndex > 0 ? html.slice(0, cutoffIndex) : html;
+
+  // EstateSales.net's rendered listing page exposes sale links in this format:
+  // /IL/Downers-Grove/60516/1702897. Keep this broad enough for single/double
+  // quoted hrefs and query strings, but tight enough to avoid navigation links.
+  const linkMatches = [
+    ...searchableHtml.matchAll(/href=["'](\/IL\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi),
+  ];
 
   for (const match of linkMatches) {
     const href = match[1];
@@ -1216,10 +1247,14 @@ function parseEstateSalesFromHtml(html, requestedZip) {
     if (seenUrls.has(absoluteUrl)) continue;
     seenUrls.add(absoluteUrl);
 
-    const index = html.indexOf(href);
+    const index = searchableHtml.indexOf(href);
     if (index === -1) continue;
 
-    const snippet = html.slice(Math.max(0, index - 1200), index + 1200);
+    // The live city/ZIP listing page puts a lot of useful data around the href:
+    // title, company, pictures, street/city/ZIP, miles away, dates, times, status.
+    // A wider window prevents the parser from dropping real listings when the
+    // markup changes spacing/classes.
+    const snippet = searchableHtml.slice(Math.max(0, index - 2600), index + 3200);
 
     if (!isCurrentOrUpcoming(snippet)) continue;
 
@@ -1373,7 +1408,7 @@ function normalizeCitySlug(city = '') {
 function getEstateSalesSearchTargets(
   requestedZip = '60565',
   requestedCity = 'Naperville',
-  requestedRadiusMiles = 50,
+  _requestedRadiusMiles = 50,
 ) {
   const targets = [];
   const seen = new Set();
@@ -1388,16 +1423,10 @@ function getEstateSalesSearchTargets(
     targets.push({ city: cleanCity, zip: cleanZip });
   };
 
+  // Important: use the user's actual EstateSales.net city/ZIP origin page.
+  // The old expanded seed sweep pulled other city pages and made the app drift
+  // away from what EstateSales.net actually shows for the selected origin.
   addTarget(requestedCity || 'Naperville', requestedZip || '60565');
-
-  // EstateSales.net often limits the listing rows on one city/ZIP page.
-  // For 50-mile searches, pull nearby city pages too, then de-dupe and
-  // radius-filter by real coordinates after detail enrichment.
-  if (Number(requestedRadiusMiles) >= 50) {
-    for (const seed of ESTATE_SALES_CITY_ZIP_SEEDS) {
-      addTarget(seed.city, seed.zip);
-    }
-  }
 
   return targets;
 }
@@ -1408,8 +1437,12 @@ async function fetchEstateSalesForTarget(target, radiusMiles = 50) {
   const citySlug = encodeURIComponent(normalizeCitySlug(target?.city || 'Naperville'));
 
   const urlsToTry = [
+    // Real live listing page format. This is the page that currently shows the
+    // actual EstateSales.net rows for the user's selected origin.
     `https://www.estatesales.net/IL/${citySlug}/${safeZip}?radius=${safeRadius}`,
     `https://www.estatesales.net/IL/${citySlug}/${safeZip}`,
+    // Last-resort same-origin fallback. Do not use the malformed /IL/60565 URL.
+    `https://www.estatesales.net/sales/advancedSearch?zip=${safeZip}&radius=${safeRadius}`,
   ];
 
   let lastError = null;
@@ -1940,7 +1973,22 @@ function formatSaleForSourceAssist(sale = {}) {
     ? sale.scheduleEntries
     : [];
 
-  const saleDateKeys = Array.from(
+  // Keep the date that was projected for the selected day at the front.
+  // The mobile UI may compute the visible weekday from saleDate/saleDateKeys,
+  // so a multi-day sale running May 2-May 5 must output May 3 when Today is
+  // May 3, not the first day of the sale range.
+  const projectedDateKey = String(
+    sale.startDate ||
+      sale.saleDate ||
+      sale.date ||
+      sale.startDateTime ||
+      sale.saleDateTime ||
+      '',
+  )
+    .trim()
+    .slice(0, 10);
+
+  const rawSaleDateKeys = Array.from(
     new Set(
       [
         sale.startDate,
@@ -1952,6 +2000,13 @@ function formatSaleForSourceAssist(sale = {}) {
         .filter((value) => /^20\d{2}-\d{2}-\d{2}$/.test(value)),
     ),
   );
+
+  const saleDateKeys = /^20\d{2}-\d{2}-\d{2}$/.test(projectedDateKey)
+    ? [
+        projectedDateKey,
+        ...rawSaleDateKeys.filter((key) => key !== projectedDateKey),
+      ]
+    : rawSaleDateKeys;
 
   const saleDateLabels = Array.from(
     new Set(
@@ -1970,9 +2025,20 @@ function formatSaleForSourceAssist(sale = {}) {
   );
 
   const website = sale.externalUrl || sale.url || sale.website || '';
-  const saleDate = saleDateKeys[0] || sale.startDate || sale.saleDate || '';
+  const saleDate =
+    (/^20\d{2}-\d{2}-\d{2}$/.test(projectedDateKey)
+      ? projectedDateKey
+      : '') ||
+    saleDateKeys[0] ||
+    sale.startDate ||
+    sale.saleDate ||
+    '';
+  const matchingScheduleEntry = scheduleEntries.find(
+    (entry) => String(entry?.startDate || '').slice(0, 10) === saleDate,
+  );
   const saleDateTime =
     sale.startDateTime ||
+    matchingScheduleEntry?.startDateTime ||
     sale.saleDateTime ||
     scheduleEntries.find((entry) => entry?.startDateTime)?.startDateTime ||
     saleDate;
@@ -1989,7 +2055,11 @@ function formatSaleForSourceAssist(sale = {}) {
     saleDateTime,
     saleDateKeys,
     saleDateLabels,
-    openingHours: sale.timeLabel || sale.openingHours || '',
+    dayLabel: sale.dayLabel || weekdayLabelFromDateKey(saleDate) || '',
+    dateLabel: sale.dateLabel || monthDayLabelFromDateKey(saleDate) || '',
+    timeLabel: sale.timeLabel || matchingScheduleEntry?.timeLabel || '',
+    openingHours:
+      sale.timeLabel || matchingScheduleEntry?.timeLabel || sale.openingHours || '',
     address:
       sale.addressLabel ||
       sale.mapAddress ||
@@ -2009,6 +2079,267 @@ function formatSaleForSourceAssist(sale = {}) {
   };
 }
 
+
+
+function getLocalDateKeyFromDate(date = new Date()) {
+  const safeDate = date instanceof Date && !Number.isNaN(date.getTime()) ? date : new Date();
+  return `${safeDate.getFullYear()}-${String(safeDate.getMonth() + 1).padStart(2, '0')}-${String(safeDate.getDate()).padStart(2, '0')}`;
+}
+
+function getDateKeyForRequestedDay(requestedDay = '') {
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  const date = new Date();
+  date.setHours(12, 0, 0, 0);
+
+  if (normalizedRequestedDay === 'tomorrow') {
+    date.setDate(date.getDate() + 1);
+  }
+
+  if (normalizedRequestedDay === 'today' || normalizedRequestedDay === 'tomorrow') {
+    return getLocalDateKeyFromDate(date);
+  }
+
+  return '';
+}
+
+function parseDateKeyToLocalDate(dateKey = '') {
+  const match = String(dateKey || '').match(/^(20\d{2})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0, 0);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
+}
+
+function weekdayLabelFromDateKey(dateKey = '') {
+  const date = parseDateKeyToLocalDate(dateKey);
+  if (!date) return '';
+  return normalizeWeekdayLabel(date.toLocaleDateString('en-US', { weekday: 'long' }));
+}
+
+function monthDayLabelFromDateKey(dateKey = '') {
+  const date = parseDateKeyToLocalDate(dateKey);
+  if (!date) return '';
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function buildNoonDateKey(year, month, day) {
+  const y = Number(year);
+  const m = Number(month);
+  const d = Number(day);
+  if (!y || !m || !d) return '';
+  const date = new Date(y, m - 1, d, 12, 0, 0, 0);
+  if (Number.isNaN(date.getTime())) return '';
+  if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return '';
+  return getLocalDateKeyFromDate(date);
+}
+
+function inferYearForVisibleEstateSalesDate(monthNumber, dayNumber, explicitYear = null) {
+  if (explicitYear) return explicitYear;
+
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const candidate = new Date(currentYear, Number(monthNumber) - 1, Number(dayNumber), 12, 0, 0, 0);
+  const today = new Date(currentYear, now.getMonth(), now.getDate(), 12, 0, 0, 0);
+
+  // EstateSales.net listing pages often omit the year. Treat dates within the
+  // normal live-listing window as the current year, and only roll forward for
+  // dates that are clearly many months behind us.
+  if (candidate.getTime() < today.getTime() - 1000 * 60 * 60 * 24 * 120) {
+    return currentYear + 1;
+  }
+
+  return currentYear;
+}
+
+function dateKeyFromVisibleMonthDay(monthName = '', day = '', explicitYear = null) {
+  const monthNumber = monthNameToNumber(monthName);
+  const dayNumber = Number(String(day || '').replace(/\D+/g, ''));
+  if (!monthNumber || !dayNumber) return '';
+  const year = inferYearForVisibleEstateSalesDate(monthNumber, dayNumber, explicitYear);
+  return buildNoonDateKey(year, monthNumber, dayNumber);
+}
+
+function expandDateKeyRange(startKey = '', endKey = '') {
+  const start = parseDateKeyToLocalDate(startKey);
+  const end = parseDateKeyToLocalDate(endKey || startKey);
+  if (!start || !end) return [];
+  if (end.getTime() < start.getTime()) return [startKey];
+
+  const keys = [];
+  const cursor = new Date(start);
+  let guard = 0;
+
+  while (cursor.getTime() <= end.getTime() && guard < 21) {
+    keys.push(getLocalDateKeyFromDate(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+    guard += 1;
+  }
+
+  return keys;
+}
+
+function extractVisibleEstateSalesDateKeys(text = '') {
+  const clean = stripHtml(text);
+  const keys = [];
+  const seen = new Set();
+
+  const pushKey = (key) => {
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    keys.push(key);
+  };
+
+  const monthWord = '(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\\.?';
+
+  // Handles true ranges: "May 2 to May 5", "Apr 30 to May 5", "May 2 - 5".
+  const rangePattern = new RegExp(
+    `\\b${monthWord}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,\\s*(20\\d{2}))?\\s*(?:-|–|to|through|thru)\\s*(?:${monthWord}\\s+)?(\\d{1,2})(?:st|nd|rd|th)?(?:,\\s*(20\\d{2}))?`,
+    'gi',
+  );
+
+  for (const match of clean.matchAll(rangePattern)) {
+    const startMonth = match[1];
+    const startDay = match[2];
+    const startYear = match[3] ? Number(match[3]) : null;
+    const endMonth = match[4] || startMonth;
+    const endDay = match[5];
+    const endYear = match[6] ? Number(match[6]) : startYear;
+    const startKey = dateKeyFromVisibleMonthDay(startMonth, startDay, startYear);
+    const endKey = dateKeyFromVisibleMonthDay(endMonth, endDay, endYear);
+    for (const key of expandDateKeyRange(startKey, endKey)) pushKey(key);
+  }
+
+  // Handles EstateSales.net list format: "May 1, 2, 3, 4".
+  // This was the missing piece: the old parser only captured "May 1", so
+  // a sale running May 1-4 was dropped from the May 3 Today list.
+  const listPattern = new RegExp(
+    `\\b${monthWord}\\s+(\\d{1,2}(?:st|nd|rd|th)?(?:\\s*,\\s*\\d{1,2}(?:st|nd|rd|th)?){1,12})(?:,?\\s*(20\\d{2}))?`,
+    'gi',
+  );
+
+  for (const match of clean.matchAll(listPattern)) {
+    const monthName = match[1];
+    const year = match[3] ? Number(match[3]) : null;
+    const dayNumbers = String(match[2] || '')
+      .split(/\s*,\s*/)
+      .map((part) => Number(String(part).replace(/\D+/g, '')))
+      .filter((day) => Number.isFinite(day) && day >= 1 && day <= 31);
+
+    for (const day of dayNumbers) {
+      pushKey(dateKeyFromVisibleMonthDay(monthName, String(day), year));
+    }
+  }
+
+  // Handles individual dates after range/list parsing.
+  const singlePattern = new RegExp(
+    `\\b${monthWord}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,\\s*(20\\d{2}))?`,
+    'gi',
+  );
+  for (const match of clean.matchAll(singlePattern)) {
+    pushKey(dateKeyFromVisibleMonthDay(match[1], match[2], match[3] ? Number(match[3]) : null));
+  }
+
+  return keys.sort();
+}
+
+function normalizeScheduleEntryDate(entry = {}, fallbackTimeLabel = '') {
+  const startDate = String(entry.startDate || entry.startDateTime || '').slice(0, 10);
+  const dateKey = /^20\d{2}-\d{2}-\d{2}$/.test(startDate) ? startDate : '';
+  if (!dateKey) return { ...entry };
+
+  return {
+    ...entry,
+    dayLabel: weekdayLabelFromDateKey(dateKey) || entry.dayLabel || '',
+    dateLabel: monthDayLabelFromDateKey(dateKey) || entry.dateLabel || '',
+    timeLabel: stripLeadingWeekdayFromTime(entry.timeLabel || fallbackTimeLabel || ''),
+    startDate: dateKey,
+    startDateTime: entry.startDateTime || buildIsoDateTime(
+      Number(dateKey.slice(0, 4)),
+      Number(dateKey.slice(5, 7)),
+      Number(dateKey.slice(8, 10)),
+      entry.startTime || fallbackTimeLabel || '',
+    ),
+  };
+}
+
+function normalizeEstateSaleCalendarData(sale = {}, requestedDay = '') {
+  const existingEntries = Array.isArray(sale.scheduleEntries)
+    ? sale.scheduleEntries.map((entry) => normalizeScheduleEntryDate(entry, sale.timeLabel || sale.openingHours || ''))
+    : [];
+
+  const visibleDateKeys = extractVisibleEstateSalesDateKeys(
+    [sale.dateText, sale.rawSnippet, sale.descriptionPreview, sale.dateLabel]
+      .filter(Boolean)
+      .join(' '),
+  );
+
+  const existingDateKeys = existingEntries
+    .map((entry) => String(entry.startDate || '').slice(0, 10))
+    .filter((key) => /^20\d{2}-\d{2}-\d{2}$/.test(key));
+
+  const allDateKeys = Array.from(new Set([...visibleDateKeys, ...existingDateKeys])).sort();
+  const timeLabel = stripLeadingWeekdayFromTime(
+    sale.timeLabel || sale.openingHours || existingEntries.find((entry) => entry.timeLabel)?.timeLabel || '',
+  );
+
+  const entriesByDate = new Map();
+  for (const entry of existingEntries) {
+    const key = String(entry.startDate || '').slice(0, 10);
+    if (/^20\d{2}-\d{2}-\d{2}$/.test(key)) {
+      entriesByDate.set(key, normalizeScheduleEntryDate(entry, timeLabel));
+    }
+  }
+
+  for (const key of allDateKeys) {
+    if (entriesByDate.has(key)) continue;
+    entriesByDate.set(key, {
+      dayLabel: weekdayLabelFromDateKey(key),
+      dateLabel: monthDayLabelFromDateKey(key),
+      timeLabel,
+      startTime: sale.startTime || '',
+      endTime: sale.endTime || '',
+      startDate: key,
+      startDateTime: buildIsoDateTime(
+        Number(key.slice(0, 4)),
+        Number(key.slice(5, 7)),
+        Number(key.slice(8, 10)),
+        sale.startTime || timeLabel || '',
+      ),
+      sortTimestamp: parseDateKeyToLocalDate(key)?.getTime() || 0,
+    });
+  }
+
+  const scheduleEntries = Array.from(entriesByDate.values()).sort((a, b) => {
+    const aTime = parseDateKeyToLocalDate(a.startDate)?.getTime() || Number.MAX_SAFE_INTEGER;
+    const bTime = parseDateKeyToLocalDate(b.startDate)?.getTime() || Number.MAX_SAFE_INTEGER;
+    return aTime - bTime;
+  });
+
+  const requestedDateKey = getDateKeyForRequestedDay(requestedDay);
+  const preferredEntry =
+    scheduleEntries.find((entry) => entry.startDate === requestedDateKey) ||
+    scheduleEntries[0] ||
+    null;
+
+  if (!preferredEntry) {
+    return {
+      ...sale,
+      scheduleEntries,
+    };
+  }
+
+  return {
+    ...sale,
+    dayLabel: preferredEntry.dayLabel || sale.dayLabel || '',
+    dateLabel: preferredEntry.dateLabel || sale.dateLabel || '',
+    timeLabel: stripLeadingWeekdayFromTime(preferredEntry.timeLabel || sale.timeLabel || ''),
+    startTime: preferredEntry.startTime || sale.startTime || '',
+    endTime: preferredEntry.endTime || sale.endTime || '',
+    startDate: preferredEntry.startDate || sale.startDate || '',
+    startDateTime: preferredEntry.startDateTime || sale.startDateTime || '',
+    scheduleEntries,
+  };
+}
 
 async function fetchAllEstateSales(
   requestedDay = '',
@@ -2087,18 +2418,21 @@ async function fetchAllEstateSales(
       shouldKeepSale(sale),
     );
 
+    const calendarNormalized = addressFiltered.map((sale) =>
+      normalizeEstateSaleCalendarData(sale, requestedDay),
+    );
+
     if (normalizedRequestedDay) {
-      const strictDayMatches = addressFiltered
+      const strictDayMatches = calendarNormalized
         .map((sale) => projectSaleToRequestedDay(sale, requestedDay))
+        .map((sale) => normalizeEstateSaleCalendarData(sale, requestedDay))
         .filter((sale) => saleMatchesRequestedDay(sale, requestedDay));
 
-      dayFiltered = strictDayMatches.length
-        ? strictDayMatches
-        : addressFiltered.map((sale) =>
-            projectSaleToRequestedDay(sale, requestedDay),
-          );
+      // Do not fall back to all days when the user selected Today/Tomorrow.
+      // That fallback is what made Saturday/Friday cards appear under Today.
+      dayFiltered = strictDayMatches;
     } else {
-      dayFiltered = addressFiltered;
+      dayFiltered = calendarNormalized;
     }
 
     setCachedEstateSalesPool(
@@ -2155,7 +2489,15 @@ async function fetchAllEstateSales(
 router.get('/', async (req, res) => {
   console.log(`[estate-sales-route] ${ESTATE_ROUTE_VERSION} NO_ZIP_SWEEP route start`);
   const requestStartedAt = Date.now();
-  const requestedDay = normalizeRequestedDay(req.query?.day || '');
+  // The mobile Source Assist screen labels this view as Today, but current
+  // frontend builds have been calling this route without a day parameter:
+  // { mode: 'estate', radiusMiles, latitude, longitude }.
+  // If we leave requestedDay blank, the backend returns any upcoming sale and
+  // the app shows Friday/Saturday cards under the Today header. Default the
+  // estate-sales route to today unless the client explicitly sends a day/date.
+  const requestedDay = normalizeRequestedDay(
+    req.query?.day || req.query?.targetDay || req.query?.date || 'today',
+  );
   const requestedRadiusMiles = normalizeRequestedRadiusMiles(
     req.query?.radiusMiles,
   );
@@ -2183,7 +2525,7 @@ router.get('/', async (req, res) => {
       requestedDay,
       requestedRadiusMiles,
       count: sourceAssistSales.length,
-      searchMode: requestedRadiusMiles >= 50 ? 'expanded-city-sweep' : 'single-city-zip',
+      searchMode: 'single-city-zip',
       fetchedAt: new Date().toISOString(),
       elapsedMs: Date.now() - requestStartedAt,
       sales: sourceAssistSales,
