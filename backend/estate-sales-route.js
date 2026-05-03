@@ -1904,6 +1904,81 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
   };
 }
 
+function formatSaleForSourceAssist(sale = {}) {
+  const scheduleEntries = Array.isArray(sale.scheduleEntries)
+    ? sale.scheduleEntries
+    : [];
+
+  const saleDateKeys = Array.from(
+    new Set(
+      [
+        sale.startDate,
+        sale.saleDate,
+        sale.date,
+        ...scheduleEntries.map((entry) => entry?.startDate),
+      ]
+        .map((value) => String(value || '').trim().slice(0, 10))
+        .filter((value) => /^20\d{2}-\d{2}-\d{2}$/.test(value)),
+    ),
+  );
+
+  const saleDateLabels = Array.from(
+    new Set(
+      [
+        sale.dateText,
+        sale.dateLabel,
+        ...scheduleEntries.map((entry) =>
+          [entry?.dayLabel, entry?.dateLabel, entry?.timeLabel]
+            .filter(Boolean)
+            .join(' • '),
+        ),
+      ]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    ),
+  );
+
+  const website = sale.externalUrl || sale.url || sale.website || '';
+  const saleDate = saleDateKeys[0] || sale.startDate || sale.saleDate || '';
+  const saleDateTime =
+    sale.startDateTime ||
+    sale.saleDateTime ||
+    scheduleEntries.find((entry) => entry?.startDateTime)?.startDateTime ||
+    saleDate;
+
+  return {
+    ...sale,
+    saleType: 'estate',
+    type: 'estate',
+    source: sale.source || 'estatesales-net',
+    sourceLabel: sale.sourceLabel || 'EstateSales.net',
+    website,
+    craigslistUrl: website,
+    saleDate,
+    saleDateTime,
+    saleDateKeys,
+    saleDateLabels,
+    openingHours: sale.timeLabel || sale.openingHours || '',
+    address:
+      sale.addressLabel ||
+      sale.mapAddress ||
+      [sale.street, sale.city, sale.state, sale.zip].filter(Boolean).join(', '),
+    addressLabel:
+      sale.addressLabel ||
+      sale.mapAddress ||
+      [sale.street, sale.city, sale.state, sale.zip].filter(Boolean).join(', '),
+    displayAddress:
+      sale.addressLabel ||
+      sale.mapAddress ||
+      [sale.street, sale.city, sale.state, sale.zip].filter(Boolean).join(', '),
+    descriptionPreview:
+      sale.descriptionPreview ||
+      sale.rawSnippet ||
+      [sale.statusText, sale.dateText, sale.company].filter(Boolean).join(' • '),
+  };
+}
+
+
 async function fetchAllEstateSales(
   requestedDay = '',
   requestedRadiusMiles = null,
@@ -1995,12 +2070,23 @@ async function fetchAllEstateSales(
           )
         : [];
 
-      dayFiltered = dedupeSales([
+      const confirmedMatches = confirmedDaySales
+        .map((sale) => projectSaleToRequestedDay(sale, requestedDay))
+        .filter((sale) => saleMatchesRequestedDay(sale, requestedDay));
+
+      const strictDayMatches = dedupeSales([
         ...initiallyMatched,
-        ...confirmedDaySales
-          .map((sale) => projectSaleToRequestedDay(sale, requestedDay))
-          .filter((sale) => saleMatchesRequestedDay(sale, requestedDay)),
+        ...confirmedMatches,
       ]);
+
+      // Source Assist needs visible estate-sale results first. EstateSales.net
+      // often lists multi-day sales in formats that do not survive a strict
+      // today/tomorrow comparison on the backend. If the strict day match comes
+      // back empty, fall back to all current/upcoming sales inside the radius and
+      // let the app/card display the best available schedule details.
+      dayFiltered = strictDayMatches.length
+        ? strictDayMatches
+        : addressFiltered.map((sale) => projectSaleToRequestedDay(sale, requestedDay));
     } else {
       dayFiltered = addressFiltered;
     }
@@ -2065,16 +2151,18 @@ router.get('/', async (req, res) => {
       requestedRadiusMiles,
       requestedOrigin,
     );
+    const sourceAssistSales = sales.map(formatSaleForSourceAssist);
 
     return res.json({
       success: true,
       source: 'estatesales-net',
       requestedDay,
       requestedRadiusMiles,
-      count: sales.length,
+      count: sourceAssistSales.length,
       fetchedAt: new Date().toISOString(),
       elapsedMs: Date.now() - requestStartedAt,
-      sales,
+      sales: sourceAssistSales,
+      estateSales: sourceAssistSales,
     });
   } catch (error) {
     console.error('EstateSales route error:', error.message);
