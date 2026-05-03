@@ -3,9 +3,9 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v6-direct-single-zip-only';
+const ESTATE_ROUTE_VERSION = 'source-assist-v8-estate-city-zip-url-fix';
 
-const ESTATE_SALES_ZIPS = []; // disabled: direct single user ZIP/radius only // disabled: single user ZIP/radius search only
+const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RESULTS = 100;
 const DETAIL_FETCH_DELAY_MS = 700;
@@ -1271,16 +1271,22 @@ function parseEstateSalesFromHtml(html, requestedZip) {
   return results;
 }
 
-async function fetchEstateSalesForZip(zip, radiusMiles = 50) {
+async function fetchEstateSalesForZip(zip, radiusMiles = 50, city = 'Naperville') {
   const safeZip = encodeURIComponent(String(zip || '60565').trim());
   const safeRadius = encodeURIComponent(String(radiusMiles || 50));
+  const citySlug = encodeURIComponent(
+    String(city || 'Naperville')
+      .split(',')[0]
+      .trim()
+      .replace(/\s+/g, '-'),
+  );
 
-  // Single origin/radius search. This replaces the old:
-  // https://www.estatesales.net/IL/Naperville/{zip}
-  // called once for dozens of ZIPs.
+  // Known working EstateSales.net page shape.
+  // This stays single-origin: one city + one ZIP from the user location.
+  // Do NOT use /IL/{zip}; that returns 404.
   const urlsToTry = [
-    `https://www.estatesales.net/sales/advancedSearch?zip=${safeZip}&radius=${safeRadius}`,
-    `https://www.estatesales.net/IL/${safeZip}?radius=${safeRadius}`,
+    `https://www.estatesales.net/IL/${citySlug}/${safeZip}?radius=${safeRadius}`,
+    `https://www.estatesales.net/IL/${citySlug}/${safeZip}`,
   ];
 
   let lastError = null;
@@ -1304,16 +1310,14 @@ async function fetchEstateSalesForZip(zip, radiusMiles = 50) {
       const parsed = parseEstateSalesFromHtml(html, zip);
 
       console.log(
-        `[estate-sales-route] ${ESTATE_ROUTE_VERSION} userZip=${zip} radius=${safeRadius} parsed=${parsed.length} url=${url}`,
+        `[estate-sales-route] ${ESTATE_ROUTE_VERSION} SINGLE_CITY_ZIP userZip=${zip} city=${citySlug} radius=${safeRadius} parsed=${parsed.length} url=${url}`,
       );
 
-      if (parsed.length || url === urlsToTry[urlsToTry.length - 1]) {
-        return parsed;
-      }
+      return parsed;
     } catch (error) {
       lastError = error;
       console.warn(
-        `[estate-sales-route] ${ESTATE_ROUTE_VERSION} fetch failed userZip=${zip} radius=${safeRadius}: ${error.message}`,
+        `[estate-sales-route] ${ESTATE_ROUTE_VERSION} fetch failed userZip=${zip} city=${citySlug} radius=${safeRadius} url=${url}: ${error.message}`,
       );
     }
   }
@@ -1459,6 +1463,8 @@ function getSearchZipsForRequest(
     .trim()
     .replace(/[^0-9]/g, '');
 
+  // Source Assist should search from the user's location only.
+  // No surrounding ZIP expansion. No 74-ZIP sweep.
   return requestedZip ? [requestedZip] : ['60565'];
 }
 
@@ -1873,6 +1879,7 @@ async function fetchAllEstateSales(
     requestedOrigin,
   )[0] || '60565';
 
+  const city = requestedOrigin?.city || 'Naperville';
   const cacheKeyZips = [searchZip];
   const cachedDayFiltered = getCachedEstateSalesPool(requestedDay, cacheKeyZips);
   let dayFiltered = null;
@@ -1883,16 +1890,13 @@ async function fetchAllEstateSales(
     cacheHit = true;
   } else {
     console.log(
-      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_ZIP_START zip=${searchZip} radius=${requestedRadiusMiles ?? 'default'} day=${normalizedRequestedDay || 'all'}`,
+      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_CITY_ZIP_START zip=${searchZip} city=${city} radius=${requestedRadiusMiles ?? 'default'} day=${normalizedRequestedDay || 'all'}`,
     );
 
     const rawResults = await fetchEstateSalesForZip(
       searchZip,
       requestedRadiusMiles || 50,
-    );
-
-    console.log(
-      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_ZIP_FETCHED zip=${searchZip} raw=${rawResults.length}`,
+      city,
     );
 
     const deduped = dedupeSales(rawResults);
@@ -1940,7 +1944,7 @@ async function fetchAllEstateSales(
     setCachedEstateSalesPool(requestedDay, cacheKeyZips, dayFiltered);
 
     console.log(
-      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_ZIP_COUNTS ` +
+      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} counts ` +
         JSON.stringify({
           raw: rawResults.length,
           deduped: deduped.length,
@@ -1965,7 +1969,7 @@ async function fetchAllEstateSales(
   const sorted = sortSales(radiusFiltered);
 
   console.log(
-    `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_ZIP_RESPONSE ` +
+    `[estate-sales-route] ${ESTATE_ROUTE_VERSION} response ` +
       JSON.stringify({
         cacheHit,
         dayFiltered: dayFiltered.length,
@@ -1995,6 +1999,7 @@ router.get('/', async (req, res) => {
     zip: req.query?.zip || req.query?.postalCode || req.query?.postal || '',
     postalCode: req.query?.postalCode || req.query?.zip || req.query?.postal || '',
     postal: req.query?.postal || req.query?.zip || req.query?.postalCode || '',
+    city: req.query?.city || req.query?.location || 'Naperville',
   };
 
   try {
