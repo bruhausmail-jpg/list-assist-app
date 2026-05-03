@@ -8,15 +8,8 @@ export default function TabLayout() {
     <Tabs
       screenOptions={{
         headerShown: false,
-        tabBarActiveTintColor: '#60A5FA',
-        tabBarInactiveTintColor: '#94A3B8',
-        tabBarLabelStyle: {
-          fontWeight: '700',
-          fontSize: 12,
-        },
         tabBarStyle: {
-          paddingBottom: 6,
-          height: 70,
+          display: 'none',
         },
       }}
     >
@@ -32,8 +25,8 @@ export default function TabLayout() {
           },
         }}
         options={{
-          title: 'Start Over',
-          tabBarLabel: 'Start Over',
+          title: 'List Assist',
+          tabBarLabel: 'Home',
         }}
       />
     </Tabs>
