@@ -3,123 +3,19 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_SALES_ZIPS = [
-  '60540', // Naperville
-  '60563', // Naperville
-  '60565', // Naperville
-  '60532', // Lisle
-  '60515', // Downers Grove
-  '60516', // Downers Grove
-  '60137', // Glen Ellyn
-  '60148', // Lombard
-  '60187', // Wheaton
-  '60189', // Wheaton
-  '60440', // Bolingbrook
-  '60490', // Bolingbrook
-  '60544', // Plainfield
-  '60585', // Plainfield
-  '60586', // Plainfield
-  '60502', // Aurora
-  '60503', // Aurora
-  '60504', // Aurora
-  '60505', // Aurora
-  '60506', // Aurora
-  '60543', // Oswego
-  '60560', // Yorkville
-  '60134', // Geneva
-  '60174', // St. Charles
-  '60175', // St. Charles
-  '60431', // Joliet
-  '60435', // Joliet
-  '60448', // Mokena
-  '60520', // Hinckley
-  '60450', // Morris
-];
+const ESTATE_ROUTE_VERSION = 'source-assist-v6-direct-single-zip-only';
+
+const ESTATE_SALES_ZIPS = []; // disabled: direct single user ZIP/radius only // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RESULTS = 100;
 const DETAIL_FETCH_DELAY_MS = 700;
-const MAX_DETAIL_FETCHES = 40;
+const MAX_DETAIL_FETCHES = 12;
 const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
 const ZIP_FETCH_CONCURRENCY = 4;
 const DETAIL_FETCH_CONCURRENCY = 6;
-const DETAIL_ENRICH_TARGET_COUNT = 60;
+const DETAIL_ENRICH_TARGET_COUNT = 20;
 
-const ZIP_CENTER_COORDS = {
-  60103: { latitude: 41.9919, longitude: -88.1856 }, // Bartlett
-  60107: { latitude: 42.0189, longitude: -88.1784 }, // Streamwood
-  60115: { latitude: 41.9295, longitude: -88.7504 }, // DeKalb
-  60118: { latitude: 42.0998, longitude: -88.289 }, // Dundee
-  60119: { latitude: 41.9503, longitude: -88.4723 }, // Elburn
-  60120: { latitude: 42.0372, longitude: -88.2831 }, // Elgin
-  60123: { latitude: 42.0396, longitude: -88.3342 }, // Elgin
-  60124: { latitude: 42.0305, longitude: -88.3957 }, // Elgin
-  60134: { latitude: 41.8869, longitude: -88.3087 },
-  60137: { latitude: 41.8775, longitude: -88.067 },
-  60148: { latitude: 41.8747, longitude: -88.017 },
-  60151: { latitude: 42.1097, longitude: -88.5356 }, // Maple Park
-  60174: { latitude: 41.9142, longitude: -88.3089 },
-  60175: { latitude: 41.9214, longitude: -88.3854 },
-  60177: { latitude: 42.0428, longitude: -88.5281 }, // South Elgin
-  60178: { latitude: 41.9882, longitude: -88.6868 }, // Sycamore
-  60185: { latitude: 41.9003, longitude: -88.2039 }, // West Chicago
-  60187: { latitude: 41.8661, longitude: -88.107 },
-  60188: { latitude: 41.9125, longitude: -88.1297 }, // Carol Stream
-  60189: { latitude: 41.8398, longitude: -88.1016 },
-  60190: { latitude: 41.8602, longitude: -88.1587 }, // Winfield
-  60194: { latitude: 42.0336, longitude: -88.1082 }, // Schaumburg
-  60195: { latitude: 42.0702, longitude: -88.0948 }, // Schaumburg
-  60404: { latitude: 41.5093, longitude: -88.2161 }, // Shorewood
-  60408: { latitude: 41.6028, longitude: -88.0417 }, // Braidwood
-  60410: { latitude: 41.4186, longitude: -88.2517 }, // Channahon
-  60416: { latitude: 41.2889, longitude: -88.2751 }, // Coal City
-  60417: { latitude: 41.4517, longitude: -87.9795 }, // Crete
-  60423: { latitude: 41.4972, longitude: -87.8353 }, // Frankfort
-  60431: { latitude: 41.5263, longitude: -88.1845 },
-  60432: { latitude: 41.536, longitude: -88.0546 }, // Joliet
-  60433: { latitude: 41.5071, longitude: -88.0584 }, // Joliet
-  60435: { latitude: 41.5538, longitude: -88.124 },
-  60439: { latitude: 41.6686, longitude: -87.9798 }, // Lemont
-  60440: { latitude: 41.6986, longitude: -88.0895 },
-  60441: { latitude: 41.5871, longitude: -88.0577 }, // Lockport
-  60442: { latitude: 41.428, longitude: -88.2014 }, // Manhattan
-  60446: { latitude: 41.6389, longitude: -88.1109 }, // Romeoville
-  60447: { latitude: 41.4845, longitude: -88.3117 }, // Minooka
-  60448: { latitude: 41.5311, longitude: -87.8892 },
-  60449: { latitude: 41.511, longitude: -87.7448 }, // Monee
-  60450: { latitude: 41.3578, longitude: -88.4212 },
-  60451: { latitude: 41.5061, longitude: -87.9631 }, // New Lenox
-  60453: { latitude: 41.7195, longitude: -87.7479 }, // Oak Lawn
-  60462: { latitude: 41.6292, longitude: -87.84 }, // Orland Park
-  60464: { latitude: 41.6681, longitude: -87.8442 }, // Palos Park
-  60465: { latitude: 41.6986, longitude: -87.8262 }, // Palos Hills
-  60467: { latitude: 41.6297, longitude: -87.8936 }, // Orland Park
-  60477: { latitude: 41.5744, longitude: -87.8039 }, // Tinley Park
-  60487: { latitude: 41.5588, longitude: -87.8337 }, // Tinley Park
-  60490: { latitude: 41.6895, longitude: -88.1412 },
-  60502: { latitude: 41.7901, longitude: -88.2487 },
-  60503: { latitude: 41.7076, longitude: -88.2635 },
-  60504: { latitude: 41.7591, longitude: -88.2434 },
-  60505: { latitude: 41.7606, longitude: -88.2962 },
-  60506: { latitude: 41.7668, longitude: -88.3523 },
-  60510: { latitude: 41.8473, longitude: -88.3112 }, // Batavia
-  60515: { latitude: 41.8089, longitude: -88.0247 },
-  60516: { latitude: 41.7584, longitude: -88.0148 },
-  60520: { latitude: 41.7695, longitude: -88.6376 },
-  60532: { latitude: 41.7928, longitude: -88.0884 },
-  60538: { latitude: 41.7709, longitude: -88.3248 }, // Montgomery
-  60540: { latitude: 41.764, longitude: -88.153 },
-  60542: { latitude: 41.8066, longitude: -88.3273 }, // North Aurora
-  60543: { latitude: 41.6826, longitude: -88.3526 },
-  60544: { latitude: 41.6294, longitude: -88.2123 },
-  60554: { latitude: 41.7788, longitude: -88.4426 }, // Sugar Grove
-  60555: { latitude: 41.8178, longitude: -88.1852 }, // Warrenville
-  60560: { latitude: 41.6414, longitude: -88.4473 },
-  60563: { latitude: 41.7905, longitude: -88.1478 },
-  60564: { latitude: 41.7369, longitude: -88.1931 }, // Naperville
-  60565: { latitude: 41.7363, longitude: -88.1287 },
-  60585: { latitude: 41.7009, longitude: -88.2138 },
-  60586: { latitude: 41.5825, longitude: -88.2042 },
-};
+const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
 const estateSalesSearchCache = new Map();
@@ -135,10 +31,10 @@ function buildEstateSalesCacheKey(requestedDay = '', searchZips = []) {
   const normalizedDay = normalizeRequestedDay(requestedDay) || 'all-days';
   const zipSignature =
     Array.isArray(searchZips) && searchZips.length
-      ? [...searchZips].sort().join(',')
-      : 'all-zips';
+      ? String(searchZips[0] || '60565')
+      : '60565';
 
-  return `v2__${normalizedDay}__${zipSignature}`;
+  return `${ESTATE_ROUTE_VERSION}__${normalizedDay}__${zipSignature}`;
 }
 
 function getCachedEstateSalesPool(requestedDay = '', searchZips = []) {
@@ -371,16 +267,10 @@ function addDeterministicJitter(baseValue, seed, spread = 0.012) {
   return Number((baseValue + normalized * spread).toFixed(6));
 }
 
-function buildZipFallbackCoordinates(zip = '', seed = '') {
-  const center = ZIP_CENTER_COORDS[String(zip || '')];
-  if (!center) return null;
-
-  return {
-    latitude: addDeterministicJitter(center.latitude, `${seed}-lat`),
-    longitude: addDeterministicJitter(center.longitude, `${seed}-lng`),
-    coordinateSource: 'zip-fallback',
-    probableLocation: true,
-  };
+function buildZipFallbackCoordinates(_zip = '', _seed = '') {
+  // Disabled with the ZIP sweep. Detail-page coordinates are still used when
+  // EstateSales.net exposes them.
+  return null;
 }
 
 function isCurrentOrUpcoming(snippet = '') {
@@ -1381,23 +1271,55 @@ function parseEstateSalesFromHtml(html, requestedZip) {
   return results;
 }
 
-async function fetchEstateSalesForZip(zip) {
-  const url = `https://www.estatesales.net/IL/Naperville/${zip}`;
+async function fetchEstateSalesForZip(zip, radiusMiles = 50) {
+  const safeZip = encodeURIComponent(String(zip || '60565').trim());
+  const safeRadius = encodeURIComponent(String(radiusMiles || 50));
 
-  const response = await axios.get(url, {
-    timeout: REQUEST_TIMEOUT_MS,
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15',
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      Referer: 'https://www.google.com/',
-      Connection: 'keep-alive',
-    },
-  });
+  // Single origin/radius search. This replaces the old:
+  // https://www.estatesales.net/IL/Naperville/{zip}
+  // called once for dozens of ZIPs.
+  const urlsToTry = [
+    `https://www.estatesales.net/sales/advancedSearch?zip=${safeZip}&radius=${safeRadius}`,
+    `https://www.estatesales.net/IL/${safeZip}?radius=${safeRadius}`,
+  ];
 
-  const html = typeof response.data === 'string' ? response.data : '';
-  return parseEstateSalesFromHtml(html, zip);
+  let lastError = null;
+
+  for (const url of urlsToTry) {
+    try {
+      const response = await axios.get(url, {
+        timeout: REQUEST_TIMEOUT_MS,
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15',
+          Accept:
+            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Referer: 'https://www.google.com/',
+          Connection: 'keep-alive',
+        },
+      });
+
+      const html = typeof response.data === 'string' ? response.data : '';
+      const parsed = parseEstateSalesFromHtml(html, zip);
+
+      console.log(
+        `[estate-sales-route] ${ESTATE_ROUTE_VERSION} userZip=${zip} radius=${safeRadius} parsed=${parsed.length} url=${url}`,
+      );
+
+      if (parsed.length || url === urlsToTry[urlsToTry.length - 1]) {
+        return parsed;
+      }
+    } catch (error) {
+      lastError = error;
+      console.warn(
+        `[estate-sales-route] ${ESTATE_ROUTE_VERSION} fetch failed userZip=${zip} radius=${safeRadius}: ${error.message}`,
+      );
+    }
+  }
+
+  if (lastError) throw lastError;
+  return [];
 }
 
 async function enrichSalesWithDetailPages(sales = []) {
@@ -1524,70 +1446,26 @@ function calculateDistanceMiles(lat1, lon1, lat2, lon2) {
 }
 
 function getSearchZipsForRequest(
-  requestedRadiusMiles = null,
+  _requestedRadiusMiles = null,
   requestedOrigin = {},
 ) {
-  const radius = Number(requestedRadiusMiles);
-  const originLatitude = Number(requestedOrigin?.latitude);
-  const originLongitude = Number(requestedOrigin?.longitude);
+  const requestedZip = String(
+    requestedOrigin?.zip ||
+      requestedOrigin?.postalCode ||
+      requestedOrigin?.postal ||
+      requestedOrigin?.requestedZip ||
+      '',
+  )
+    .trim()
+    .replace(/[^0-9]/g, '');
 
-  const allKnownZips = Array.from(
-    new Set([...ESTATE_SALES_ZIPS, ...Object.keys(ZIP_CENTER_COORDS)]),
-  );
-
-  if (
-    !Number.isFinite(radius) ||
-    radius <= 0 ||
-    !Number.isFinite(originLatitude) ||
-    !Number.isFinite(originLongitude)
-  ) {
-    return allKnownZips;
-  }
-
-  const targetRadius = radius + ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES;
-  const nearbyZips = allKnownZips.filter((zip) => {
-    const center = ZIP_CENTER_COORDS[String(zip)];
-    if (!center) return false;
-
-    const distance = calculateDistanceMiles(
-      originLatitude,
-      originLongitude,
-      center.latitude,
-      center.longitude,
-    );
-
-    return Number.isFinite(distance) && distance <= targetRadius;
-  });
-
-  return nearbyZips.length ? nearbyZips : allKnownZips;
+  return requestedZip ? [requestedZip] : ['60565'];
 }
 
-function getClosestZipCenterDistanceMiles(sale = {}) {
-  const lat = Number(sale.latitude);
-  const lng = Number(sale.longitude);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    return null;
-  }
-
-  const zipCenters = Object.values(ZIP_CENTER_COORDS);
-  let bestDistance = null;
-
-  for (const center of zipCenters) {
-    const distance = calculateDistanceMiles(
-      lat,
-      lng,
-      center.latitude,
-      center.longitude,
-    );
-
-    if (!Number.isFinite(distance)) continue;
-    if (bestDistance == null || distance < bestDistance) {
-      bestDistance = distance;
-    }
-  }
-
-  return bestDistance;
+function getClosestZipCenterDistanceMiles(_sale = {}) {
+  // Disabled with the ZIP sweep. We no longer infer distance from a large
+  // table of ZIP centers because it caused broad searching and muddy filtering.
+  return null;
 }
 
 function getEffectiveDistanceMiles(sale = {}, requestedOrigin = {}) {
@@ -1989,11 +1867,14 @@ async function fetchAllEstateSales(
   if (normalizedRequestedDay === 'unsupported') {
     return [];
   }
-  const searchZips = getSearchZipsForRequest(
+
+  const searchZip = getSearchZipsForRequest(
     requestedRadiusMiles,
     requestedOrigin,
-  );
-  const cachedDayFiltered = getCachedEstateSalesPool(requestedDay, searchZips);
+  )[0] || '60565';
+
+  const cacheKeyZips = [searchZip];
+  const cachedDayFiltered = getCachedEstateSalesPool(requestedDay, cacheKeyZips);
   let dayFiltered = null;
   let cacheHit = false;
 
@@ -2001,26 +1882,20 @@ async function fetchAllEstateSales(
     dayFiltered = cachedDayFiltered;
     cacheHit = true;
   } else {
-    const zipResultSets = await mapWithConcurrency(
-      searchZips,
-      ZIP_FETCH_CONCURRENCY,
-      async (zip) => {
-        try {
-          const zipResults = await fetchEstateSalesForZip(zip);
-          console.log(`EstateSales.net ${zip}: ${zipResults.length} listings`);
-          return zipResults;
-        } catch (error) {
-          console.error(
-            `EstateSales.net fetch failed for ${zip}:`,
-            error.message,
-          );
-          return [];
-        }
-      },
+    console.log(
+      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_ZIP_START zip=${searchZip} radius=${requestedRadiusMiles ?? 'default'} day=${normalizedRequestedDay || 'all'}`,
     );
 
-    const allResults = zipResultSets.flat();
-    const deduped = dedupeSales(allResults);
+    const rawResults = await fetchEstateSalesForZip(
+      searchZip,
+      requestedRadiusMiles || 50,
+    );
+
+    console.log(
+      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_ZIP_FETCHED zip=${searchZip} raw=${rawResults.length}`,
+    );
+
+    const deduped = dedupeSales(rawResults);
     const preliminaryRadiusFiltered = filterSalesByRadius(
       deduped,
       requestedRadiusMiles,
@@ -2030,83 +1905,55 @@ async function fetchAllEstateSales(
       preliminaryRadiusFiltered.length ? preliminaryRadiusFiltered : deduped,
     );
 
-    const enrichmentTargetCount = Math.max(
-      MAX_DETAIL_FETCHES,
-      DETAIL_ENRICH_TARGET_COUNT,
+    const enrichmentTargetCount = Math.min(
+      prioritizedSales.length,
+      Math.max(MAX_DETAIL_FETCHES, DETAIL_ENRICH_TARGET_COUNT),
     );
+
     const enriched = await enrichSalesWithDetailPages(
       prioritizedSales.slice(0, enrichmentTargetCount),
     );
+
     const combinedSales = dedupeSales([
       ...enriched,
       ...prioritizedSales.slice(enrichmentTargetCount),
     ]);
+
     const addressFiltered = combinedSales.filter((sale) =>
       shouldKeepSale(sale),
     );
 
     if (normalizedRequestedDay) {
-      const initiallyMatched = addressFiltered
+      const strictDayMatches = addressFiltered
         .map((sale) => projectSaleToRequestedDay(sale, requestedDay))
         .filter((sale) => saleMatchesRequestedDay(sale, requestedDay));
 
-      const unresolvedForRequestedDay = addressFiltered.filter((sale) => {
-        return !saleMatchesRequestedDay(sale, requestedDay);
-      });
-
-      const confirmationCandidates = sortSales(
-        filterSalesByRadius(
-          unresolvedForRequestedDay,
-          requestedRadiusMiles,
-          requestedOrigin,
-        ),
-      );
-
-      const confirmationFetchLimit = MAX_DETAIL_FETCHES;
-
-      const confirmedDaySales = confirmationCandidates.length
-        ? await enrichSalesWithDetailPages(
-            confirmationCandidates.slice(0, confirmationFetchLimit),
-          )
-        : [];
-
-      const confirmedMatches = confirmedDaySales
-        .map((sale) => projectSaleToRequestedDay(sale, requestedDay))
-        .filter((sale) => saleMatchesRequestedDay(sale, requestedDay));
-
-      const strictDayMatches = dedupeSales([
-        ...initiallyMatched,
-        ...confirmedMatches,
-      ]);
-
-      // Source Assist needs visible estate-sale results first. EstateSales.net
-      // often lists multi-day sales in formats that do not survive a strict
-      // today/tomorrow comparison on the backend. If the strict day match comes
-      // back empty, fall back to all current/upcoming sales inside the radius and
-      // let the app/card display the best available schedule details.
       dayFiltered = strictDayMatches.length
         ? strictDayMatches
-        : addressFiltered.map((sale) => projectSaleToRequestedDay(sale, requestedDay));
+        : addressFiltered.map((sale) =>
+            projectSaleToRequestedDay(sale, requestedDay),
+          );
     } else {
       dayFiltered = addressFiltered;
     }
 
-    setCachedEstateSalesPool(requestedDay, searchZips, dayFiltered);
+    setCachedEstateSalesPool(requestedDay, cacheKeyZips, dayFiltered);
 
     console.log(
-      '[estate-sales-route] counts',
-      JSON.stringify({
-        raw: allResults.length,
-        deduped: deduped.length,
-        preliminaryRadiusFiltered: preliminaryRadiusFiltered.length,
-        enriched: enriched.length,
-        addressFiltered: addressFiltered.length,
-        dayFiltered: dayFiltered.length,
-        cacheHit: false,
-        requestedDay: normalizedRequestedDay || null,
-        requestedRadiusMiles: requestedRadiusMiles ?? null,
-        searchedZipCount: searchZips.length,
-      }),
+      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_ZIP_COUNTS ` +
+        JSON.stringify({
+          raw: rawResults.length,
+          deduped: deduped.length,
+          preliminaryRadiusFiltered: preliminaryRadiusFiltered.length,
+          enriched: enriched.length,
+          addressFiltered: addressFiltered.length,
+          dayFiltered: dayFiltered.length,
+          cacheHit: false,
+          requestedDay: normalizedRequestedDay || null,
+          requestedRadiusMiles: requestedRadiusMiles ?? null,
+          searchedZip: searchZip,
+          searchedZipCount: 1,
+        }),
     );
   }
 
@@ -2118,23 +1965,25 @@ async function fetchAllEstateSales(
   const sorted = sortSales(radiusFiltered);
 
   console.log(
-    '[estate-sales-route] response',
-    JSON.stringify({
-      cacheHit,
-      dayFiltered: dayFiltered.length,
-      radiusFiltered: radiusFiltered.length,
-      requestedDay: normalizedRequestedDay || null,
-      requestedRadiusMiles: requestedRadiusMiles ?? null,
-      requestedLatitude: requestedOrigin?.latitude ?? null,
-      requestedLongitude: requestedOrigin?.longitude ?? null,
-      searchedZipCount: searchZips.length,
-    }),
+    `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_ZIP_RESPONSE ` +
+      JSON.stringify({
+        cacheHit,
+        dayFiltered: dayFiltered.length,
+        radiusFiltered: radiusFiltered.length,
+        requestedDay: normalizedRequestedDay || null,
+        requestedRadiusMiles: requestedRadiusMiles ?? null,
+        requestedLatitude: requestedOrigin?.latitude ?? null,
+        requestedLongitude: requestedOrigin?.longitude ?? null,
+        searchedZip: searchZip,
+        searchedZipCount: 1,
+      }),
   );
 
   return sorted.slice(0, MAX_RESULTS);
 }
 
 router.get('/', async (req, res) => {
+  console.log(`[estate-sales-route] ${ESTATE_ROUTE_VERSION} NO_ZIP_SWEEP route start`);
   const requestStartedAt = Date.now();
   const requestedDay = normalizeRequestedDay(req.query?.day || '');
   const requestedRadiusMiles = normalizeRequestedRadiusMiles(
@@ -2143,6 +1992,9 @@ router.get('/', async (req, res) => {
   const requestedOrigin = {
     latitude: normalizeRequestedOriginCoordinate(req.query?.latitude),
     longitude: normalizeRequestedOriginCoordinate(req.query?.longitude),
+    zip: req.query?.zip || req.query?.postalCode || req.query?.postal || '',
+    postalCode: req.query?.postalCode || req.query?.zip || req.query?.postal || '',
+    postal: req.query?.postal || req.query?.zip || req.query?.postalCode || '',
   };
 
   try {
@@ -2155,6 +2007,7 @@ router.get('/', async (req, res) => {
 
     return res.json({
       success: true,
+      routeVersion: ESTATE_ROUTE_VERSION,
       source: 'estatesales-net',
       requestedDay,
       requestedRadiusMiles,

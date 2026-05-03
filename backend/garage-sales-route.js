@@ -1,1640 +1,2063 @@
 const express = require('express');
 const axios = require('axios');
-const cheerio = require('cheerio');
 
 const router = express.Router();
 
-function toRadians(value) {
-  return (Number(value) * Math.PI) / 180;
+const ESTATE_ROUTE_VERSION = 'source-assist-no-zip-sweep-v5-user-radius-only';
+
+const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_RESULTS = 100;
+const DETAIL_FETCH_DELAY_MS = 700;
+const MAX_DETAIL_FETCHES = 40;
+const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
+const ZIP_FETCH_CONCURRENCY = 4;
+const DETAIL_FETCH_CONCURRENCY = 6;
+const DETAIL_ENRICH_TARGET_COUNT = 60;
+
+const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
+
+const detailPageCache = new Map();
+const estateSalesSearchCache = new Map();
+const ESTATE_SALES_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function normalizeRequestedOriginCoordinate(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Number(parsed.toFixed(4));
 }
 
-function distanceMiles(startLat, startLon, endLat, endLon) {
-  if (
-    startLat === null ||
-    startLat === undefined ||
-    startLon === null ||
-    startLon === undefined ||
-    endLat === null ||
-    endLat === undefined ||
-    endLon === null ||
-    endLon === undefined ||
-    !Number.isFinite(Number(startLat)) ||
-    !Number.isFinite(Number(startLon)) ||
-    !Number.isFinite(Number(endLat)) ||
-    !Number.isFinite(Number(endLon))
-  ) {
+function buildEstateSalesCacheKey(requestedDay = '', searchZips = []) {
+  const normalizedDay = normalizeRequestedDay(requestedDay) || 'all-days';
+  const zipSignature =
+    Array.isArray(searchZips) && searchZips.length
+      ? String(searchZips[0] || '60565')
+      : '60565';
+
+  return `${ESTATE_ROUTE_VERSION}__${normalizedDay}__${zipSignature}`;
+}
+
+function getCachedEstateSalesPool(requestedDay = '', searchZips = []) {
+  const cacheKey = buildEstateSalesCacheKey(requestedDay, searchZips);
+  const cached = estateSalesSearchCache.get(cacheKey);
+
+  if (!cached) return null;
+  if (Date.now() - cached.timestamp > ESTATE_SALES_CACHE_TTL_MS) {
+    estateSalesSearchCache.delete(cacheKey);
     return null;
   }
 
-  const earthRadiusMiles = 3958.8;
-  const dLat = toRadians(Number(endLat) - Number(startLat));
-  const dLon = toRadians(Number(endLon) - Number(startLon));
-  const lat1 = toRadians(Number(startLat));
-  const lat2 = toRadians(Number(endLat));
-
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return Math.round(earthRadiusMiles * c * 100) / 100;
+  return Array.isArray(cached.sales)
+    ? cached.sales.map((sale) => ({ ...sale }))
+    : null;
 }
 
-function parseCoordinateValue(value) {
-  if (value === null || value === undefined) return null;
-
-  const text = String(value).trim();
-  if (!text) return null;
-
-  const parsed = Number(text);
-  return Number.isFinite(parsed) ? parsed : null;
+function setCachedEstateSalesPool(
+  requestedDay = '',
+  searchZips = [],
+  sales = [],
+) {
+  const cacheKey = buildEstateSalesCacheKey(requestedDay, searchZips);
+  estateSalesSearchCache.set(cacheKey, {
+    timestamp: Date.now(),
+    sales: Array.isArray(sales) ? sales.map((sale) => ({ ...sale })) : [],
+  });
 }
 
-function isUsableCoordinatePair(latitude, longitude) {
-  const lat = Number(latitude);
-  const lon = Number(longitude);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    return false;
+async function mapWithConcurrency(items = [], concurrency = 4, worker) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const safeConcurrency = Math.max(1, Number(concurrency) || 1);
+  const results = new Array(safeItems.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (nextIndex < safeItems.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(
+        safeItems[currentIndex],
+        currentIndex,
+      );
+    }
   }
 
-  // Reject placeholder / empty-parsed coords like 0,0.
-  if (Math.abs(lat) < 0.000001 && Math.abs(lon) < 0.000001) {
-    return false;
-  }
-
-  // Craigslist garage sale results for this feature are US-only.
-  if (lat < 24 || lat > 50 || lon > -66 || lon < -125) {
-    return false;
-  }
-
-  return true;
-}
-
-function normalizeAreaFromCoords(latitude, longitude) {
-  const lat = Number(latitude);
-  const lon = Number(longitude);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    return 'chicago';
-  }
-
-  if (lat >= 41 && lat <= 43.5 && lon >= -89.5 && lon <= -86.5)
-    return 'chicago';
-  if (lat >= 42 && lat <= 44.5 && lon >= -89 && lon <= -87) return 'milwaukee';
-  if (lat >= 43 && lat <= 44.5 && lon >= -90.5 && lon <= -88.5)
-    return 'madison';
-  if (lat >= 44 && lat <= 46 && lon >= -94.5 && lon <= -92)
-    return 'minneapolis';
-  if (lat >= 39 && lat <= 41 && lon >= -87 && lon <= -84.5)
-    return 'indianapolis';
-
-  return 'chicago';
-}
-
-function parseCraigslistDate(textValue, fallbackDay) {
-  const text = String(textValue || '').trim();
-  if (!text)
-    return fallbackDay === 'tomorrow'
-      ? 'Tomorrow'
-      : fallbackDay === 'today'
-        ? 'Today'
-        : '';
-
-  const date = new Date(text);
-  if (Number.isNaN(date.getTime())) return text;
-
-  return `${date.getMonth() + 1}/${date.getDate()}/${date.getFullYear()}`;
-}
-
-function parsePostingUrl(href, baseUrl) {
-  if (!href) return '';
-  if (/^https?:\/\//i.test(href)) return href;
-  return new URL(href, baseUrl).toString();
-}
-
-function parseGeoFromElement($element) {
-  const lat = parseCoordinateValue(
-    $element.attr('data-latitude') ||
-      $element.attr('data-lat') ||
-      $element.attr('latitude'),
-  );
-  const lon = parseCoordinateValue(
-    $element.attr('data-longitude') ||
-      $element.attr('data-lon') ||
-      $element.attr('longitude'),
+  const workers = Array.from(
+    { length: Math.min(safeConcurrency, safeItems.length) },
+    () => runWorker(),
   );
 
-  if (isUsableCoordinatePair(lat, lon)) {
-    return { latitude: lat, longitude: lon };
-  }
-
-  return null;
+  await Promise.all(workers);
+  return results;
 }
 
-function parseGeoFromHtml(html) {
-  const htmlText = String(html || '');
-  if (!htmlText) return { latitude: null, longitude: null };
+function stripHtml(value = '') {
+  return String(value)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<\/p>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeText(value = '') {
+  return stripHtml(value).toLowerCase();
+}
+
+function decodeUrlPath(path = '') {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+}
+
+function makeStableId(url = '') {
+  return `es-${Buffer.from(url).toString('base64').replace(/=/g, '')}`;
+}
+
+function extractLocationFromUrl(url = '') {
+  const match = url.match(/\/IL\/([^/]+)\/(\d{5})\/(\d+)/i);
+
+  if (!match) {
+    return {
+      city: '',
+      state: 'IL',
+      zip: '',
+      sourceListingId: '',
+    };
+  }
+
+  const rawCity = match[1] || '';
+  const parsedZip = match[2] || '';
+  const sourceListingId = match[3] || '';
+
+  const city = rawCity
+    .split('-')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(' ');
+
+  return {
+    city,
+    state: 'IL',
+    zip: parsedZip,
+    sourceListingId,
+  };
+}
+
+function extractTitle(snippet = '', absoluteUrl = '') {
+  const h3Match = snippet.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
+  if (h3Match) {
+    const title = stripHtml(h3Match[1]);
+    if (title) return title;
+  }
+
+  const titleAttrMatch = snippet.match(/title="([^"]+)"/i);
+  if (titleAttrMatch) {
+    const title = stripHtml(titleAttrMatch[1]);
+    if (title) return title;
+  }
+
+  const urlLocation = extractLocationFromUrl(absoluteUrl);
+  if (urlLocation.city) {
+    return `Estate Sale - ${urlLocation.city}`;
+  }
+
+  return 'Estate Sale';
+}
+
+function extractStatusText(snippet = '') {
+  const text = stripHtml(snippet);
 
   const patterns = [
-    /data-latitude=["']([\-\d.]+)["'][^>]*data-longitude=["']([\-\d.]+)["']/i,
-    /data-longitude=["']([\-\d.]+)["'][^>]*data-latitude=["']([\-\d.]+)["']/i,
-    /"latitude"\s*:\s*([\-\d.]+)\s*,\s*"longitude"\s*:\s*([\-\d.]+)/i,
-    /lat=([\-\d.]+).*?lon=([\-\d.]+)/i,
+    /sale is over/i,
+    /going on now/i,
+    /starts today/i,
+    /starts tomorrow/i,
+    /starts in \d+ day(?:s)?/i,
+    /\d+\s+day(?:s)?\s+away/i,
+    /today/i,
+    /tomorrow/i,
   ];
 
   for (const pattern of patterns) {
-    const match = htmlText.match(pattern);
-    if (!match) continue;
-    const first = Number(match[1]);
-    const second = Number(match[2]);
-    if (/data-longitude=.*data-latitude/i.test(String(match[0]))) {
-      if (isUsableCoordinatePair(second, first)) {
-        return { latitude: second, longitude: first };
-      }
-      continue;
-    }
-
-    if (isUsableCoordinatePair(first, second)) {
-      return { latitude: first, longitude: second };
-    }
+    const match = text.match(pattern);
+    if (match) return match[0];
   }
 
-  return { latitude: null, longitude: null };
+  return '';
 }
 
-function extractStreetAddressFromText(value) {
-  const text = String(value || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!text) return '';
+function extractDateText(snippet = '') {
+  const text = stripHtml(snippet);
 
   const patterns = [
-    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6}\s(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy))\b/i,
-    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6})\b/i,
+    /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:\s*-\s*\d{1,2})?(?:,\s*\d{4})?/i,
+    /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?(?:\s*-\s*\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)?/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) return match[0];
+  }
+
+  return '';
+}
+
+function extractCompany(snippet = '') {
+  const text = stripHtml(snippet);
+
+  const patterns = [
+    /by\s+([A-Z0-9][A-Za-z0-9 '&,.\-]{2,80})/,
+    /company[:\s]+([A-Z0-9][A-Za-z0-9 '&,.\-]{2,80})/i,
   ];
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      return String(match[1])
-        .replace(/[,:;.-]+$/g, '')
-        .trim();
+      return match[1].trim();
     }
   }
 
   return '';
 }
 
-function buildAddressLabel(parts) {
-  const cleanParts = parts
-    .map((part) =>
-      String(part || '')
-        .replace(/\s+/g, ' ')
-        .trim(),
-    )
-    .filter(Boolean);
-
-  return cleanParts.join(', ').replace(/,\s*,/g, ', ').trim();
+function extractImageCount(snippet = '') {
+  const text = stripHtml(snippet);
+  const match = text.match(/(\d+)\s+photos?/i);
+  return match ? Number(match[1]) : 0;
 }
 
-function parseMapAddressFromPage($, html) {
-  const htmlText = String(html || '');
+function extractDistanceMiles(snippet = '') {
+  const text = stripHtml(snippet);
+  const match = text.match(/(\d+(?:\.\d+)?)\s*miles?/i);
+  return match ? Number(match[1]) : null;
+}
 
-  const directCandidates = [
-    $('.mapaddress').first().text().trim(),
-    $('[data-mapaddress]').first().attr('data-mapaddress'),
-    $('[itemprop="streetAddress"]').first().text().trim(),
-    $('[itemprop="streetAddress"]').first().attr('content'),
-    $('meta[property="og:street-address"]').attr('content'),
-    $('meta[name="geo.placename"]').attr('content'),
-  ].filter(Boolean);
+function inferSaleType(title = '', snippet = '') {
+  const text = `${title} ${stripHtml(snippet)}`.toLowerCase();
 
-  for (const candidate of directCandidates) {
-    const cleaned = String(candidate || '').trim();
-    if (cleaned) return cleaned;
-  }
+  if (text.includes('tag sale')) return 'tag-sale';
+  if (text.includes('garage sale')) return 'garage-sale';
+  if (text.includes('yard sale')) return 'yard-sale';
+  if (text.includes('moving sale')) return 'moving-sale';
+  if (text.includes('estate sale')) return 'estate-sale';
 
-  const jsonLikePatterns = [
-    /"mapaddress"\s*:\s*"([^"]+)"/i,
-    /"streetAddress"\s*:\s*"([^"]+)"/i,
-    /"addressLocality"\s*:\s*"([^"]+)"/i,
-    /data-mapaddress=["']([^"']+)["']/i,
+  return 'sale';
+}
+
+function addDeterministicJitter(baseValue, seed, spread = 0.012) {
+  const hash = Array.from(String(seed || 'seed')).reduce(
+    (acc, ch) => acc + ch.charCodeAt(0),
+    0,
+  );
+  const normalized = (hash % 1000) / 999 - 0.5;
+  return Number((baseValue + normalized * spread).toFixed(6));
+}
+
+function buildZipFallbackCoordinates(_zip = '', _seed = '') {
+  // Disabled with the ZIP sweep. Detail-page coordinates are still used when
+  // EstateSales.net exposes them.
+  return null;
+}
+
+function isCurrentOrUpcoming(snippet = '') {
+  const text = normalizeText(snippet);
+
+  if (!text) return false;
+  if (/sale\s+is\s+over/.test(text)) return false;
+
+  const positiveSignals = [
+    /going on now/,
+    /starts today/,
+    /starts tomorrow/,
+    /starts in \d+ day/,
+    /\b\d+\s+days?\s+away\b/,
+    /\btoday\b/,
+    /\btomorrow\b/,
+    /\bthu(?:rsday)?\b/,
+    /\bfri(?:day)?\b/,
+    /\bsat(?:urday)?\b/,
+    /\bsun(?:day)?\b/,
+    /\bmon(?:day)?\b/,
+    /\btue(?:sday)?\b/,
+    /\bwed(?:nesday)?\b/,
   ];
 
-  for (const pattern of jsonLikePatterns) {
-    const match = htmlText.match(pattern);
-    if (match && match[1]) {
-      const cleaned = String(match[1])
-        .replace(/\\u002F/gi, '/')
-        .replace(/\\u0026/gi, '&')
-        .replace(/\\"/g, '"')
-        .trim();
-      if (cleaned) return cleaned;
-    }
-  }
-
-  return '';
+  return positiveSignals.some((pattern) => pattern.test(text));
 }
 
-function cleanAddressFragment(value) {
-  return String(value || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .replace(/[,:;.-]+$/g, '')
-    .trim();
-}
-
-function normalizeRoadAbbreviation(value) {
-  return String(value || '')
-    .replace(/St\.?/gi, 'Street')
-    .replace(/Rd\.?/gi, 'Road')
-    .replace(/Dr\.?/gi, 'Drive')
-    .replace(/Ln\.?/gi, 'Lane')
-    .replace(/Ct\.?/gi, 'Court')
-    .replace(/Cir\.?/gi, 'Circle')
-    .replace(/Blvd\.?/gi, 'Boulevard')
-    .replace(/Pkwy\.?/gi, 'Parkway')
-    .replace(/Pl\.?/gi, 'Place')
-    .replace(/Ter\.?/gi, 'Terrace')
-    .replace(/Trl\.?/gi, 'Trail')
-    .replace(/Hwy\.?/gi, 'Highway')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function normalizeNearAddressText(value) {
-  return cleanAddressFragment(value)
-    .replace(
-      /\s*\((?:church on corner|corner|near corner|by park|park district).*?\)\s*/gi,
-      ' ',
-    )
-    .replace(/near\s+near/gi, 'near')
-    .replace(/\s*&\s*/g, ' & ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function hasHouseNumberPrefix(value) {
-  const text = cleanAddressFragment(value);
-  return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\b/i.test(text);
-}
-
-function isLikelyStreetName(value) {
-  const text = normalizeRoadAbbreviation(value);
-  if (!text) return false;
-
-  if (
-    /\b(?:Street|Road|Drive|Lane|Court|Circle|Boulevard|Parkway|Place|Terrace|Way|Trail|Highway|Ave(?:nue)?|Route)\b/i.test(
-      text,
-    )
-  ) {
-    return true;
-  }
-
-  return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,5}$/i.test(
-    text,
-  );
-}
-
-function isLikelyCrossStreet(value) {
-  const text = normalizeRoadAbbreviation(value);
-  if (!text) return false;
-
-  if (/\s(?:&|and)\s/i.test(` ${text} `)) return true;
-  if (/^(?:[NESW]\s+)?\d{1,3}(?:st|nd|rd|th)\b/i.test(text)) return true;
-  if (/^(?:Route|Rt)\s*\d+\b/i.test(text)) return true;
-
-  return isLikelyStreetName(text);
-}
-
-function isLikelyCityLabel(value) {
-  const text = cleanAddressFragment(value);
-  if (!text) return false;
-  if (/\d/.test(text)) return false;
-  if (/\bnear\b/i.test(text)) return false;
-  if (/[/&]/.test(text)) return false;
-  if (text.length < 2 || text.length > 40) return false;
-
-  return /^[A-Za-z][A-Za-z .'-]+$/.test(text);
-}
-
-function parseCityStateZip(value) {
-  const text = cleanAddressFragment(value);
-  if (!text) {
-    return { city: '', state: '', zip: '' };
-  }
-
-  const zipMatch = text.match(/(\d{5})(?:-\d{4})?/);
-  const zip = zipMatch ? zipMatch[1] : '';
-
-  let withoutZip = text
-    .replace(/\d{5}(?:-\d{4})?/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const cityStateMatch = withoutZip.match(/^(.+?),\s*([A-Z]{2})$/);
-  if (cityStateMatch) {
-    return {
-      city: cleanAddressFragment(cityStateMatch[1]),
-      state: cityStateMatch[2].toUpperCase(),
-      zip,
-    };
-  }
-
-  const stateOnlyMatch = withoutZip.match(/^(.+?)\s+([A-Z]{2})$/);
-  if (stateOnlyMatch && isLikelyCityLabel(stateOnlyMatch[1])) {
-    return {
-      city: cleanAddressFragment(stateOnlyMatch[1]),
-      state: stateOnlyMatch[2].toUpperCase(),
-      zip,
-    };
-  }
-
-  return {
-    city: isLikelyCityLabel(withoutZip) ? withoutZip : '',
-    state: '',
-    zip,
-  };
-}
-
-function splitNearAddress(rawValue) {
-  const text = normalizeNearAddressText(rawValue);
-  if (!text) {
-    return {
-      street: '',
-      crossStreet: '',
-      raw: '',
-    };
-  }
-
-  if (/^near\s+/i.test(text)) {
-    const crossStreetOnly = normalizeRoadAbbreviation(
-      text.replace(/^near\s+/i, ''),
-    );
-    return {
-      street: '',
-      crossStreet: isLikelyCrossStreet(crossStreetOnly) ? crossStreetOnly : '',
-      raw: text,
-    };
-  }
-
-  const nearMatch = text.match(/^(.+?)\s+near\s+(.+)$/i);
-  if (nearMatch) {
-    const left = normalizeRoadAbbreviation(nearMatch[1]);
-    const right = normalizeRoadAbbreviation(nearMatch[2]);
-
-    const leftLooksStreet = isLikelyStreetName(left);
-    const rightLooksStreet = isLikelyCrossStreet(right);
-    const leftHasHouseNumber = hasHouseNumberPrefix(left);
-
-    if (leftHasHouseNumber && leftLooksStreet) {
-      return {
-        street: left,
-        crossStreet: rightLooksStreet ? right : '',
-        raw: text,
-      };
-    }
-
-    // Final street-only enhancement:
-    // when we clearly have "Street near CrossStreet", keep the street even
-    // without a house number so map users can still get to the block.
-    if (leftLooksStreet && rightLooksStreet) {
-      return {
-        street: left,
-        crossStreet: right,
-        raw: text,
-      };
-    }
-
-    if (!leftHasHouseNumber && rightLooksStreet) {
-      return {
-        street: '',
-        crossStreet: right,
-        raw: text,
-      };
-    }
-
-    return {
-      street: '',
-      crossStreet: '',
-      raw: text,
-    };
-  }
-
-  const street = normalizeRoadAbbreviation(text);
-  return {
-    street:
-      isLikelyStreetName(street) && hasHouseNumberPrefix(street) ? street : '',
-    crossStreet: '',
-    raw: text,
-  };
-}
-
-function buildMapsQuery(parts) {
-  return parts
-    .map((part) => cleanAddressFragment(part))
-    .filter(Boolean)
-    .join(', ')
-    .replace(/,\s*,/g, ', ')
-    .trim();
-}
-
-function getDefaultCityFromContext({
-  hood,
-  title,
-  mapAddress,
-  approximateAddress,
-}) {
-  const combined = [
-    cleanAddressFragment(hood),
-    cleanAddressFragment(title),
-    cleanAddressFragment(mapAddress),
-    cleanAddressFragment(approximateAddress),
-  ]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-
-  if (combined.includes('lemont')) return 'Lemont';
-  if (combined.includes('woodridge')) return 'Woodridge';
-  if (combined.includes('downers grove')) return 'Downers Grove';
-  if (combined.includes('bolingbrook')) return 'Bolingbrook';
-  if (combined.includes('romeoville')) return 'Romeoville';
-  if (combined.includes('naperville')) return 'Naperville';
-  if (combined.includes('plainfield')) return 'Plainfield';
-  if (combined.includes('darien')) return 'Darien';
-  if (combined.includes('lisle')) return 'Lisle';
-
-  return '';
-}
-
-function buildPreferredMapsQuery({
-  street,
-  crossStreet,
-  city,
-  state,
-  zip,
-  mapAddress,
-  approximateAddress,
-  fallbackAddressLabel,
-}) {
-  const cleanStreet = cleanAddressFragment(street);
-  const cleanCrossStreet = cleanAddressFragment(crossStreet);
-  const cleanCity = cleanAddressFragment(city);
-  const cleanState = cleanAddressFragment(state);
-  const cleanZip = cleanAddressFragment(zip);
-
-  const hasExactStreetAddress =
-    cleanStreet && hasHouseNumberPrefix(cleanStreet);
-
-  if (hasExactStreetAddress) {
-    return buildMapsQuery([cleanStreet, cleanCity, cleanState, cleanZip]);
-  }
-
-  if (cleanStreet && cleanCrossStreet) {
-    return buildMapsQuery([
-      `${cleanStreet} & ${cleanCrossStreet}`,
-      cleanCity,
-      cleanState,
-      cleanZip,
-    ]);
-  }
-
-  if (cleanStreet) {
-    return buildMapsQuery([cleanStreet, cleanCity, cleanState, cleanZip]);
-  }
-
-  if (cleanCrossStreet) {
-    return buildMapsQuery([cleanCrossStreet, cleanCity, cleanState, cleanZip]);
-  }
-
-  return (
-    buildMapsQuery([
-      cleanAddressFragment(mapAddress),
-      cleanCity,
-      cleanState,
-      cleanZip,
-    ]) ||
-    buildMapsQuery([
-      cleanAddressFragment(approximateAddress),
-      cleanCity,
-      cleanState,
-      cleanZip,
-    ]) ||
-    buildMapsQuery([
-      cleanAddressFragment(fallbackAddressLabel),
-      cleanCity,
-      cleanState,
-      cleanZip,
-    ])
-  );
-}
-
-function buildFinalAddressData({
-  title,
-  hood,
-  mapAddress,
-  approximateAddress,
-  fallbackAddressLabel,
-}) {
-  const cleanMapAddress = normalizeNearAddressText(mapAddress);
-  const cleanApproximateAddress = normalizeNearAddressText(approximateAddress);
-  const cleanHood = cleanAddressFragment(hood);
-  const cleanFallback = cleanAddressFragment(fallbackAddressLabel);
-
-  const titleStreet = cleanAddressFragment(
-    extractStreetAddressFromText(stripDateNoiseFromText(title)),
-  );
-
-  const mapParts = splitNearAddress(cleanMapAddress);
-  const approxParts = splitNearAddress(cleanApproximateAddress);
-  const hoodParts = parseCityStateZip(cleanHood);
-
-  const trustedTitleStreet =
-    hasHouseNumberPrefix(titleStreet) && looksLikeRealStreetAddress(titleStreet)
-      ? normalizeRoadAbbreviation(titleStreet)
-      : '';
-
-  const street =
-    mapParts.street || trustedTitleStreet || approxParts.street || '';
-
-  const crossStreet = mapParts.crossStreet || approxParts.crossStreet || '';
-
-  const inferredCity =
-    hoodParts.city ||
-    getDefaultCityFromContext({
-      hood: cleanHood,
-      title,
-      mapAddress: cleanMapAddress,
-      approximateAddress: cleanApproximateAddress,
-    });
-
-  const city =
-    inferredCity ||
-    (!street && !crossStreet && isLikelyCityLabel(cleanMapAddress)
-      ? cleanMapAddress
-      : '') ||
-    (!street && !crossStreet && isLikelyCityLabel(cleanApproximateAddress)
-      ? cleanApproximateAddress
-      : '');
-
-  const state = hoodParts.state || 'IL';
-  const zip = hoodParts.zip || '';
-
-  const displayAddress =
-    buildMapsQuery([
-      street,
-      crossStreet ? `near ${crossStreet}` : '',
-      city,
-      state,
-    ]) ||
-    cleanMapAddress ||
-    cleanApproximateAddress ||
-    cleanHood ||
-    cleanFallback ||
-    'Approximate location';
-
-  const mapsQuery = buildPreferredMapsQuery({
-    street,
-    crossStreet,
-    city,
-    state,
-    zip,
-    mapAddress: cleanMapAddress,
-    approximateAddress: cleanApproximateAddress,
-    fallbackAddressLabel: cleanFallback,
-  });
-
-  return {
-    street,
-    crossStreet,
-    city,
-    state,
-    zip,
-    country: 'USA',
-    addressLabel: displayAddress,
-    displayAddress,
-    mapAddress: cleanMapAddress || cleanApproximateAddress || cleanHood || '',
-    mapsQuery: mapsQuery || displayAddress,
-  };
-}
-
-function stripDateNoiseFromText(value) {
-  return cleanAddressFragment(value)
-    .replace(
-      /(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s*\d{1,2}(?:\s*[-/,]\s*\d{1,2})?(?:\s*,?\s*\d{2,4})?/gi,
-      ' ',
-    )
-    .replace(/\d{1,2}\/\d{1,2}(?:\/\d{2,4})?/g, ' ')
-    .replace(/\d{4}/g, ' ')
-    .replace(/\d{1,2}\s*(?:am|pm)/gi, ' ')
-    .replace(
-      /(?:today|tomorrow|thursday|friday|saturday|sunday|monday|tuesday|wednesday)/gi,
-      ' ',
-    )
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function looksLikeRealStreetAddress(value) {
-  const text = cleanAddressFragment(value);
-  if (!text) return false;
-  if (
-    /\d{1,6}\s+[A-Za-z]/.test(text) &&
-    /(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)/i.test(
-      text,
-    )
-  ) {
-    return true;
-  }
-  return /^\d{1,6}\s+[A-Za-z][A-Za-z0-9.#'\-]*(?:\s+[A-Za-z0-9.#'\-]+){0,4}$/i.test(
-    text,
-  );
-}
-
-function buildBestAddressLabel({ mapAddress, title, hood }) {
-  const cleanedMapAddress = cleanAddressFragment(mapAddress);
-  if (cleanedMapAddress) {
-    return cleanedMapAddress;
-  }
-
-  const extractedStreet = cleanAddressFragment(
-    extractStreetAddressFromText(stripDateNoiseFromText(title)),
-  );
-  if (looksLikeRealStreetAddress(extractedStreet)) {
-    return buildAddressLabel([extractedStreet, hood]);
-  }
-
-  return '';
-}
-
-function buildGeocodeCandidates({ mapAddress, addressLabel, hood, title }) {
-  const candidates = [
-    cleanAddressFragment(mapAddress),
-    cleanAddressFragment(addressLabel),
-    cleanAddressFragment(hood),
-    buildAddressLabel([
-      cleanAddressFragment(
-        extractStreetAddressFromText(stripDateNoiseFromText(title)),
-      ),
-      cleanAddressFragment(hood),
-    ]),
-    cleanAddressFragment(stripDateNoiseFromText(title)),
-  ].filter(Boolean);
-
-  return [...new Set(candidates)].filter((candidate) => {
-    if (!candidate) return false;
-    if (
-      /^(garage|yard|estate|moving|church|community|subdivision)/i.test(
-        candidate,
-      )
-    ) {
-      return false;
-    }
-    return true;
-  });
-}
-
-async function geocodeWithFallbacks(candidates, area) {
-  for (const candidate of candidates) {
-    const result = await geocodeApproximateLocation(candidate, area);
-    if (
-      Number.isFinite(Number(result.latitude)) &&
-      Number.isFinite(Number(result.longitude))
-    ) {
-      return result;
-    }
-  }
-
-  return { latitude: null, longitude: null, approximateAddress: '' };
-}
-
-const postingPageDetailCache = new Map();
-const approximateGeocodeCache = new Map();
-
-function getAreaGeocodeSuffix(area) {
-  switch (String(area || '').toLowerCase()) {
-    case 'milwaukee':
-      return 'Wisconsin, USA';
-    case 'madison':
-      return 'Wisconsin, USA';
-    case 'minneapolis':
-      return 'Minnesota, USA';
-    case 'indianapolis':
-      return 'Indiana, USA';
-    case 'chicago':
-    default:
-      return 'Illinois, USA';
-  }
-}
-
-function buildApproximateGeocodeQuery(rawValue, area) {
-  const value = String(rawValue || '')
-    .replace(/[()]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!value) return '';
-
-  const suffix = getAreaGeocodeSuffix(area);
-  if (value.toLowerCase().includes(suffix.toLowerCase())) {
-    return value;
-  }
-
-  return `${value}, ${suffix}`;
-}
-
-async function geocodeApproximateLocation(rawValue, area) {
-  const query = buildApproximateGeocodeQuery(rawValue, area);
-  if (!query) {
-    return { latitude: null, longitude: null, approximateAddress: '' };
-  }
-
-  const cacheKey = `${String(area || '').toLowerCase()}::${query.toLowerCase()}`;
-  if (approximateGeocodeCache.has(cacheKey)) {
-    return approximateGeocodeCache.get(cacheKey);
-  }
-
+function safeJsonParse(value) {
   try {
-    const response = await axios.get(
-      'https://nominatim.openstreetmap.org/search',
-      {
-        timeout: 12000,
-        params: {
-          q: query,
-          format: 'jsonv2',
-          limit: 1,
-          countrycodes: 'us',
-          addressdetails: 1,
-        },
-        headers: {
-          'User-Agent': 'ListAssist/1.0 (garage-sale geocoder)',
-          Accept: 'application/json',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-        validateStatus: () => true,
-      },
-    );
-
-    if (
-      response.status >= 400 ||
-      !Array.isArray(response.data) ||
-      !response.data.length
-    ) {
-      const fallback = {
-        latitude: null,
-        longitude: null,
-        approximateAddress: '',
-      };
-      approximateGeocodeCache.set(cacheKey, fallback);
-      return fallback;
-    }
-
-    const first = response.data[0] || {};
-    const latitude = Number(first.lat);
-    const longitude = Number(first.lon);
-    const approximateAddress = String(first.display_name || query).trim();
-
-    const result = {
-      latitude: Number.isFinite(latitude) ? latitude : null,
-      longitude: Number.isFinite(longitude) ? longitude : null,
-      approximateAddress,
-    };
-    approximateGeocodeCache.set(cacheKey, result);
-    return result;
-  } catch (_error) {
-    const fallback = {
-      latitude: null,
-      longitude: null,
-      approximateAddress: '',
-    };
-    approximateGeocodeCache.set(cacheKey, fallback);
-    return fallback;
-  }
-}
-
-function normalizeTimingText(value) {
-  return String(value || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function monthNameToIndex(value) {
-  const text = String(value || '')
-    .trim()
-    .toLowerCase();
-  const months = {
-    jan: 0,
-    january: 0,
-    feb: 1,
-    february: 1,
-    mar: 2,
-    march: 2,
-    apr: 3,
-    april: 3,
-    may: 4,
-    jun: 5,
-    june: 5,
-    jul: 6,
-    july: 6,
-    aug: 7,
-    august: 7,
-    sep: 8,
-    sept: 8,
-    september: 8,
-    oct: 9,
-    october: 9,
-    nov: 10,
-    november: 10,
-    dec: 11,
-    december: 11,
-  };
-
-  return Object.prototype.hasOwnProperty.call(months, text) ? months[text] : -1;
-}
-
-function buildSaleDateValue({ month, day, year }, referenceDate) {
-  const ref = referenceDate instanceof Date ? referenceDate : new Date();
-  const normalizedYear = Number(year) > 0 ? Number(year) : ref.getFullYear();
-  const fullYear =
-    normalizedYear < 100 ? 2000 + normalizedYear : normalizedYear;
-  const parsed = new Date(fullYear, Number(month), Number(day), 9, 0, 0, 0);
-
-  if (Number.isNaN(parsed.getTime())) {
+    return JSON.parse(value);
+  } catch {
     return null;
   }
+}
 
-  if (!year) {
-    const refStart = new Date(ref);
-    refStart.setHours(0, 0, 0, 0);
-    const maybeNextYear = new Date(parsed);
-    maybeNextYear.setFullYear(parsed.getFullYear() + 1);
+function htmlDecode(value = '') {
+  return String(value)
+    .replace(/\\u0026/g, '&')
+    .replace(/\\\//g, '/')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .trim();
+}
 
-    if (parsed.getTime() < refStart.getTime() - 45 * 24 * 60 * 60 * 1000) {
-      return maybeNextYear;
+function normalizeAddressLine(value = '') {
+  return String(value)
+    .replace(/\s+/g, ' ')
+    .replace(/^[,\s]+|[,\s]+$/g, '')
+    .trim();
+}
+
+function buildAddressLabel(parts = {}) {
+  const street = normalizeAddressLine(parts.street || '');
+  const city = normalizeAddressLine(parts.city || '');
+  const state = normalizeAddressLine(parts.state || '');
+  const zip = normalizeAddressLine(parts.zip || '');
+
+  const locality = [city, state].filter(Boolean).join(', ');
+  const tail = [locality, zip].filter(Boolean).join(locality && zip ? ' ' : '');
+  return [street, tail].filter(Boolean).join(', ');
+}
+
+function extractCoordinatesFromHtml(html = '') {
+  const patterns = [
+    {
+      regex:
+        /"latitude"\s*:\s*"?(-?\d{1,3}\.\d+)"?[\s\S]*?"longitude"\s*:\s*"?(-?\d{1,3}\.\d+)"?/i,
+      order: 'lat-lng',
+    },
+    {
+      regex:
+        /"longitude"\s*:\s*"?(-?\d{1,3}\.\d+)"?[\s\S]*?"latitude"\s*:\s*"?(-?\d{1,3}\.\d+)"?/i,
+      order: 'lng-lat',
+    },
+    {
+      regex:
+        /lat(?:itude)?\s*[:=]\s*(-?\d{1,3}\.\d+)[\s\S]{0,80}?(?:lng|lon|longitude)\s*[:=]\s*(-?\d{1,3}\.\d+)/i,
+      order: 'lat-lng',
+    },
+    {
+      regex:
+        /(?:lng|lon|longitude)\s*[:=]\s*(-?\d{1,3}\.\d+)[\s\S]{0,80}?lat(?:itude)?\s*[:=]\s*(-?\d{1,3}\.\d+)/i,
+      order: 'lng-lat',
+    },
+    {
+      regex:
+        /data-lat(?:itude)?="(-?\d{1,3}\.\d+)"[\s\S]{0,120}?(?:data-lng|data-lon(?:gitude)?)="(-?\d{1,3}\.\d+)"/i,
+      order: 'lat-lng',
+    },
+    {
+      regex:
+        /(?:data-lng|data-lon(?:gitude)?)="(-?\d{1,3}\.\d+)"[\s\S]{0,120}?data-lat(?:itude)?="(-?\d{1,3}\.\d+)"/i,
+      order: 'lng-lat',
+    },
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern.regex);
+    if (!match) continue;
+
+    const latitude = Number(pattern.order === 'lat-lng' ? match[1] : match[2]);
+    const longitude = Number(pattern.order === 'lat-lng' ? match[2] : match[1]);
+
+    if (
+      Number.isFinite(latitude) &&
+      Number.isFinite(longitude) &&
+      Math.abs(latitude) <= 90 &&
+      Math.abs(longitude) <= 180
+    ) {
+      return { latitude, longitude };
     }
-  }
-
-  return parsed;
-}
-
-function formatSaleDateLabel(date) {
-  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
-  return `${date.getMonth() + 1}/${date.getDate()}/${date.getFullYear()}`;
-}
-
-function formatSaleDayLabel(date) {
-  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
-  return date.toLocaleDateString('en-US', { weekday: 'long' });
-}
-
-function normalizeClockLabel(hours, minutes, meridiem) {
-  const mm = String(minutes || 0).padStart(2, '0');
-  if (Number(minutes || 0) === 0) {
-    return `${hours} ${meridiem}`;
-  }
-  return `${hours}:${mm} ${meridiem}`;
-}
-
-function extractSaleTimeLabel(text) {
-  const haystack = normalizeTimingText(text);
-  if (!haystack) return { timeLabel: '', endTime: '', startTime: '' };
-
-  const rangeMatch = haystack.match(
-    /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:-|–|to|until|through)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
-  );
-
-  if (rangeMatch) {
-    const startMeridiem = String(rangeMatch[3] || '').toUpperCase();
-    const endMeridiem = String(
-      rangeMatch[6] || rangeMatch[3] || '',
-    ).toUpperCase();
-    const startHours = Number(rangeMatch[1]);
-    const startMinutes = Number(rangeMatch[2] || 0);
-    const endHours = Number(rangeMatch[4]);
-    const endMinutes = Number(rangeMatch[5] || 0);
-
-    return {
-      startTime: normalizeClockLabel(startHours, startMinutes, startMeridiem),
-      endTime: normalizeClockLabel(endHours, endMinutes, endMeridiem),
-      timeLabel: `${normalizeClockLabel(startHours, startMinutes, startMeridiem)} - ${normalizeClockLabel(endHours, endMinutes, endMeridiem)}`,
-    };
-  }
-
-  const singleMatch = haystack.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
-  if (singleMatch) {
-    const meridiem = String(singleMatch[3] || '').toUpperCase();
-    const hours = Number(singleMatch[1]);
-    const minutes = Number(singleMatch[2] || 0);
-    return {
-      startTime: normalizeClockLabel(hours, minutes, meridiem),
-      endTime: '',
-      timeLabel: normalizeClockLabel(hours, minutes, meridiem),
-    };
-  }
-
-  return { timeLabel: '', endTime: '', startTime: '' };
-}
-
-function extractSaleDateFromText(text, referenceDate) {
-  const haystack = normalizeTimingText(text);
-  if (!haystack) return null;
-
-  const monthMatch = haystack.match(
-    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*(?:-|–|to|through|thru|and|&)\s*(\d{1,2})(?:st|nd|rd|th)?)?(?:\s*,?\s*(\d{2,4}))?/i,
-  );
-
-  if (monthMatch) {
-    const monthIndex = monthNameToIndex(monthMatch[1]);
-    const day = Number(monthMatch[2]);
-    const year = monthMatch[4] ? Number(monthMatch[4]) : null;
-    const parsed = buildSaleDateValue(
-      { month: monthIndex, day, year },
-      referenceDate,
-    );
-    if (parsed) return parsed;
-  }
-
-  const numericMatch = haystack.match(
-    /\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?(?:\s*(?:-|–|to|through|thru|and|&)\s*(\d{1,2})(?:\/(\d{1,2}))?)?/i,
-  );
-
-  if (numericMatch) {
-    const month = Number(numericMatch[1]) - 1;
-    const day = Number(numericMatch[2]);
-    const year = numericMatch[3] ? Number(numericMatch[3]) : null;
-    const parsed = buildSaleDateValue({ month, day, year }, referenceDate);
-    if (parsed) return parsed;
   }
 
   return null;
 }
 
-function extractPostingBodyText($) {
-  return normalizeTimingText(
-    $('#postingbody').text() ||
-      $('section#postingbody').text() ||
-      $('.postingbody').text() ||
-      $('body').text(),
-  );
-}
+function extractAddressFromJsonLdObject(obj) {
+  if (!obj || typeof obj !== 'object') return null;
 
-function extractTimingDetailsFromPosting({
-  title,
-  bodyText,
-  html,
-  referenceDate,
-}) {
-  const candidates = [
-    normalizeTimingText(title),
-    normalizeTimingText(bodyText),
-    normalizeTimingText(html).slice(0, 8000),
-  ].filter(Boolean);
+  const address = obj.address || obj.location?.address;
+  if (!address || typeof address !== 'object') return null;
 
-  for (const candidate of candidates) {
-    const saleDate = extractSaleDateFromText(candidate, referenceDate);
-    const timeInfo = extractSaleTimeLabel(candidate);
+  const street = normalizeAddressLine(address.streetAddress || '');
+  const city = normalizeAddressLine(address.addressLocality || '');
+  const state = normalizeAddressLine(address.addressRegion || 'IL');
+  const zip = normalizeAddressLine(address.postalCode || '');
+  const addressLabel = buildAddressLabel({ street, city, state, zip });
 
-    if (saleDate || timeInfo.timeLabel) {
-      return {
-        saleDate,
-        saleDateLabel: saleDate ? formatSaleDateLabel(saleDate) : '',
-        dayLabel: saleDate ? formatSaleDayLabel(saleDate) : '',
-        timeLabel: timeInfo.timeLabel,
-        startTime: timeInfo.startTime,
-        endTime: timeInfo.endTime,
-        timingConfidence: saleDate
-          ? 'high'
-          : timeInfo.timeLabel
-            ? 'medium'
-            : 'low',
-      };
-    }
-  }
+  if (!addressLabel) return null;
 
   return {
-    saleDate: null,
-    saleDateLabel: '',
-    dayLabel: '',
-    timeLabel: '',
-    startTime: '',
-    endTime: '',
-    timingConfidence: 'low',
+    street,
+    city,
+    state,
+    zip,
+    addressLabel,
   };
 }
 
-async function fetchPostingPageDetails(postingUrl, baseUrl) {
-  if (!postingUrl) {
-    return {
-      latitude: null,
-      longitude: null,
-      mapAddress: '',
-      bodyText: '',
-      saleDate: '',
-      saleDateTime: '',
-      dayLabel: '',
-      timeLabel: '',
-      startTime: '',
-      endTime: '',
-      timingConfidence: 'low',
-    };
-  }
-
-  if (postingPageDetailCache.has(postingUrl)) {
-    return postingPageDetailCache.get(postingUrl);
-  }
-
-  try {
-    const response = await axios.get(postingUrl, {
-      timeout: 15000,
-      validateStatus: () => true,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Referer: baseUrl,
-        DNT: '1',
-        Connection: 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-      },
-    });
-
-    if (response.status >= 400) {
-      const fallback = {
-        latitude: null,
-        longitude: null,
-        mapAddress: '',
-        bodyText: '',
-        saleDate: '',
-        saleDateTime: '',
-        dayLabel: '',
-        timeLabel: '',
-        startTime: '',
-        endTime: '',
-        timingConfidence: 'low',
-      };
-      postingPageDetailCache.set(postingUrl, fallback);
-      return fallback;
-    }
-
-    const html = String(response.data || '');
-    const $ = cheerio.load(html);
-    const parsedMapAddress = parseMapAddressFromPage($, html);
-    const bodyText = extractPostingBodyText($);
-    const timing = extractTimingDetailsFromPosting({
-      title: $('title').first().text() || '',
-      bodyText,
-      html,
-      referenceDate: new Date(),
-    });
-    const directGeo =
-      parseGeoFromElement($('#map')) ||
-      parseGeoFromElement($('[data-latitude][data-longitude]').first()) ||
-      parseGeoFromElement($('[data-lat][data-lon]').first()) ||
-      parseGeoFromHtml(html);
-    const detail = {
-      latitude: directGeo.latitude,
-      longitude: directGeo.longitude,
-      mapAddress: parsedMapAddress,
-      bodyText,
-      saleDate: timing.saleDateLabel,
-      saleDateTime: timing.saleDate ? timing.saleDate.toISOString() : '',
-      dayLabel: timing.dayLabel,
-      timeLabel: timing.timeLabel,
-      startTime: timing.startTime,
-      endTime: timing.endTime,
-      timingConfidence: timing.timingConfidence,
-    };
-    postingPageDetailCache.set(postingUrl, detail);
-    return detail;
-  } catch (_error) {
-    const fallback = {
-      latitude: null,
-      longitude: null,
-      mapAddress: '',
-      bodyText: '',
-      saleDate: '',
-      saleDateTime: '',
-      dayLabel: '',
-      timeLabel: '',
-      startTime: '',
-      endTime: '',
-      timingConfidence: 'low',
-    };
-    postingPageDetailCache.set(postingUrl, fallback);
-    return fallback;
-  }
-}
-
-function parseGeoFromRow($row) {
-  const direct =
-    parseGeoFromElement($row) ||
-    parseGeoFromElement($row.find('[data-latitude][data-longitude]').first()) ||
-    parseGeoFromElement($row.find('[data-lat][data-lon]').first()) ||
-    parseGeoFromHtml($row.html());
-
-  if (isUsableCoordinatePair(direct.latitude, direct.longitude)) {
-    return direct;
-  }
-
-  return { latitude: null, longitude: null };
-}
-
-function detectCraigslistSaleType({ title, metaText, hood }) {
-  const haystack = [title, metaText, hood]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-
-  const blockedPatterns = [
-    /bmw/,
-    /mercedes/,
-    /toyota/,
-    /honda/,
-    /ford/,
-    /chevy/,
-    /vehicle/,
-    /car/,
-    /truck/,
-    /motorcycle/,
-    /storage unit/,
-    /auction/,
-    /apartment/,
-    /rental/,
+function extractAddressFromJsonLd(html = '') {
+  const scriptMatches = [
+    ...html.matchAll(
+      /<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi,
+    ),
   ];
 
-  if (blockedPatterns.some((pattern) => pattern.test(haystack))) {
-    return 'blocked';
+  for (const match of scriptMatches) {
+    const rawJson = htmlDecode(match[1] || '');
+    const parsed = safeJsonParse(rawJson);
+    if (!parsed) continue;
+
+    const candidates = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed['@graph'])
+        ? parsed['@graph']
+        : [parsed];
+
+    for (const candidate of candidates) {
+      const extracted = extractAddressFromJsonLdObject(candidate);
+      if (extracted) return extracted;
+    }
   }
 
-  if (/estate sale|estate\s+liquidation|estate\s+tag\s+sale/.test(haystack)) {
-    return 'estate';
-  }
-
-  if (
-    /yard sale|garage sale|moving sale|rummage sale|flea market|multi\s*family sale|community garage sale|subdivision sale/.test(
-      haystack,
-    )
-  ) {
-    return 'garage';
-  }
-
-  return 'garage';
+  return null;
 }
 
-function isSameCalendarDay(dateA, dateB) {
+function extractScheduleFromJsonLdObject(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+
+  const candidates = [];
+
+  if (obj.startDate || obj.endDate) {
+    candidates.push(obj);
+  }
+
+  if (obj.eventSchedule && typeof obj.eventSchedule === 'object') {
+    candidates.push(obj.eventSchedule);
+  }
+
+  if (Array.isArray(obj.subEvent)) {
+    candidates.push(...obj.subEvent);
+  }
+
+  if (obj.location && typeof obj.location === 'object') {
+    if (obj.location.startDate || obj.location.endDate) {
+      candidates.push(obj.location);
+    }
+  }
+
+  const scheduleEntries = [];
+
+  for (const candidate of candidates) {
+    const startRaw = String(candidate?.startDate || '').trim();
+    const endRaw = String(candidate?.endDate || '').trim();
+    if (!startRaw) continue;
+
+    const start = new Date(startRaw);
+    if (Number.isNaN(start.getTime())) continue;
+
+    const end = endRaw ? new Date(endRaw) : null;
+    const weekday = normalizeWeekdayLabel(
+      start.toLocaleDateString('en-US', { weekday: 'long' }),
+    );
+    const dateLabel = start.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+    });
+    const startTime = normalizeClockLabel(
+      start.toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      }),
+    );
+    const endTime =
+      end && !Number.isNaN(end.getTime())
+        ? normalizeClockLabel(
+            end.toLocaleTimeString('en-US', {
+              hour: 'numeric',
+              minute: '2-digit',
+              hour12: true,
+            }),
+          )
+        : '';
+
+    scheduleEntries.push({
+      dayLabel: weekday,
+      dateLabel,
+      timeLabel: endTime ? `${startTime} to ${endTime}` : startTime,
+      startTime,
+      endTime,
+      startDate: `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`,
+      startDateTime: `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}T${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}:00`,
+      sortTimestamp: start.getTime(),
+    });
+  }
+
+  if (!scheduleEntries.length) return null;
+
+  scheduleEntries.sort((a, b) => a.sortTimestamp - b.sortTimestamp);
+  const primary = scheduleEntries[0];
+  const dateText = scheduleEntries
+    .map((entry) =>
+      [entry.dayLabel, entry.dateLabel, entry.timeLabel]
+        .filter(Boolean)
+        .join(' • '),
+    )
+    .filter(Boolean)
+    .slice(0, 2)
+    .join(' | ');
+
+  return {
+    dayLabel: primary.dayLabel || '',
+    dateLabel: primary.dateLabel || '',
+    timeLabel: stripLeadingWeekdayFromTime(primary.timeLabel || ''),
+    startTime: primary.startTime || '',
+    endTime: primary.endTime || '',
+    startDate: primary.startDate || '',
+    startDateTime: primary.startDateTime || '',
+    dateText: dateText || primary.dateLabel || '',
+    scheduleEntries,
+  };
+}
+
+function extractScheduleFromJsonLd(html = '') {
+  const scriptMatches = [
+    ...html.matchAll(
+      /<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi,
+    ),
+  ];
+
+  for (const match of scriptMatches) {
+    const rawJson = htmlDecode(match[1] || '');
+    const parsed = safeJsonParse(rawJson);
+    if (!parsed) continue;
+
+    const candidates = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed['@graph'])
+        ? parsed['@graph']
+        : [parsed];
+
+    for (const candidate of candidates) {
+      const extracted = extractScheduleFromJsonLdObject(candidate);
+      if (extracted) return extracted;
+    }
+  }
+
+  return null;
+}
+
+function extractAddressFromInlineJson(html = '', fallbackLocation = {}) {
+  const patterns = [
+    /"streetAddress"\s*:\s*"([^"]+)"[\s\S]{0,500}?"addressLocality"\s*:\s*"([^"]+)"[\s\S]{0,200}?"addressRegion"\s*:\s*"([^"]{2})"[\s\S]{0,200}?"postalCode"\s*:\s*"(\d{5})"/i,
+    /"address1"\s*:\s*"([^"]+)"[\s\S]{0,500}?"city"\s*:\s*"([^"]+)"[\s\S]{0,200}?"state"\s*:\s*"([^"]{2})"[\s\S]{0,200}?"zip"\s*:\s*"(\d{5})"/i,
+    /"address"\s*:\s*\{[\s\S]{0,500}?"street"\s*:\s*"([^"]+)"[\s\S]{0,250}?"city"\s*:\s*"([^"]+)"[\s\S]{0,150}?"state"\s*:\s*"([^"]{2})"[\s\S]{0,150}?"zip"\s*:\s*"(\d{5})"/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (!match) continue;
+
+    const street = normalizeAddressLine(match[1] || '');
+    const city = normalizeAddressLine(match[2] || fallbackLocation.city || '');
+    const state = normalizeAddressLine(
+      match[3] || fallbackLocation.state || 'IL',
+    );
+    const zip = normalizeAddressLine(match[4] || fallbackLocation.zip || '');
+    const addressLabel = buildAddressLabel({ street, city, state, zip });
+
+    if (!addressLabel) continue;
+
+    return { street, city, state, zip, addressLabel };
+  }
+
+  return null;
+}
+
+function extractMetaTagValue(html = '', attributeName = '') {
+  if (!html || !attributeName) return '';
+
+  const metaMatches = html.match(/<meta[^>]+>/gi) || [];
+
+  for (const tag of metaMatches) {
+    const nameMatch = tag.match(/(?:property|name|itemprop)="([^"]+)"/i);
+    const contentMatch = tag.match(/content="([^"]+)"/i);
+    if (!nameMatch?.[1] || !contentMatch?.[1]) continue;
+
+    const normalizedName = String(nameMatch[1]).trim().toLowerCase();
+    if (normalizedName !== String(attributeName).trim().toLowerCase()) continue;
+
+    return normalizeAddressLine(contentMatch[1]);
+  }
+
+  return '';
+}
+
+function extractMetaContent(html = '', patterns = []) {
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) {
+      return normalizeAddressLine(match[1]);
+    }
+  }
+
+  return '';
+}
+
+function extractAddressFromMeta(html = '') {
+  const street =
+    extractMetaTagValue(html, 'og:street-address') ||
+    extractMetaTagValue(html, 'street-address') ||
+    extractMetaTagValue(html, 'streetAddress') ||
+    extractMetaTagValue(html, 'address.street') ||
+    extractMetaContent(html, [
+      /(?:streetAddress|street-address)"?\s*[:=]\s*"([^"]+)"/i,
+    ]) ||
+    '';
+
+  const city =
+    extractMetaTagValue(html, 'og:locality') ||
+    extractMetaTagValue(html, 'locality') ||
+    extractMetaTagValue(html, 'addressLocality') ||
+    extractMetaTagValue(html, 'city') ||
+    extractMetaContent(html, [
+      /(?:addressLocality|city)"?\s*[:=]\s*"([^"]+)"/i,
+    ]) ||
+    '';
+
+  const state =
+    extractMetaTagValue(html, 'og:region') ||
+    extractMetaTagValue(html, 'region') ||
+    extractMetaTagValue(html, 'addressRegion') ||
+    extractMetaTagValue(html, 'state') ||
+    extractMetaContent(html, [
+      /(?:addressRegion|state)"?\s*[:=]\s*"([A-Z]{2})"/i,
+    ]) ||
+    'IL';
+
+  const zip =
+    extractMetaTagValue(html, 'og:postal-code') ||
+    extractMetaTagValue(html, 'postal-code') ||
+    extractMetaTagValue(html, 'postalCode') ||
+    extractMetaTagValue(html, 'zip') ||
+    extractMetaContent(html, [/(?:postalCode|zip)"?\s*[:=]\s*"(\d{5})"/i]) ||
+    '';
+
+  const addressLabel = buildAddressLabel({ street, city, state, zip });
+
+  if (!addressLabel) return null;
+
+  return { street, city, state, zip, addressLabel };
+}
+
+function extractStreetAddressFromVisibleText(html = '', fallbackLocation = {}) {
+  const text = stripHtml(html);
+
+  const numberedStreetPattern =
+    /(\d{2,6}[A-Za-z0-9-]*\s+[A-Za-z0-9.'#\-\s]+(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Court|Ct|Circle|Cir|Boulevard|Blvd|Place|Pl|Way|Terrace|Ter|Parkway|Pkwy)\.?)/i;
+  const crossStreetPattern =
+    /((?:[A-Za-z0-9.'#\-]+\s+){0,4}(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Court|Ct|Circle|Cir|Boulevard|Blvd|Place|Pl|Way|Terrace|Ter|Parkway|Pkwy)\.?\s*(?:and|&)\s*(?:[A-Za-z0-9.'#\-]+\s+){0,4}(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Court|Ct|Circle|Cir|Boulevard|Blvd|Place|Pl|Way|Terrace|Ter|Parkway|Pkwy)\.?)/i;
+  const streetOnlyPattern =
+    /\b((?:[A-Za-z0-9.'#\-]+\s+){0,4}(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Court|Ct|Circle|Cir|Boulevard|Blvd|Place|Pl|Way|Terrace|Ter|Parkway|Pkwy))\b/i;
+
+  const match =
+    text.match(numberedStreetPattern) ||
+    text.match(crossStreetPattern) ||
+    text.match(streetOnlyPattern);
+
+  if (!match) return null;
+
+  const street = normalizeAddressLine(match[1]);
+  if (!isMeaningfulStreet(street)) return null;
+
+  const city = normalizeAddressLine(fallbackLocation.city || '');
+  const state = normalizeAddressLine(fallbackLocation.state || 'IL');
+  const zip = normalizeAddressLine(fallbackLocation.zip || '');
+  const addressLabel = buildAddressLabel({ street, city, state, zip });
+
+  if (!addressLabel) return null;
+
+  return { street, city, state, zip, addressLabel };
+}
+
+function monthNameToNumber(monthName = '') {
+  const key = String(monthName).trim().toLowerCase().slice(0, 3);
+  const months = {
+    jan: 1,
+    feb: 2,
+    mar: 3,
+    apr: 4,
+    may: 5,
+    jun: 6,
+    jul: 7,
+    aug: 8,
+    sep: 9,
+    oct: 10,
+    nov: 11,
+    dec: 12,
+  };
+
+  return months[key] || null;
+}
+
+function normalizeClockLabel(value = '') {
+  const match = String(value)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+
+  if (!match) {
+    return String(value)
+      .replace(/\s+/g, ' ')
+      .replace(/\b(am|pm)\b/gi, (part) => part.toLowerCase())
+      .trim();
+  }
+
+  const hours = String(Number(match[1] || '0'));
+  const minutes = String(match[2] || '00').padStart(2, '0');
+  const meridiem = String(match[3] || '').toLowerCase();
+
+  return `${hours}:${minutes}${meridiem}`;
+}
+
+function normalizeWeekdayLabel(value = '') {
+  const key = String(value).trim().toLowerCase().replace(/\./g, '');
+  const weekdays = {
+    mon: 'Monday',
+    monday: 'Monday',
+    tue: 'Tuesday',
+    tues: 'Tuesday',
+    tuesday: 'Tuesday',
+    wed: 'Wednesday',
+    wednesday: 'Wednesday',
+    thu: 'Thursday',
+    thur: 'Thursday',
+    thurs: 'Thursday',
+    thursday: 'Thursday',
+    fri: 'Friday',
+    friday: 'Friday',
+    sat: 'Saturday',
+    saturday: 'Saturday',
+    sun: 'Sunday',
+    sunday: 'Sunday',
+  };
+
+  return weekdays[key] || String(value).trim();
+}
+
+function stripLeadingWeekdayFromTime(value = '') {
+  return String(value)
+    .replace(
+      /^\s*(?:mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\s*[•,\-]*\s*/i,
+      '',
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function streetHasHouseNumber(street = '') {
+  return /^\d+[A-Za-z0-9-]*\s+/.test(String(street).trim());
+}
+
+function looksLikeCrossStreet(street = '') {
+  const text = String(street).trim();
+  if (!text) return false;
+
+  return /\b(?:and|&|\/| at | near | corner of )\b/i.test(text);
+}
+
+function isMeaningfulStreet(street = '') {
+  const text = String(street).trim();
+  if (!text) return false;
+
   return (
-    dateA.getFullYear() === dateB.getFullYear() &&
-    dateA.getMonth() === dateB.getMonth() &&
-    dateA.getDate() === dateB.getDate()
+    streetHasHouseNumber(text) ||
+    looksLikeCrossStreet(text) ||
+    /\b(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|court|ct|circle|cir|boulevard|blvd|place|pl|way|terrace|ter|parkway|pkwy)\b/i.test(
+      text,
+    )
   );
 }
 
-function buildSaleDedupKey(sale) {
-  const lat = Number(sale?.latitude);
-  const lon = Number(sale?.longitude);
-  const coordKey =
-    Number.isFinite(lat) && Number.isFinite(lon)
-      ? `${lat.toFixed(4)}|${lon.toFixed(4)}`
-      : 'no-coords';
+function isProbableSaleAddress(street = '') {
+  const text = String(street).trim();
+  if (!text) return false;
+  return !streetHasHouseNumber(text);
+}
 
-  const addressKey = String(
-    sale?.mapAddress ||
-      sale?.street ||
-      sale?.crossStreet ||
-      sale?.addressLabel ||
-      sale?.mapsQuery ||
-      sale?.hood ||
-      '',
-  )
-    .toLowerCase()
-    .replace(/\bnear\b/g, ' ')
+function shouldKeepSale(sale = {}) {
+  const street = String(sale.street || '').trim();
+  const city = String(sale.city || '').trim();
+  const addressLabel = String(sale.addressLabel || '').trim();
+
+  if (streetHasHouseNumber(street)) return true;
+  if (looksLikeCrossStreet(street)) return true;
+  if (street && city) return true;
+
+  const normalizedAddress = addressLabel.toLowerCase();
+  if (!street && (!city || ['il', 'illinois'].includes(normalizedAddress)))
+    return false;
+  if (!street && !addressLabel) return false;
+
+  return false;
+}
+
+function formatMonthDay(monthName = '', day = '') {
+  const month = String(monthName).trim().slice(0, 3);
+  const dayNumber = String(day).trim();
+  if (!month || !dayNumber) return '';
+  return `${month} ${dayNumber}`;
+}
+
+function buildIsoDateTime(year, month, day, timeLabel = '') {
+  const parsedYear = Number(year);
+  const parsedMonth = Number(month);
+  const parsedDay = Number(day);
+
+  if (!parsedYear || !parsedMonth || !parsedDay) return '';
+
+  const timeMatch = String(timeLabel)
+    .trim()
+    .match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+
+  if (!timeMatch) {
+    return `${parsedYear}-${String(parsedMonth).padStart(2, '0')}-${String(
+      parsedDay,
+    ).padStart(2, '0')}`;
+  }
+
+  let hours = Number(timeMatch[1]);
+  const minutes = Number(timeMatch[2] || '0');
+  const meridiem = String(timeMatch[3]).toLowerCase();
+
+  if (meridiem === 'pm' && hours < 12) hours += 12;
+  if (meridiem === 'am' && hours === 12) hours = 0;
+
+  return `${parsedYear}-${String(parsedMonth).padStart(2, '0')}-${String(
+    parsedDay,
+  ).padStart(2, '0')}T${String(hours).padStart(2, '0')}:${String(
+    minutes,
+  ).padStart(2, '0')}:00`;
+}
+
+function inferBestYearForSale(monthNumber, dayNumber) {
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth() + 1;
+
+  if (!monthNumber || !dayNumber) return currentYear;
+  if (monthNumber + 6 < currentMonth) return currentYear + 1;
+
+  return currentYear;
+}
+
+function extractDetailSchedule(html = '') {
+  const text = stripHtml(html)
     .replace(
-      /\b(?:sat|sun|fri|apr|may|today|tomorrow|rain|shine|or|and)\b/g,
+      /\bAddress Released\s*:\s*[A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\s+\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)/gi,
       ' ',
     )
-    .replace(/[^a-z0-9]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  return `${coordKey}|${addressKey}`;
-}
+  if (!text) return null;
 
-function chooseBetterDuplicateSale(currentSale, nextSale) {
-  const score = (sale) => {
-    let total = 0;
-    if (sale?.street) total += 5;
-    if (sale?.crossStreet) total += 2;
-    if (sale?.city) total += 2;
-    if (sale?.state) total += 1;
-    if (sale?.zip) total += 1;
-    if (sale?.hasExactCoordinates) total += 3;
-    if (sale?.geoSource === 'posting_page') total += 2;
-    total += Math.max(0, 120 - (Number(sale?.title || '').length || 0)) / 120;
-    return total;
-  };
+  const statusText = extractStatusText(text) || '';
+  const entryPattern =
+    /((?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?)\s*,?\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?\s+(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))\s*(?:-|to)\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))/gi;
 
-  return score(nextSale) > score(currentSale) ? nextSale : currentSale;
-}
+  const entries = [];
+  let match;
 
-function dedupeSales(sales) {
-  const seen = new Map();
+  while ((match = entryPattern.exec(text)) !== null) {
+    const dayLabel = normalizeWeekdayLabel(match[1] || '');
+    const monthName = String(match[2] || '').trim();
+    const dayOfMonth = String(match[3] || '').trim();
+    const explicitYear = Number(match[4] || '0') || null;
+    const startTime = normalizeClockLabel(match[5] || '');
+    const endTime = normalizeClockLabel(match[6] || '');
+    const monthNumber = monthNameToNumber(monthName);
+    const year =
+      explicitYear || inferBestYearForSale(monthNumber, Number(dayOfMonth));
 
-  for (const sale of sales) {
-    const key = buildSaleDedupKey(sale);
-    if (!seen.has(key)) {
-      seen.set(key, sale);
-      continue;
-    }
-    seen.set(key, chooseBetterDuplicateSale(seen.get(key), sale));
+    if (!monthNumber || !dayOfMonth || !startTime || !endTime) continue;
+
+    const dateLabel = formatMonthDay(monthName, dayOfMonth);
+    entries.push({
+      dayLabel,
+      dateLabel,
+      timeLabel: `${startTime} to ${endTime}`,
+      startTime,
+      endTime,
+      startDate: `${year}-${String(monthNumber).padStart(2, '0')}-${String(
+        dayOfMonth,
+      ).padStart(2, '0')}`,
+      startDateTime: buildIsoDateTime(year, monthNumber, dayOfMonth, startTime),
+      sortTimestamp: new Date(
+        buildIsoDateTime(year, monthNumber, dayOfMonth, startTime),
+      ).getTime(),
+    });
   }
 
-  return Array.from(seen.values());
-}
+  if (!entries.length) {
+    const compactMatch = text.match(
+      /\b(?:Dates|Days and Times)\b[:\s-]*([A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?)\s+(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))\s*(?:-|to)\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))/i,
+    );
 
-async function fetchCraigslistGarageSales({
-  area,
-  latitude,
-  longitude,
-  radiusMiles,
-  day,
-}) {
-  const baseUrl = `https://${area}.craigslist.org`;
-  const query = new URLSearchParams({
-    search_distance: String(radiusMiles || 25),
-    sort: 'date',
-  });
-
-  if (Number.isFinite(Number(latitude)) && Number.isFinite(Number(longitude))) {
-    query.set('lat', String(latitude));
-    query.set('lon', String(longitude));
-  }
-
-  const url = `${baseUrl}/search/gms?${query.toString()}`;
-
-  const response = await axios.get(url, {
-    timeout: 20000,
-    validateStatus: () => true,
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      Referer: baseUrl,
-      DNT: '1',
-      Connection: 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-    },
-  });
-
-  if (response.status >= 400) {
-    throw new Error(`Craigslist responded with status ${response.status}`);
-  }
-
-  const html = String(response.data || '');
-  if (!html || html.trim().startsWith('{')) {
-    throw new Error('Craigslist HTML was not returned.');
-  }
-
-  const $ = cheerio.load(html);
-  const rows = $(
-    '.cl-search-result, .result-row, li.cl-static-search-result',
-  ).toArray();
-  const today = new Date();
-  const tomorrow = new Date(today);
-  tomorrow.setDate(today.getDate() + 1);
-  const normalizedTargetDay =
-    day === 'today' || day === 'tomorrow' ? day : null;
-  const targetDate =
-    normalizedTargetDay === 'tomorrow'
-      ? tomorrow
-      : normalizedTargetDay === 'today'
-        ? today
-        : null;
-
-  const resolvedSales = await Promise.all(
-    rows.map(async (row, index) => {
-      const $row = $(row);
-      const title =
-        $row
-          .find('.result-title, .posting-title, .title')
-          .first()
-          .text()
-          .trim() ||
-        $row.find('a').first().text().trim() ||
-        `Garage Sale ${index + 1}`;
-
-      const postingUrl = parsePostingUrl(
-        $row
-          .find('.result-title, .posting-title, .title, a')
-          .first()
-          .attr('href'),
-        baseUrl,
+    if (compactMatch) {
+      const monthDayText = compactMatch[1];
+      const mdMatch = monthDayText.match(
+        /((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?/i,
       );
 
-      const hood = $row
-        .find('.meta .nearby, .result-hood, .location')
-        .first()
-        .text()
-        .trim();
-      const price = $row.find('.price').first().text().trim();
-      const metaText = $row
-        .find('.meta, .supertitle, .details')
-        .text()
-        .replace(/\s+/g, ' ')
-        .trim();
-      const dateText =
-        $row.find('time').first().attr('datetime') ||
-        $row.find('time').first().text().trim() ||
-        $row.find('.meta time').first().text().trim();
+      if (mdMatch) {
+        const monthName = mdMatch[1];
+        const dayOfMonth = mdMatch[2];
+        const explicitYear = Number(mdMatch[3] || '0') || null;
+        const monthNumber = monthNameToNumber(monthName);
+        const year =
+          explicitYear || inferBestYearForSale(monthNumber, Number(dayOfMonth));
+        const startTime = normalizeClockLabel(compactMatch[2] || '');
+        const endTime = normalizeClockLabel(compactMatch[3] || '');
 
-      const postingDate = dateText ? new Date(dateText) : null;
-      if (
-        targetDate &&
-        postingDate &&
-        !Number.isNaN(postingDate.getTime()) &&
-        !isSameCalendarDay(postingDate, targetDate)
-      ) {
-        return null;
-      }
-
-      const rowGeo = parseGeoFromRow($row);
-      const rowHasUsableGeo = isUsableCoordinatePair(
-        rowGeo.latitude,
-        rowGeo.longitude,
-      );
-      const pageDetails =
-        !rowHasUsableGeo || !hood
-          ? await fetchPostingPageDetails(postingUrl, baseUrl)
-          : { latitude: null, longitude: null, mapAddress: '' };
-      const pageHasUsableGeo = isUsableCoordinatePair(
-        pageDetails.latitude,
-        pageDetails.longitude,
-      );
-      const exactGeo = rowHasUsableGeo
-        ? rowGeo
-        : pageHasUsableGeo
-          ? {
-              latitude: pageDetails.latitude,
-              longitude: pageDetails.longitude,
-            }
-          : { latitude: null, longitude: null };
-      const resolvedAddressLabel = buildBestAddressLabel({
-        mapAddress: pageDetails.mapAddress,
-        title,
-        hood,
-      });
-      const geocodeCandidates = buildGeocodeCandidates({
-        mapAddress: pageDetails.mapAddress,
-        addressLabel: resolvedAddressLabel,
-        hood,
-        title,
-      });
-      const approximateGeo = !isUsableCoordinatePair(
-        exactGeo.latitude,
-        exactGeo.longitude,
-      )
-        ? await geocodeWithFallbacks(geocodeCandidates, area)
-        : { latitude: null, longitude: null, approximateAddress: '' };
-      const hasExactCoordinates = isUsableCoordinatePair(
-        exactGeo.latitude,
-        exactGeo.longitude,
-      );
-      const hasApproximateCoordinates = isUsableCoordinatePair(
-        approximateGeo.latitude,
-        approximateGeo.longitude,
-      );
-      const geo = hasExactCoordinates
-        ? exactGeo
-        : hasApproximateCoordinates
-          ? {
-              latitude: approximateGeo.latitude,
-              longitude: approximateGeo.longitude,
-            }
-          : { latitude: null, longitude: null };
-      const milesAway = distanceMiles(
-        latitude,
-        longitude,
-        geo.latitude,
-        geo.longitude,
-      );
-      const distanceLabel = hasExactCoordinates
-        ? milesAway !== null
-          ? `${milesAway} mi away`
-          : 'Use map for area'
-        : hasApproximateCoordinates
-          ? milesAway !== null
-            ? `Approx. ${milesAway} mi away`
-            : 'Approximate area'
-          : 'Use map for area';
-      const approximateAddressLabel = cleanAddressFragment(
-        approximateGeo.approximateAddress,
-      );
-      const hoodLabel = cleanAddressFragment(hood);
-      const finalAddress = buildFinalAddressData({
-        title,
-        hood,
-        mapAddress: pageDetails.mapAddress,
-        approximateAddress: approximateAddressLabel,
-        fallbackAddressLabel: resolvedAddressLabel || hoodLabel,
-      });
-
-      if (
-        !finalAddress.street &&
-        !finalAddress.crossStreet &&
-        /\bnear\b/i.test(finalAddress.addressLabel) &&
-        !/\bnear\b/i.test(hoodLabel)
-      ) {
-        const reparsed = splitNearAddress(finalAddress.addressLabel);
-        if (reparsed.street || reparsed.crossStreet) {
-          finalAddress.street = reparsed.street || finalAddress.street;
-          finalAddress.crossStreet =
-            reparsed.crossStreet || finalAddress.crossStreet;
+        if (monthNumber && dayOfMonth && startTime && endTime) {
+          entries.push({
+            dayLabel: '',
+            dateLabel: formatMonthDay(monthName, dayOfMonth),
+            timeLabel: `${startTime} to ${endTime}`,
+            startTime,
+            endTime,
+            startDate: `${year}-${String(monthNumber).padStart(2, '0')}-${String(
+              dayOfMonth,
+            ).padStart(2, '0')}`,
+            startDateTime: buildIsoDateTime(
+              year,
+              monthNumber,
+              dayOfMonth,
+              startTime,
+            ),
+            sortTimestamp: new Date(
+              buildIsoDateTime(year, monthNumber, dayOfMonth, startTime),
+            ).getTime(),
+          });
         }
       }
-      const saleType = detectCraigslistSaleType({ title, metaText, hood });
-      if (saleType === 'blocked') {
-        return null;
-      }
-      const saleLabel =
-        saleType === 'estate' ? 'Estate Sale' : 'Garage/Yard Sale';
-      const rawNotes =
-        [metaText, price].filter(Boolean).join(' • ') ||
-        `${saleLabel} listing from Craigslist`;
-      const notes =
-        !hasExactCoordinates && hasApproximateCoordinates
-          ? `${rawNotes} • Approximate location from listing area.`
-          : rawNotes;
+    }
+  }
 
-      return {
-        id: `garage-${area}-${index + 1}`,
-        saleType,
-        title,
-        subtitle: `${saleLabel} • ${distanceLabel}`,
-        latitude: geo.latitude,
-        longitude: geo.longitude,
-        lat: geo.latitude,
-        lon: geo.longitude,
-        address: finalAddress.addressLabel,
-        addressLabel: finalAddress.addressLabel,
-        mapAddress: finalAddress.mapAddress,
-        street: finalAddress.street,
-        crossStreet: finalAddress.crossStreet,
-        city: finalAddress.city,
-        state: finalAddress.state,
-        zip: finalAddress.zip,
-        country: finalAddress.country,
-        hood: hoodLabel,
-        hasExactCoordinates,
-        isApproximateLocation:
-          !hasExactCoordinates && hasApproximateCoordinates,
-        saleDate:
-          cleanAddressFragment(pageDetails.saleDate) ||
-          (dateText ? parseCraigslistDate(dateText, normalizedTargetDay) : ''),
-        saleDateTime: pageDetails.saleDateTime || '',
-        startTime: pageDetails.startTime || '',
-        endTime: pageDetails.endTime || '',
-        timeLabel: cleanAddressFragment(pageDetails.timeLabel) || '',
-        dayLabel:
-          cleanAddressFragment(pageDetails.dayLabel) ||
-          (normalizedTargetDay
-            ? normalizedTargetDay === 'tomorrow'
-              ? 'Tomorrow'
-              : 'Today'
-            : ''),
-        timingConfidence:
-          pageDetails.timingConfidence ||
-          (cleanAddressFragment(pageDetails.saleDate) ? 'high' : 'low'),
-        isProbableSale:
-          !cleanAddressFragment(pageDetails.saleDate) &&
-          !cleanAddressFragment(pageDetails.dayLabel) &&
-          !cleanAddressFragment(pageDetails.timeLabel),
-        notes,
-        query: `${title} ${finalAddress.addressLabel}`.trim(),
-        mapsQuery: finalAddress.mapsQuery,
-        pinColor: saleType === 'estate' ? '#7c3aed' : '#2563eb',
-        craigslistUrl: postingUrl,
-        geoSource: hasExactCoordinates
-          ? rowHasUsableGeo
-            ? 'search_row'
-            : pageHasUsableGeo
-              ? 'posting_page'
-              : 'unknown'
-          : hasApproximateCoordinates
-            ? 'geocoder'
-            : 'none',
-        geocodeQuery:
-          !hasExactCoordinates && hasApproximateCoordinates
-            ? buildApproximateGeocodeQuery(
-                geocodeCandidates[0] || finalAddress.addressLabel,
-                area,
-              )
-            : '',
-        distanceMiles: milesAway,
-        distanceLabel,
-      };
+  if (!entries.length) {
+    return statusText ? { statusText } : null;
+  }
+
+  entries.sort((a, b) => {
+    const aTime = Number.isFinite(a.sortTimestamp)
+      ? a.sortTimestamp
+      : Number.MAX_SAFE_INTEGER;
+    const bTime = Number.isFinite(b.sortTimestamp)
+      ? b.sortTimestamp
+      : Number.MAX_SAFE_INTEGER;
+    return aTime - bTime;
+  });
+
+  const primary = entries[0];
+  const dateText = entries
+    .map((entry) =>
+      [entry.dayLabel, entry.dateLabel, entry.timeLabel]
+        .filter(Boolean)
+        .join(' • '),
+    )
+    .filter(Boolean)
+    .slice(0, 2)
+    .join(' | ');
+
+  return {
+    statusText,
+    dayLabel: primary.dayLabel || '',
+    dateLabel: primary.dateLabel || '',
+    timeLabel: stripLeadingWeekdayFromTime(primary.timeLabel || ''),
+    startTime: primary.startTime || '',
+    endTime: primary.endTime || '',
+    startDate: primary.startDate || '',
+    startDateTime: primary.startDateTime || '',
+    dateText: dateText || primary.dateLabel || '',
+    scheduleEntries: entries,
+  };
+}
+
+function mergeDetailIntoSale(sale, detail = {}) {
+  const mergedZip = detail.zip || sale.zip || sale.requestedZip || '';
+  const mergedCity = detail.city || sale.city || '';
+  const mergedState = detail.state || sale.state || 'IL';
+
+  let latitude = sale.latitude ?? null;
+  let longitude = sale.longitude ?? null;
+  let coordinateSource = sale.coordinateSource || 'missing';
+  let probableLocation = sale.probableLocation ?? true;
+
+  if (Number.isFinite(detail.latitude) && Number.isFinite(detail.longitude)) {
+    latitude = detail.latitude;
+    longitude = detail.longitude;
+    coordinateSource = detail.coordinateSource || 'detail-page';
+    probableLocation = false;
+  }
+
+  const street = detail.street || sale.street || '';
+  const addressLabel =
+    detail.addressLabel ||
+    buildAddressLabel({
+      street,
+      city: mergedCity,
+      state: mergedState,
+      zip: mergedZip,
+    }) ||
+    sale.addressLabel;
+  const probableSale = isProbableSaleAddress(street);
+  const hasExactCoordinates =
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
+    coordinateSource === 'detail-page' &&
+    probableSale === false;
+  const isApproximateLocation =
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
+    !hasExactCoordinates;
+  const mapAddress =
+    addressLabel ||
+    buildAddressLabel({
+      street,
+      city: mergedCity,
+      state: mergedState,
+      zip: mergedZip,
+    });
+
+  return {
+    ...sale,
+    city: mergedCity,
+    state: mergedState,
+    zip: mergedZip,
+    latitude,
+    longitude,
+    coordinateSource,
+    probableLocation: probableLocation || probableSale,
+    street,
+    addressLabel,
+    mapAddress,
+    mapsQuery: mapAddress,
+    probableSale,
+    isProbableSale: probableSale,
+    hasExactCoordinates,
+    isApproximateLocation,
+    statusText: detail.statusText || sale.statusText || '',
+    dateText: detail.dateText || sale.dateText || '',
+    dayLabel: detail.dayLabel || sale.dayLabel || '',
+    dateLabel: detail.dateLabel || sale.dateLabel || '',
+    timeLabel: stripLeadingWeekdayFromTime(
+      detail.timeLabel || sale.timeLabel || '',
+    ),
+    startTime: detail.startTime || sale.startTime || '',
+    endTime: detail.endTime || sale.endTime || '',
+    startDate: detail.startDate || sale.startDate || '',
+    startDateTime: detail.startDateTime || sale.startDateTime || '',
+    scheduleEntries: Array.isArray(detail.scheduleEntries)
+      ? detail.scheduleEntries
+      : Array.isArray(sale.scheduleEntries)
+        ? sale.scheduleEntries
+        : [],
+  };
+}
+
+async function fetchDetailEnhancements(url, fallbackLocation = {}) {
+  if (!url) return {};
+  if (detailPageCache.has(url)) return detailPageCache.get(url);
+
+  try {
+    const response = await axios.get(url, {
+      timeout: REQUEST_TIMEOUT_MS,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15',
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Referer: 'https://www.google.com/',
+        Connection: 'keep-alive',
+      },
+    });
+
+    const html = typeof response.data === 'string' ? response.data : '';
+
+    const coords = extractCoordinatesFromHtml(html);
+    const address =
+      extractAddressFromJsonLd(html) ||
+      extractAddressFromMeta(html) ||
+      extractAddressFromInlineJson(html, fallbackLocation) ||
+      extractStreetAddressFromVisibleText(html, fallbackLocation) ||
+      {};
+    const schedule =
+      extractScheduleFromJsonLd(html) || extractDetailSchedule(html) || {};
+
+    const detail = {
+      street: address.street || '',
+      city: address.city || fallbackLocation.city || '',
+      state: address.state || fallbackLocation.state || 'IL',
+      zip: address.zip || fallbackLocation.zip || '',
+      addressLabel:
+        address.addressLabel ||
+        buildAddressLabel({
+          street: address.street || '',
+          city: address.city || fallbackLocation.city || '',
+          state: address.state || fallbackLocation.state || 'IL',
+          zip: address.zip || fallbackLocation.zip || '',
+        }),
+      latitude: coords?.latitude,
+      longitude: coords?.longitude,
+      coordinateSource: coords ? 'detail-page' : undefined,
+      mapAddress:
+        address.addressLabel ||
+        buildAddressLabel({
+          street: address.street || '',
+          city: address.city || fallbackLocation.city || '',
+          state: address.state || fallbackLocation.state || 'IL',
+          zip: address.zip || fallbackLocation.zip || '',
+        }),
+      mapsQuery:
+        address.addressLabel ||
+        buildAddressLabel({
+          street: address.street || '',
+          city: address.city || fallbackLocation.city || '',
+          state: address.state || fallbackLocation.state || 'IL',
+          zip: address.zip || fallbackLocation.zip || '',
+        }),
+      statusText: schedule.statusText || '',
+      dateText: schedule.dateText || '',
+      dayLabel: schedule.dayLabel || '',
+      dateLabel: schedule.dateLabel || '',
+      timeLabel: schedule.timeLabel || '',
+      startTime: schedule.startTime || '',
+      endTime: schedule.endTime || '',
+      startDate: schedule.startDate || '',
+      startDateTime: schedule.startDateTime || '',
+      scheduleEntries: Array.isArray(schedule.scheduleEntries)
+        ? schedule.scheduleEntries
+        : [],
+    };
+
+    detailPageCache.set(url, detail);
+    return detail;
+  } catch (error) {
+    console.error(`EstateSales detail fetch failed for ${url}:`, error.message);
+    const detail = {};
+    detailPageCache.set(url, detail);
+    return detail;
+  }
+}
+
+function parseEstateSalesFromHtml(html, requestedZip) {
+  const results = [];
+  const seenUrls = new Set();
+
+  const linkMatches = [...html.matchAll(/href="(\/IL\/[^"]+\/\d+)"/gi)];
+
+  for (const match of linkMatches) {
+    const href = match[1];
+    if (!href) continue;
+
+    const absoluteUrl = `https://www.estatesales.net${decodeUrlPath(href)}`;
+
+    if (seenUrls.has(absoluteUrl)) continue;
+    seenUrls.add(absoluteUrl);
+
+    const index = html.indexOf(href);
+    if (index === -1) continue;
+
+    const snippet = html.slice(Math.max(0, index - 1200), index + 1200);
+
+    if (!isCurrentOrUpcoming(snippet)) continue;
+
+    const location = extractLocationFromUrl(absoluteUrl);
+    const title = extractTitle(snippet, absoluteUrl);
+    const statusText = extractStatusText(snippet);
+    const dateText = extractDateText(snippet);
+    const company = extractCompany(snippet);
+    const imageCount = extractImageCount(snippet);
+    const distanceMiles = extractDistanceMiles(snippet);
+    const saleType = inferSaleType(title, snippet);
+
+    const fallbackCoordinates = buildZipFallbackCoordinates(
+      location.zip || requestedZip || '',
+      absoluteUrl,
+    );
+
+    results.push({
+      id: makeStableId(absoluteUrl),
+      sourceListingId: location.sourceListingId || '',
+      title,
+      saleType,
+      source: 'estatesales-net',
+      sourceLabel: 'EstateSales.net',
+      url: absoluteUrl,
+      externalUrl: absoluteUrl,
+      city: location.city || '',
+      state: location.state || 'IL',
+      zip: location.zip || requestedZip || '',
+      requestedZip,
+      statusText,
+      dateText,
+      company,
+      imageCount,
+      distanceMiles,
+      latitude: fallbackCoordinates?.latitude ?? null,
+      longitude: fallbackCoordinates?.longitude ?? null,
+      coordinateSource: fallbackCoordinates?.coordinateSource || 'missing',
+      probableLocation: fallbackCoordinates?.probableLocation ?? true,
+      probableSale: true,
+      isProbableSale: true,
+      hasExactCoordinates: false,
+      isApproximateLocation: Boolean(fallbackCoordinates),
+      street: '',
+      mapAddress: [
+        location.city,
+        location.state || 'IL',
+        location.zip || requestedZip || '',
+      ]
+        .filter(Boolean)
+        .join(', '),
+      mapsQuery: [
+        location.city,
+        location.state || 'IL',
+        location.zip || requestedZip || '',
+      ]
+        .filter(Boolean)
+        .join(', '),
+      addressLabel: [
+        location.city,
+        location.state || 'IL',
+        location.zip || requestedZip || '',
+      ]
+        .filter(Boolean)
+        .join(', '),
+      confidence: statusText || dateText ? 'high' : 'medium',
+      dayLabel: '',
+      dateLabel: '',
+      timeLabel: '',
+      startTime: '',
+      endTime: '',
+      startDate: '',
+      startDateTime: '',
+      scheduleEntries: [],
+      rawSnippet: stripHtml(snippet).slice(0, 400),
+    });
+  }
+
+  return results;
+}
+
+async async function fetchEstateSalesForZip(zip, radiusMiles = 50) {
+  const safeZip = encodeURIComponent(String(zip || '60565').trim());
+  const safeRadius = encodeURIComponent(String(radiusMiles || 50));
+
+  // Single origin/radius search. This replaces the old:
+  // https://www.estatesales.net/IL/Naperville/{zip}
+  // called once for dozens of ZIPs.
+  const urlsToTry = [
+    `https://www.estatesales.net/sales/advancedSearch?zip=${safeZip}&radius=${safeRadius}`,
+    `https://www.estatesales.net/IL/${safeZip}?radius=${safeRadius}`,
+  ];
+
+  let lastError = null;
+
+  for (const url of urlsToTry) {
+    try {
+      const response = await axios.get(url, {
+        timeout: REQUEST_TIMEOUT_MS,
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15',
+          Accept:
+            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Referer: 'https://www.google.com/',
+          Connection: 'keep-alive',
+        },
+      });
+
+      const html = typeof response.data === 'string' ? response.data : '';
+      const parsed = parseEstateSalesFromHtml(html, zip);
+
+      console.log(
+        `[estate-sales-route] ${ESTATE_ROUTE_VERSION} userZip=${zip} radius=${safeRadius} parsed=${parsed.length} url=${url}`,
+      );
+
+      if (parsed.length || url === urlsToTry[urlsToTry.length - 1]) {
+        return parsed;
+      }
+    } catch (error) {
+      lastError = error;
+      console.warn(
+        `[estate-sales-route] ${ESTATE_ROUTE_VERSION} fetch failed userZip=${zip} radius=${safeRadius}: ${error.message}`,
+      );
+    }
+  }
+
+  if (lastError) throw lastError;
+  return [];
+}
+
+async function enrichSalesWithDetailPages(sales = []) {
+  const limit = Math.min(sales.length, MAX_DETAIL_FETCHES);
+  const salesToEnrich = sales.slice(0, limit);
+  const remainingSales = sales.slice(limit);
+
+  const enrichedSales = await mapWithConcurrency(
+    salesToEnrich,
+    DETAIL_FETCH_CONCURRENCY,
+    async (sale) => {
+      const detail = await fetchDetailEnhancements(sale.url, {
+        city: sale.city,
+        state: sale.state,
+        zip: sale.zip || sale.requestedZip,
+      });
+
+      return mergeDetailIntoSale(sale, detail);
+    },
+  );
+
+  return [...enrichedSales, ...remainingSales];
+}
+
+function dedupeSales(sales = []) {
+  const map = new Map();
+
+  for (const sale of sales) {
+    const key =
+      sale.url || `${sale.title}-${sale.city}-${sale.zip}-${sale.dateText}`;
+
+    if (!map.has(key)) {
+      map.set(key, sale);
+      continue;
+    }
+
+    const existing = map.get(key);
+
+    const existingScore =
+      (existing.imageCount || 0) +
+      (existing.statusText ? 10 : 0) +
+      (existing.dateText ? 5 : 0) +
+      (existing.street ? 25 : 0) +
+      (existing.coordinateSource === 'detail-page' ? 20 : 0);
+
+    const incomingScore =
+      (sale.imageCount || 0) +
+      (sale.statusText ? 10 : 0) +
+      (sale.dateText ? 5 : 0) +
+      (sale.street ? 25 : 0) +
+      (sale.coordinateSource === 'detail-page' ? 20 : 0);
+
+    if (incomingScore > existingScore) {
+      map.set(key, sale);
+    }
+  }
+
+  return [...map.values()];
+}
+
+function sortSales(sales = []) {
+  const statusRank = (status = '') => {
+    const text = (status || '').toLowerCase();
+
+    if (text.includes('going on now')) return 0;
+    if (text.includes('starts today')) return 1;
+    if (text.includes('today')) return 2;
+    if (text.includes('starts tomorrow')) return 3;
+    if (text.includes('tomorrow')) return 4;
+    if (text.includes('starts in')) return 5;
+    if (/\b\d+\s+days?\s+away\b/.test(text)) return 6;
+
+    return 9;
+  };
+
+  return [...sales].sort((a, b) => {
+    const rankDiff = statusRank(a.statusText) - statusRank(b.statusText);
+    if (rankDiff !== 0) return rankDiff;
+
+    const addressScoreA = a.street ? 1 : 0;
+    const addressScoreB = b.street ? 1 : 0;
+    if (addressScoreA !== addressScoreB) return addressScoreB - addressScoreA;
+
+    const imageDiff = (b.imageCount || 0) - (a.imageCount || 0);
+    if (imageDiff !== 0) return imageDiff;
+
+    const distanceA =
+      a.distanceMiles == null ? Number.MAX_SAFE_INTEGER : a.distanceMiles;
+    const distanceB =
+      b.distanceMiles == null ? Number.MAX_SAFE_INTEGER : b.distanceMiles;
+
+    if (distanceA !== distanceB) return distanceA - distanceB;
+
+    return (a.title || '').localeCompare(b.title || '');
+  });
+}
+
+function normalizeRequestedRadiusMiles(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed <= 0) return null;
+  return parsed;
+}
+
+function calculateDistanceMiles(lat1, lon1, lat2, lon2) {
+  const values = [lat1, lon1, lat2, lon2].map(Number);
+  if (values.some((value) => !Number.isFinite(value))) return null;
+
+  const [aLat, aLon, bLat, bLon] = values;
+  const toRadians = (value) => (value * Math.PI) / 180;
+  const earthRadiusMiles = 3958.8;
+
+  const dLat = toRadians(bLat - aLat);
+  const dLon = toRadians(bLon - aLon);
+  const startLat = toRadians(aLat);
+  const endLat = toRadians(bLat);
+
+  const haversine =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(startLat) * Math.cos(endLat) * Math.sin(dLon / 2) ** 2;
+
+  const arc = 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+  return Number((earthRadiusMiles * arc).toFixed(2));
+}
+
+function getSearchZipsForRequest(
+  _requestedRadiusMiles = null,
+  requestedOrigin = {},
+) {
+  const requestedZip = String(
+    requestedOrigin?.zip ||
+      requestedOrigin?.postalCode ||
+      requestedOrigin?.postal ||
+      requestedOrigin?.requestedZip ||
+      '',
+  )
+    .trim()
+    .replace(/[^0-9]/g, '');
+
+  // Source Assist should search from the user's location only.
+  // No surrounding ZIP expansion. No 74-ZIP sweep.
+  return requestedZip ? [requestedZip] : ['60565'];
+}
+
+function getClosestZipCenterDistanceMiles(_sale = {}) {
+  // Disabled with the ZIP sweep. We no longer infer distance from a large
+  // table of ZIP centers because it caused broad searching and muddy filtering.
+  return null;
+}
+
+function getEffectiveDistanceMiles(sale = {}, requestedOrigin = {}) {
+  const originLatitude = Number(requestedOrigin?.latitude);
+  const originLongitude = Number(requestedOrigin?.longitude);
+  const saleLatitude = Number(sale.latitude);
+  const saleLongitude = Number(sale.longitude);
+
+  if (
+    Number.isFinite(originLatitude) &&
+    Number.isFinite(originLongitude) &&
+    Number.isFinite(saleLatitude) &&
+    Number.isFinite(saleLongitude)
+  ) {
+    const directDistance = calculateDistanceMiles(
+      originLatitude,
+      originLongitude,
+      saleLatitude,
+      saleLongitude,
+    );
+
+    if (Number.isFinite(directDistance)) {
+      return directDistance;
+    }
+  }
+
+  const explicitDistance = Number(sale.distanceMiles);
+  if (Number.isFinite(explicitDistance) && explicitDistance >= 0) {
+    return explicitDistance;
+  }
+
+  return getClosestZipCenterDistanceMiles(sale);
+}
+
+function filterSalesByRadius(
+  sales = [],
+  requestedRadiusMiles = null,
+  requestedOrigin = {},
+) {
+  const normalizedSales = sales.map((sale) => {
+    const effectiveDistance = getEffectiveDistanceMiles(sale, requestedOrigin);
+    return Number.isFinite(effectiveDistance)
+      ? { ...sale, distanceMiles: effectiveDistance }
+      : { ...sale };
+  });
+
+  if (!Number.isFinite(requestedRadiusMiles) || requestedRadiusMiles <= 0) {
+    return normalizedSales;
+  }
+
+  return normalizedSales.filter((sale) => {
+    const effectiveDistance = Number(sale.distanceMiles);
+    return (
+      Number.isFinite(effectiveDistance) &&
+      effectiveDistance <= requestedRadiusMiles
+    );
+  });
+}
+
+function normalizeRequestedDay(value = '') {
+  const normalized = String(value).trim().toLowerCase().replace(/\./g, '');
+
+  if (normalized === 'today') return 'today';
+  if (normalized === 'tomorrow') return 'tomorrow';
+  if (
+    [
+      'nexttwoweeks',
+      'next-2-weeks',
+      'next2weeks',
+      'two-weeks',
+      '2weeks',
+    ].includes(normalized)
+  ) {
+    return 'unsupported';
+  }
+
+  return normalized;
+}
+
+function getWeekdayFromDateLikeValue(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return '';
+
+  return normalizeRequestedDay(
+    parsed.toLocaleDateString('en-US', { weekday: 'long' }),
+  );
+}
+
+function getRequestedDateWindow(requestedDay = '') {
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  if (normalizedRequestedDay === 'today') {
+    const end = new Date(today);
+    end.setHours(23, 59, 59, 999);
+    return { start: today, end };
+  }
+
+  if (normalizedRequestedDay === 'tomorrow') {
+    const start = new Date(today);
+    start.setDate(start.getDate() + 1);
+    const end = new Date(start);
+    end.setHours(23, 59, 59, 999);
+    return { start, end };
+  }
+
+  return null;
+}
+
+function getComparableSaleDateValue(sale = {}) {
+  const candidates = [
+    sale.startDateTime,
+    sale.startDate,
+    sale.saleDateTime,
+    sale.saleDate,
+    sale.date,
+    sale.dateLabel,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = new Date(String(candidate || '').trim());
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed;
+    }
+  }
+
+  if (Array.isArray(sale.scheduleEntries)) {
+    for (const entry of sale.scheduleEntries) {
+      const parsed = getComparableSaleDateValue(entry || {});
+      if (parsed) return parsed;
+    }
+  }
+
+  return null;
+}
+
+function getSaleDatesForComparison(sale = {}) {
+  const results = [];
+  const seen = new Set();
+
+  const pushDate = (value) => {
+    const parsed = new Date(String(value || '').trim());
+    if (Number.isNaN(parsed.getTime())) return;
+    const key = parsed.toISOString();
+    if (seen.has(key)) return;
+    seen.add(key);
+    results.push(parsed);
+  };
+
+  pushDate(sale.startDateTime);
+  pushDate(sale.startDate);
+  pushDate(sale.saleDateTime);
+  pushDate(sale.saleDate);
+  pushDate(sale.date);
+  pushDate(sale.dateLabel);
+
+  if (Array.isArray(sale.scheduleEntries)) {
+    for (const entry of sale.scheduleEntries) {
+      pushDate(entry?.startDateTime);
+      pushDate(entry?.startDate);
+      pushDate(entry?.saleDateTime);
+      pushDate(entry?.saleDate);
+      pushDate(entry?.date);
+      pushDate(entry?.dateLabel);
+    }
+  }
+
+  return results;
+}
+
+function saleHasDayConfirmationData(sale = {}) {
+  if (normalizeRequestedDay(sale.dayLabel || '')) return true;
+  if (getWeekdayFromDateLikeValue(sale.startDateTime || sale.startDate || '')) {
+    return true;
+  }
+
+  if (Array.isArray(sale.scheduleEntries)) {
+    return sale.scheduleEntries.some((entry) => {
+      return Boolean(
+        normalizeRequestedDay(entry?.dayLabel || '') ||
+        getWeekdayFromDateLikeValue(
+          entry?.startDateTime || entry?.startDate || '',
+        ),
+      );
+    });
+  }
+
+  return false;
+}
+
+function saleMatchesRequestedDay(sale = {}, requestedDay = '') {
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  if (!normalizedRequestedDay) return true;
+
+  const requestedWindow = getRequestedDateWindow(normalizedRequestedDay);
+  if (requestedWindow) {
+    const entryDates =
+      Array.isArray(sale.scheduleEntries) && sale.scheduleEntries.length
+        ? sale.scheduleEntries.flatMap((entry) =>
+            getSaleDatesForComparison(entry || {}),
+          )
+        : [];
+
+    const comparableDates = entryDates.length
+      ? entryDates
+      : getSaleDatesForComparison(sale);
+
+    if (!comparableDates.length) return false;
+
+    return comparableDates.some((comparableDate) => {
+      return (
+        comparableDate.getTime() >= requestedWindow.start.getTime() &&
+        comparableDate.getTime() <= requestedWindow.end.getTime()
+      );
+    });
+  }
+
+  const candidates = [];
+
+  if (sale.dayLabel) {
+    candidates.push(String(sale.dayLabel));
+  }
+
+  const saleWeekdayFromDate = getWeekdayFromDateLikeValue(
+    sale.startDateTime || sale.startDate || '',
+  );
+  if (saleWeekdayFromDate) {
+    candidates.push(saleWeekdayFromDate);
+  }
+
+  if (Array.isArray(sale.scheduleEntries)) {
+    for (const entry of sale.scheduleEntries) {
+      if (entry?.dayLabel) {
+        candidates.push(String(entry.dayLabel));
+      }
+
+      const entryWeekdayFromDate = getWeekdayFromDateLikeValue(
+        entry?.startDateTime || entry?.startDate || '',
+      );
+      if (entryWeekdayFromDate) {
+        candidates.push(entryWeekdayFromDate);
+      }
+    }
+  }
+
+  return candidates.some((candidate) => {
+    const normalizedCandidate = normalizeRequestedDay(candidate);
+    return (
+      normalizedCandidate === normalizedRequestedDay ||
+      normalizedCandidate.startsWith(normalizedRequestedDay)
+    );
+  });
+}
+
+function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  if (!normalizedRequestedDay) return sale;
+
+  const entries = Array.isArray(sale.scheduleEntries)
+    ? sale.scheduleEntries
+    : [];
+  const requestedWindow = getRequestedDateWindow(normalizedRequestedDay);
+
+  const matchingEntries = entries.filter((entry) => {
+    if (requestedWindow) {
+      const entryDates = getSaleDatesForComparison(entry || {});
+      return entryDates.some((entryDate) => {
+        return (
+          entryDate.getTime() >= requestedWindow.start.getTime() &&
+          entryDate.getTime() <= requestedWindow.end.getTime()
+        );
+      });
+    }
+
+    const normalizedEntryDay = normalizeRequestedDay(entry?.dayLabel || '');
+    const normalizedEntryDateDay = getWeekdayFromDateLikeValue(
+      entry?.startDateTime || entry?.startDate || '',
+    );
+    return (
+      normalizedEntryDay === normalizedRequestedDay ||
+      normalizedEntryDay.startsWith(normalizedRequestedDay) ||
+      normalizedEntryDateDay === normalizedRequestedDay ||
+      normalizedEntryDateDay.startsWith(normalizedRequestedDay)
+    );
+  });
+
+  const matchedEntry = matchingEntries.slice().sort((a, b) => {
+    const aDate =
+      getComparableSaleDateValue(a) || new Date('9999-12-31T00:00:00');
+    const bDate =
+      getComparableSaleDateValue(b) || new Date('9999-12-31T00:00:00');
+    return aDate.getTime() - bDate.getTime();
+  })[0];
+
+  if (!matchedEntry) {
+    return sale;
+  }
+
+  return {
+    ...sale,
+    dayLabel: matchedEntry.dayLabel || sale.dayLabel || '',
+    dateLabel: matchedEntry.dateLabel || sale.dateLabel || '',
+    timeLabel: stripLeadingWeekdayFromTime(
+      matchedEntry.timeLabel || sale.timeLabel || '',
+    ),
+    startTime: matchedEntry.startTime || sale.startTime || '',
+    endTime: matchedEntry.endTime || sale.endTime || '',
+    startDate: matchedEntry.startDate || sale.startDate || '',
+    startDateTime: matchedEntry.startDateTime || sale.startDateTime || '',
+  };
+}
+
+function formatSaleForSourceAssist(sale = {}) {
+  const scheduleEntries = Array.isArray(sale.scheduleEntries)
+    ? sale.scheduleEntries
+    : [];
+
+  const saleDateKeys = Array.from(
+    new Set(
+      [
+        sale.startDate,
+        sale.saleDate,
+        sale.date,
+        ...scheduleEntries.map((entry) => entry?.startDate),
+      ]
+        .map((value) => String(value || '').trim().slice(0, 10))
+        .filter((value) => /^20\d{2}-\d{2}-\d{2}$/.test(value)),
+    ),
+  );
+
+  const saleDateLabels = Array.from(
+    new Set(
+      [
+        sale.dateText,
+        sale.dateLabel,
+        ...scheduleEntries.map((entry) =>
+          [entry?.dayLabel, entry?.dateLabel, entry?.timeLabel]
+            .filter(Boolean)
+            .join(' • '),
+        ),
+      ]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    ),
+  );
+
+  const website = sale.externalUrl || sale.url || sale.website || '';
+  const saleDate = saleDateKeys[0] || sale.startDate || sale.saleDate || '';
+  const saleDateTime =
+    sale.startDateTime ||
+    sale.saleDateTime ||
+    scheduleEntries.find((entry) => entry?.startDateTime)?.startDateTime ||
+    saleDate;
+
+  return {
+    ...sale,
+    saleType: 'estate',
+    type: 'estate',
+    source: sale.source || 'estatesales-net',
+    sourceLabel: sale.sourceLabel || 'EstateSales.net',
+    website,
+    craigslistUrl: website,
+    saleDate,
+    saleDateTime,
+    saleDateKeys,
+    saleDateLabels,
+    openingHours: sale.timeLabel || sale.openingHours || '',
+    address:
+      sale.addressLabel ||
+      sale.mapAddress ||
+      [sale.street, sale.city, sale.state, sale.zip].filter(Boolean).join(', '),
+    addressLabel:
+      sale.addressLabel ||
+      sale.mapAddress ||
+      [sale.street, sale.city, sale.state, sale.zip].filter(Boolean).join(', '),
+    displayAddress:
+      sale.addressLabel ||
+      sale.mapAddress ||
+      [sale.street, sale.city, sale.state, sale.zip].filter(Boolean).join(', '),
+    descriptionPreview:
+      sale.descriptionPreview ||
+      sale.rawSnippet ||
+      [sale.statusText, sale.dateText, sale.company].filter(Boolean).join(' • '),
+  };
+}
+
+
+async function fetchAllEstateSales(
+  requestedDay = '',
+  requestedRadiusMiles = null,
+  requestedOrigin = {},
+) {
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+
+  if (normalizedRequestedDay === 'unsupported') {
+    return [];
+  }
+  const searchZips = getSearchZipsForRequest(
+    requestedRadiusMiles,
+    requestedOrigin,
+  );
+  const cachedDayFiltered = getCachedEstateSalesPool(requestedDay, searchZips);
+  let dayFiltered = null;
+  let cacheHit = false;
+
+  if (cachedDayFiltered) {
+    dayFiltered = cachedDayFiltered;
+    cacheHit = true;
+  } else {
+    const zipResultSets = await mapWithConcurrency(
+      searchZips,
+      ZIP_FETCH_CONCURRENCY,
+      async (zip) => {
+        try {
+          const zipResults = await fetchEstateSalesForZip(zip, requestedRadiusMiles);
+          console.log(`EstateSales.net ${zip}: ${zipResults.length} listings`);
+          return zipResults;
+        } catch (error) {
+          console.error(
+            `EstateSales.net fetch failed for ${zip}:`,
+            error.message,
+          );
+          return [];
+        }
+      },
+    );
+
+    const allResults = zipResultSets.flat();
+    const deduped = dedupeSales(allResults);
+    const preliminaryRadiusFiltered = filterSalesByRadius(
+      deduped,
+      requestedRadiusMiles,
+      requestedOrigin,
+    );
+    const prioritizedSales = sortSales(
+      preliminaryRadiusFiltered.length ? preliminaryRadiusFiltered : deduped,
+    );
+
+    const enrichmentTargetCount = Math.max(
+      MAX_DETAIL_FETCHES,
+      DETAIL_ENRICH_TARGET_COUNT,
+    );
+    const enriched = await enrichSalesWithDetailPages(
+      prioritizedSales.slice(0, enrichmentTargetCount),
+    );
+    const combinedSales = dedupeSales([
+      ...enriched,
+      ...prioritizedSales.slice(enrichmentTargetCount),
+    ]);
+    const addressFiltered = combinedSales.filter((sale) =>
+      shouldKeepSale(sale),
+    );
+
+    if (normalizedRequestedDay) {
+      const initiallyMatched = addressFiltered
+        .map((sale) => projectSaleToRequestedDay(sale, requestedDay))
+        .filter((sale) => saleMatchesRequestedDay(sale, requestedDay));
+
+      const unresolvedForRequestedDay = addressFiltered.filter((sale) => {
+        return !saleMatchesRequestedDay(sale, requestedDay);
+      });
+
+      const confirmationCandidates = sortSales(
+        filterSalesByRadius(
+          unresolvedForRequestedDay,
+          requestedRadiusMiles,
+          requestedOrigin,
+        ),
+      );
+
+      const confirmationFetchLimit = MAX_DETAIL_FETCHES;
+
+      const confirmedDaySales = confirmationCandidates.length
+        ? await enrichSalesWithDetailPages(
+            confirmationCandidates.slice(0, confirmationFetchLimit),
+          )
+        : [];
+
+      const confirmedMatches = confirmedDaySales
+        .map((sale) => projectSaleToRequestedDay(sale, requestedDay))
+        .filter((sale) => saleMatchesRequestedDay(sale, requestedDay));
+
+      const strictDayMatches = dedupeSales([
+        ...initiallyMatched,
+        ...confirmedMatches,
+      ]);
+
+      // Source Assist needs visible estate-sale results first. EstateSales.net
+      // often lists multi-day sales in formats that do not survive a strict
+      // today/tomorrow comparison on the backend. If the strict day match comes
+      // back empty, fall back to all current/upcoming sales inside the radius and
+      // let the app/card display the best available schedule details.
+      dayFiltered = strictDayMatches.length
+        ? strictDayMatches
+        : addressFiltered.map((sale) => projectSaleToRequestedDay(sale, requestedDay));
+    } else {
+      dayFiltered = addressFiltered;
+    }
+
+    setCachedEstateSalesPool(requestedDay, searchZips, dayFiltered);
+
+    console.log(
+      '[estate-sales-route] counts',
+      JSON.stringify({
+        raw: allResults.length,
+        deduped: deduped.length,
+        preliminaryRadiusFiltered: preliminaryRadiusFiltered.length,
+        enriched: enriched.length,
+        addressFiltered: addressFiltered.length,
+        dayFiltered: dayFiltered.length,
+        cacheHit: false,
+        requestedDay: normalizedRequestedDay || null,
+        requestedRadiusMiles: requestedRadiusMiles ?? null,
+        searchedZipCount: 1,
+      }),
+    );
+  }
+
+  const radiusFiltered = filterSalesByRadius(
+    dayFiltered,
+    requestedRadiusMiles,
+    requestedOrigin,
+  );
+  const sorted = sortSales(radiusFiltered);
+
+  console.log(
+    '[estate-sales-route] response',
+    JSON.stringify({
+      cacheHit,
+      dayFiltered: dayFiltered.length,
+      radiusFiltered: radiusFiltered.length,
+      requestedDay: normalizedRequestedDay || null,
+      requestedRadiusMiles: requestedRadiusMiles ?? null,
+      requestedLatitude: requestedOrigin?.latitude ?? null,
+      requestedLongitude: requestedOrigin?.longitude ?? null,
+      searchedZipCount: 1,
     }),
   );
 
-  const salesBeforeDedupe = resolvedSales.filter(Boolean);
-  const sales = dedupeSales(salesBeforeDedupe).sort((a, b) => {
-    const aDistance = Number.isFinite(Number(a.distanceMiles))
-      ? Number(a.distanceMiles)
-      : 9999;
-    const bDistance = Number.isFinite(Number(b.distanceMiles))
-      ? Number(b.distanceMiles)
-      : 9999;
-    return aDistance - bDistance;
-  });
+  return sorted.slice(0, MAX_RESULTS);
+}
 
-  const diagnostics = {
-    sourceRows: rows.length,
-    afterDayFilter: resolvedSales.filter((item) => item !== null).length,
-    exactCoords: sales.filter((sale) => sale.hasExactCoordinates).length,
-    approximateCoords: sales.filter((sale) => sale.isApproximateLocation)
-      .length,
-    withStreet: sales.filter((sale) => sale.street).length,
-    withCity: sales.filter((sale) => sale.city).length,
-    fromPostingPage: sales.filter((sale) => sale.geoSource === 'posting_page')
-      .length,
-    fromGeocoder: sales.filter((sale) => sale.geoSource === 'geocoder').length,
-    deduped: Math.max(0, salesBeforeDedupe.length - sales.length),
-    returned: sales.length,
+router.get('/', async (req, res) => {
+  console.log(`[estate-sales-route] source-assist-no-zip-sweep-v5-user-radius-only NO_ZIP_SWEEP route start`);
+  const requestStartedAt = Date.now();
+  const requestedDay = normalizeRequestedDay(req.query?.day || '');
+  const requestedRadiusMiles = normalizeRequestedRadiusMiles(
+    req.query?.radiusMiles,
+  );
+  const requestedOrigin = {
+    latitude: normalizeRequestedOriginCoordinate(req.query?.latitude),
+    longitude: normalizeRequestedOriginCoordinate(req.query?.longitude),
   };
 
-  return { sales, sourceUrl: url, diagnostics };
-}
-
-async function handleGarageSales(req, res) {
   try {
-    const latitude = Number(req.query.latitude);
-    const longitude = Number(req.query.longitude);
-    const radiusMiles = Math.max(
-      1,
-      Math.min(Number(req.query.radiusMiles) || 25, 50),
+    const sales = await fetchAllEstateSales(
+      requestedDay,
+      requestedRadiusMiles,
+      requestedOrigin,
     );
-    const day =
-      req.query.day === 'tomorrow'
-        ? 'tomorrow'
-        : req.query.day === 'today'
-          ? 'today'
-          : null;
-    const area =
-      String(req.query.area || normalizeAreaFromCoords(latitude, longitude))
-        .trim()
-        .toLowerCase() || 'chicago';
-
-    const { sales, sourceUrl, diagnostics } = await fetchCraigslistGarageSales({
-      area,
-      latitude,
-      longitude,
-      radiusMiles,
-      day,
-    });
-    const debugEnabled =
-      req.query.debug === '1' ||
-      req.query.debug === 'true' ||
-      req.query.debug === 'yes';
+    const sourceAssistSales = sales.map(formatSaleForSourceAssist);
 
     return res.json({
-      ok: true,
-      area,
-      source: 'craigslist',
-      sourceUrl,
-      day: day || 'all',
-      radiusMiles,
-      sales,
-      count: sales.length,
-      ...(debugEnabled ? { diagnostics } : {}),
-      message: sales.length
-        ? `Loaded ${sales.length} Craigslist sale listings.`
-        : 'No Craigslist garage, yard, or estate sale listings matched this area and radius.',
+      success: true,
+      routeVersion: ESTATE_ROUTE_VERSION,
+      source: 'estatesales-net',
+      requestedDay,
+      requestedRadiusMiles,
+      count: sourceAssistSales.length,
+      fetchedAt: new Date().toISOString(),
+      elapsedMs: Date.now() - requestStartedAt,
+      sales: sourceAssistSales,
+      estateSales: sourceAssistSales,
     });
   } catch (error) {
-    console.error('Garage sales route failed:', error?.message || error);
+    console.error('EstateSales route error:', error.message);
+
     return res.status(500).json({
-      ok: false,
-      error: 'garage_sales_fetch_failed',
-      message: 'Could not load garage sales from Craigslist right now.',
-      detail: error?.message || String(error),
+      success: false,
+      error: 'ESTATE_SALES_FETCH_FAILED',
+      message: error.message,
+      fetchedAt: new Date().toISOString(),
+      elapsedMs: Date.now() - requestStartedAt,
+      sales: [],
     });
   }
-}
-
-router.get('/garage-sales-health', (_req, res) => {
-  return res.json({ ok: true, route: 'garage-sales-route', mounted: true });
 });
-
-router.get('/garage-sales', handleGarageSales);
-router.get('/api/garage-sales', handleGarageSales);
 
 module.exports = router;
