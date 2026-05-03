@@ -1271,7 +1271,7 @@ function parseEstateSalesFromHtml(html, requestedZip) {
   return results;
 }
 
-async async function fetchEstateSalesForZip(zip, radiusMiles = 50) {
+async function fetchEstateSalesForZip(zip, radiusMiles = 50) {
   const safeZip = encodeURIComponent(String(zip || '60565').trim());
   const safeRadius = encodeURIComponent(String(radiusMiles || 50));
 
