@@ -8,6 +8,7 @@
 // - Better labels: Thrift Store, Resale Shop, Consignment Shop, Antiques / Resale, Used Goods Store
 // - In-memory cache to keep it fast and reduce Google API calls
 // - Wider 25/50 mile coverage using multiple search origins
+// - v7 coverage tune: fuller results, looser useful-store filter, stronger radius coverage
 
 const GOOGLE_TEXT_SEARCH_URL =
   'https://places.googleapis.com/v1/places:searchText';
@@ -22,7 +23,7 @@ const GOOGLE_CACHE_TTL_MS =
   Number(process.env.GOOGLE_PLACES_CACHE_TTL_DAYS || 7) * 24 * 60 * 60 * 1000;
 const GOOGLE_QUERY_LIMIT = Math.max(
   1,
-  Math.min(Number(process.env.GOOGLE_PLACES_THRIFT_QUERY_LIMIT || 6), 10),
+  Math.min(Number(process.env.GOOGLE_PLACES_THRIFT_QUERY_LIMIT || 10), 10),
 );
 
 const cache = new Map();
@@ -150,6 +151,9 @@ function isLikelyBadResult(place = {}) {
     : '';
   const text = `${name} ${address} ${types}`;
 
+  // Keep obviously bad matches out, but do not over-filter resale-style places.
+  // Google can classify legit thrift/resale spots broadly, so this stays focused
+  // on categories we definitely do NOT want.
   return /pawn|vape|liquor|tobacco|gun|firearm|adult|casino|storage|car dealer|auto dealer|motorcycle|boat|junkyard|scrap|recycling center|landfill|restaurant|bar|coffee|gas station|convenience store|hotel|motel|bank|atm|pharmacy/.test(
     text,
   );
@@ -166,7 +170,7 @@ function looksLikeUsefulStore(place = {}) {
   const text = `${name} ${address} ${types}`;
 
   if (
-    /goodwill|salvation army|savers|thrift|resale|second hand|second-hand|restore|habitat for humanity|consignment|st vincent|value village|arc thrift|unique thrift|family shelter|charity shop|hope chest|new uses|out of the attic/.test(
+    /goodwill|salvation army|savers|thrift|resale|second hand|second-hand|restore|habitat for humanity|consignment|st vincent|st\. vincent|value village|arc thrift|unique thrift|family shelter|charity shop|hope chest|new uses|out of the attic|mission mart|plato'?s closet|once upon a child|clothes mentor|uptown cheapskate|style encore|play it again sports|half price books|used books|used furniture|used clothing|vintage shop|antique mall|antique store|re-use|reuse|donation center/.test(
       text,
     )
   ) {
@@ -174,7 +178,9 @@ function looksLikeUsefulStore(place = {}) {
   }
 
   // Google often returns broad store categories from thrift/resale text searches.
-  return /thrift_store|used_store|discount_store|clothing_store|home_goods_store|furniture_store|store/.test(
+  // Keep these when they came from thrift/resale queries; bad categories were
+  // already removed above. This brings back useful hidden resale stops.
+  return /thrift_store|used_store|discount_store|clothing_store|home_goods_store|furniture_store|book_store|shoe_store|store/.test(
     types,
   );
 }
@@ -192,6 +198,11 @@ function buildSearchQueries(radiusMiles = DEFAULT_RADIUS_MILES) {
     'Habitat for Humanity ReStore',
     'Savers thrift store',
     'charity shop',
+    'used furniture store',
+    'used clothing store',
+    'vintage resale shop',
+    'antique resale shop',
+    'donation resale store',
   ].slice(0, queryLimit);
 }
 
@@ -231,11 +242,11 @@ function getSearchOrigins(latitude, longitude, radiusMiles) {
   // coverage across the selected radius, then results are deduped and sorted
   // from the user's true location.
   if (radiusMiles >= 25) {
-    const ringDistance = radiusMiles >= 50 ? 28 : 14;
+    const ringDistance = radiusMiles >= 50 ? 30 : 15;
     const bearings =
       radiusMiles >= 50
         ? [0, 45, 90, 135, 180, 225, 270, 315]
-        : [0, 90, 180, 270];
+        : [0, 45, 90, 135, 180, 225, 270, 315];
 
     for (const bearing of bearings) {
       origins.push({
@@ -250,14 +261,13 @@ function getSearchOrigins(latitude, longitude, radiusMiles) {
 
 function getEffectiveQueryLimit(radiusMiles) {
   const requested = GOOGLE_QUERY_LIMIT;
-  if (radiusMiles >= 50)
-    return Math.max(requested, Math.min(10, requested + 3));
-  if (radiusMiles >= 25) return Math.max(requested, Math.min(8, requested + 2));
-  return requested;
+  if (radiusMiles >= 50) return Math.max(requested, 10);
+  if (radiusMiles >= 25) return Math.max(requested, 10);
+  return Math.max(requested, 8);
 }
 
 function getCacheKey(latitude, longitude, radiusMiles, limit) {
-  return `google_places_thrift_v6_wide__${Number(latitude).toFixed(3)}__${Number(longitude).toFixed(3)}__${radiusMiles}__${limit}__${GOOGLE_QUERY_LIMIT}`;
+  return `google_places_thrift_v7_fuller__${Number(latitude).toFixed(3)}__${Number(longitude).toFixed(3)}__${radiusMiles}__${limit}__${GOOGLE_QUERY_LIMIT}`;
 }
 
 function getCached(key) {
@@ -407,7 +417,7 @@ function dedupeStores(stores = []) {
         existingAddressKey &&
         (addressKey.includes(existingAddressKey) ||
           existingAddressKey.includes(addressKey));
-      const veryClose = distanceMiles <= 0.12;
+      const veryClose = distanceMiles <= 0.05;
 
       return (
         (sameBrand && veryClose) ||
@@ -542,12 +552,12 @@ async function fetchStores(latitude, longitude, radiusMiles, limit) {
   const queries = buildSearchQueries(radiusMiles);
   const origins = getSearchOrigins(latitude, longitude, radiusMiles);
   const searchRadiusMeters = Math.round(
-    Math.min(radiusMiles, radiusMiles >= 25 ? 18 : radiusMiles) * 1609.344,
+    Math.min(radiusMiles, radiusMiles >= 25 ? 25 : radiusMiles) * 1609.344,
   );
   const perQueryLimit =
     radiusMiles >= 25
       ? 20
-      : Math.max(10, Math.min(20, Math.ceil(limit / queries.length) + 8));
+      : Math.max(15, Math.min(20, Math.ceil(limit / queries.length) + 10));
   const allStores = [];
   const errors = [];
 
