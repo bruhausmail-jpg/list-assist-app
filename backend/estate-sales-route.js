@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v15-default-today-query-fix';
+const ESTATE_ROUTE_VERSION = 'source-assist-v16-estatesales-chicago-time-fix';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -518,30 +518,17 @@ function extractScheduleFromJsonLdObject(obj) {
     if (Number.isNaN(start.getTime())) continue;
 
     const end = endRaw ? new Date(endRaw) : null;
-    const weekday = normalizeWeekdayLabel(
-      start.toLocaleDateString('en-US', { weekday: 'long' }),
-    );
-    const dateLabel = start.toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-    });
-    const startTime = normalizeClockLabel(
-      start.toLocaleTimeString('en-US', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-      }),
-    );
-    const endTime =
-      end && !Number.isNaN(end.getTime())
-        ? normalizeClockLabel(
-            end.toLocaleTimeString('en-US', {
-              hour: 'numeric',
-              minute: '2-digit',
-              hour12: true,
-            }),
-          )
-        : '';
+    // EstateSales.net detail pages expose JSON-LD date/times with Chicago sale times.
+    // Render runs in UTC, so using plain toLocaleTimeString() shifted the cards by
+    // about five hours (for example 11am-3pm became 3pm-8pm). Always render and
+    // build date keys in America/Chicago so Today matches the EstateSales.net app.
+    const startParts = getChicagoDateParts(start);
+    const endParts = end && !Number.isNaN(end.getTime()) ? getChicagoDateParts(end) : null;
+    const weekday = startParts.weekday || '';
+    const dateLabel = getChicagoMonthDayLabel(start);
+    const startTime = startParts.timeLabel || '';
+    const endTime = endParts?.timeLabel || '';
+    const startDate = getChicagoDateKey(start);
 
     scheduleEntries.push({
       dayLabel: weekday,
@@ -549,8 +536,8 @@ function extractScheduleFromJsonLdObject(obj) {
       timeLabel: endTime ? `${startTime} to ${endTime}` : startTime,
       startTime,
       endTime,
-      startDate: `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`,
-      startDateTime: `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}T${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}:00`,
+      startDate,
+      startDateTime: buildChicagoIsoDateTime(startDate, startTime),
       sortTimestamp: start.getTime(),
     });
   }
@@ -805,6 +792,64 @@ function normalizeWeekdayLabel(value = '') {
   };
 
   return weekdays[key] || String(value).trim();
+}
+
+
+const ESTATE_SALES_TIME_ZONE = 'America/Chicago';
+
+function getChicagoDateParts(date = new Date()) {
+  const safeDate = date instanceof Date && !Number.isNaN(date.getTime()) ? date : new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: ESTATE_SALES_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'long',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+
+  const parts = Object.fromEntries(
+    formatter.formatToParts(safeDate).map((part) => [part.type, part.value]),
+  );
+
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    weekday: normalizeWeekdayLabel(parts.weekday || ''),
+    timeLabel: normalizeClockLabel(`${parts.hour || ''}:${parts.minute || '00'} ${parts.dayPeriod || ''}`),
+  };
+}
+
+function getChicagoDateKey(date = new Date()) {
+  const parts = getChicagoDateParts(date);
+  if (!parts.year || !parts.month || !parts.day) return '';
+  return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+}
+
+function getChicagoMonthDayLabel(date = new Date()) {
+  const parts = getChicagoDateParts(date);
+  if (!parts.month || !parts.day) return '';
+  const monthLabels = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${monthLabels[parts.month] || ''} ${parts.day}`.trim();
+}
+
+function buildChicagoIsoDateTime(dateKey = '', timeLabel = '') {
+  const cleanDateKey = String(dateKey || '').slice(0, 10);
+  if (!/^20\d{2}-\d{2}-\d{2}$/.test(cleanDateKey)) return '';
+
+  const timeMatch = String(timeLabel || '').match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+  if (!timeMatch) return cleanDateKey;
+
+  let hours = Number(timeMatch[1]);
+  const minutes = Number(timeMatch[2] || '0');
+  const meridiem = String(timeMatch[3]).toLowerCase();
+  if (meridiem === 'pm' && hours < 12) hours += 12;
+  if (meridiem === 'am' && hours === 12) hours = 0;
+
+  return `${cleanDateKey}T${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`;
 }
 
 function stripLeadingWeekdayFromTime(value = '') {
@@ -1738,9 +1783,7 @@ function getWeekdayFromDateLikeValue(value = '') {
   const parsed = new Date(raw);
   if (Number.isNaN(parsed.getTime())) return '';
 
-  return normalizeRequestedDay(
-    parsed.toLocaleDateString('en-US', { weekday: 'long' }),
-  );
+  return normalizeRequestedDay(getChicagoDateParts(parsed).weekday || '');
 }
 
 function getRequestedDateWindow(requestedDay = '') {
@@ -1852,25 +1895,46 @@ function saleMatchesRequestedDay(sale = {}, requestedDay = '') {
 
   const requestedWindow = getRequestedDateWindow(normalizedRequestedDay);
   if (requestedWindow) {
-    const entryDates =
-      Array.isArray(sale.scheduleEntries) && sale.scheduleEntries.length
-        ? sale.scheduleEntries.flatMap((entry) =>
-            getSaleDatesForComparison(entry || {}),
-          )
-        : [];
+    const requestedDateKey = getDateKeyForRequestedDay(normalizedRequestedDay);
+    const dateKeyCandidates = [];
 
-    const comparableDates = entryDates.length
-      ? entryDates
-      : getSaleDatesForComparison(sale);
+    const pushDateKey = (value) => {
+      const raw = String(value || '').trim();
+      const direct = raw.slice(0, 10);
+      if (/^20\d{2}-\d{2}-\d{2}$/.test(direct)) {
+        dateKeyCandidates.push(direct);
+        return;
+      }
 
+      const parsed = new Date(raw);
+      if (!Number.isNaN(parsed.getTime())) {
+        dateKeyCandidates.push(getChicagoDateKey(parsed));
+      }
+    };
+
+    pushDateKey(sale.startDate);
+    pushDateKey(sale.startDateTime);
+    pushDateKey(sale.saleDate);
+    pushDateKey(sale.saleDateTime);
+    pushDateKey(sale.date);
+
+    if (Array.isArray(sale.scheduleEntries)) {
+      for (const entry of sale.scheduleEntries) {
+        pushDateKey(entry?.startDate);
+        pushDateKey(entry?.startDateTime);
+        pushDateKey(entry?.saleDate);
+        pushDateKey(entry?.saleDateTime);
+        pushDateKey(entry?.date);
+      }
+    }
+
+    const uniqueDateKeys = Array.from(new Set(dateKeyCandidates.filter(Boolean)));
+    if (uniqueDateKeys.length) return uniqueDateKeys.includes(requestedDateKey);
+
+    const comparableDates = getSaleDatesForComparison(sale);
     if (!comparableDates.length) return false;
 
-    return comparableDates.some((comparableDate) => {
-      return (
-        comparableDate.getTime() >= requestedWindow.start.getTime() &&
-        comparableDate.getTime() <= requestedWindow.end.getTime()
-      );
-    });
+    return comparableDates.some((comparableDate) => getChicagoDateKey(comparableDate) === requestedDateKey);
   }
 
   const candidates = [];
@@ -1921,13 +1985,12 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
 
   const matchingEntries = entries.filter((entry) => {
     if (requestedWindow) {
+      const requestedDateKey = getDateKeyForRequestedDay(normalizedRequestedDay);
+      const directKey = String(entry?.startDate || entry?.saleDate || entry?.date || '').slice(0, 10);
+      if (/^20\d{2}-\d{2}-\d{2}$/.test(directKey)) return directKey === requestedDateKey;
+
       const entryDates = getSaleDatesForComparison(entry || {});
-      return entryDates.some((entryDate) => {
-        return (
-          entryDate.getTime() >= requestedWindow.start.getTime() &&
-          entryDate.getTime() <= requestedWindow.end.getTime()
-        );
-      });
+      return entryDates.some((entryDate) => getChicagoDateKey(entryDate) === requestedDateKey);
     }
 
     const normalizedEntryDay = normalizeRequestedDay(entry?.dayLabel || '');
@@ -2082,8 +2145,7 @@ function formatSaleForSourceAssist(sale = {}) {
 
 
 function getLocalDateKeyFromDate(date = new Date()) {
-  const safeDate = date instanceof Date && !Number.isNaN(date.getTime()) ? date : new Date();
-  return `${safeDate.getFullYear()}-${String(safeDate.getMonth() + 1).padStart(2, '0')}-${String(safeDate.getDate()).padStart(2, '0')}`;
+  return getChicagoDateKey(date);
 }
 
 function getDateKeyForRequestedDay(requestedDay = '') {
