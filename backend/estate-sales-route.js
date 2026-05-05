@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v16-estatesales-chicago-time-fix';
+const ESTATE_ROUTE_VERSION = 'source-assist-v17-estatesales-badge-force';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -281,16 +281,37 @@ function extractDistanceMiles(snippet = '') {
   return match ? Number(match[1]) : null;
 }
 
-function inferSaleType(title = '', snippet = '') {
-  const text = `${title} ${stripHtml(snippet)}`.toLowerCase();
+function inferSaleType(_title = '', _snippet = '') {
+  // Every listing pulled by this route comes from EstateSales.net. Some valid
+  // EstateSales.net detail pages show the small "Estate Sale" badge on the
+  // page but do not repeat those words in the listing title or preview text.
+  // Returning estate-sale here prevents those real listings from being dropped
+  // later by frontend/backend filters that expect saleType === 'estate-sale'.
+  return 'estate-sale';
+}
 
-  if (text.includes('tag sale')) return 'tag-sale';
-  if (text.includes('garage sale')) return 'garage-sale';
-  if (text.includes('yard sale')) return 'yard-sale';
-  if (text.includes('moving sale')) return 'moving-sale';
-  if (text.includes('estate sale')) return 'estate-sale';
+function extractDetailSaleBadge(html = '') {
+  const text = stripHtml(html);
+  if (!text) return '';
 
-  return 'sale';
+  const badgePatterns = [
+    /\bestate\s+sale\b/i,
+    /\btag\s+sale\b/i,
+    /\bmoving\s+sale\b/i,
+    /\bgarage\s+sale\b/i,
+    /\byard\s+sale\b/i,
+  ];
+
+  for (const pattern of badgePatterns) {
+    const match = text.match(pattern);
+    if (match?.[0]) {
+      return match[0]
+        .toLowerCase()
+        .replace(/\b\w/g, (letter) => letter.toUpperCase());
+    }
+  }
+
+  return '';
 }
 
 function addDeterministicJitter(baseValue, seed, spread = 0.012) {
@@ -1154,6 +1175,11 @@ function mergeDetailIntoSale(sale, detail = {}) {
     isProbableSale: probableSale,
     hasExactCoordinates,
     isApproximateLocation,
+    saleType: detail.saleType || sale.saleType || 'estate-sale',
+    saleBadge: detail.saleBadge || sale.saleBadge || 'Estate Sale',
+    detailSaleBadge: detail.detailSaleBadge || sale.detailSaleBadge || '',
+    detailSaleBadgeConfirmed:
+      detail.detailSaleBadgeConfirmed || sale.detailSaleBadgeConfirmed || false,
     statusText: detail.statusText || sale.statusText || '',
     dateText: detail.dateText || sale.dateText || '',
     dayLabel: detail.dayLabel || sale.dayLabel || '',
@@ -1192,6 +1218,7 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
     });
 
     const html = typeof response.data === 'string' ? response.data : '';
+    const detailSaleBadge = extractDetailSaleBadge(html);
 
     const coords = extractCoordinatesFromHtml(html);
     const address =
@@ -1219,6 +1246,10 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
       latitude: coords?.latitude,
       longitude: coords?.longitude,
       coordinateSource: coords ? 'detail-page' : undefined,
+      saleType: 'estate-sale',
+      saleBadge: detailSaleBadge || 'Estate Sale',
+      detailSaleBadge: detailSaleBadge || '',
+      detailSaleBadgeConfirmed: /estate\s+sale/i.test(detailSaleBadge),
       mapAddress:
         address.addressLabel ||
         buildAddressLabel({
@@ -1322,6 +1353,9 @@ function parseEstateSalesFromHtml(html, requestedZip) {
       sourceListingId: location.sourceListingId || '',
       title,
       saleType,
+      saleBadge: 'Estate Sale',
+      detailSaleBadge: '',
+      detailSaleBadgeConfirmed: false,
       source: 'estatesales-net',
       sourceLabel: 'EstateSales.net',
       url: absoluteUrl,
