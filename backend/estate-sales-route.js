@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v18-filter-online-only-auctions';
+const ESTATE_ROUTE_VERSION = 'source-assist-v21-detail-first-online-only-filter';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -290,25 +290,66 @@ function inferSaleType(_title = '', _snippet = '') {
   return 'estate-sale';
 }
 
+function buildOnlineOnlyDetectionText(value = '') {
+  const raw = htmlDecode(String(value || ''));
+
+  // Keep BOTH versions:
+  // 1) stripHtml() gives us the normal visible page/listing text.
+  // 2) rawWithoutTags keeps words that EstateSales.net may place inside JSON,
+  //    script payloads, aria labels, or app-state data. The prior filter only
+  //    looked at visible text, so detail pages that rendered "Online Only
+  //    Auction" from app data could slip through as false in-person sales.
+  const visibleText = stripHtml(raw);
+  const rawWithoutTags = raw
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\u0026/g, '&')
+    .replace(/\u003c/gi, '<')
+    .replace(/\u003e/gi, '>')
+    .replace(/\u002f/gi, '/')
+    .replace(/\\//g, '/');
+
+  return `${visibleText} ${rawWithoutTags}`
+    .toLowerCase()
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/[-–—_]+/g, ' ')
+    .replace(/&nbsp;|&amp;|&quot;|&#39;|&apos;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function isOnlineOnlyEstateSaleText(value = '') {
-  const text = normalizeText(value);
+  const text = buildOnlineOnlyDetectionText(value);
   if (!text) return false;
 
-  return [
-    /online\s+only\s+auction/,
-    /online\s+only\s+sale/,
-    /online-only\s+auction/,
-    /online-only\s+sale/,
-    /not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
-    /location\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
-    /address\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
-    /this\s+is\s+an\s+online\s+only\s+auction/,
-    /online\s+bidding\s+only/,
-  ].some((pattern) => pattern.test(text));
+  const onlineOnlySignals = [
+    /\bonline\s+only\s+auction\b/i,
+    /\bonline\s+only\s+sale\b/i,
+    /\bonline\s+only\s+estate\s+sale\b/i,
+    /\bonline\s+auction\s+only\b/i,
+    /\bonline\s+bidding\s+only\b/i,
+    /\bbidding\s+only\b/i,
+    /\bnot\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
+    /\blocation\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
+    /\baddress\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
+    /\bthis\s+is\s+an\s+online\s+only\s+auction\b/i,
+    /\bsale\s+type\s*[:=]\s*online\s+only\s+auction\b/i,
+    /\bsale\s+format\s*[:=]\s*online\s+only\b/i,
+  ];
+
+  return onlineOnlySignals.some((pattern) => pattern.test(text));
 }
 
 function shouldExcludeOnlineOnlySale(sale = {}) {
   if (sale.isOnlineOnly === true) return true;
+
+  // Detail-page evidence is more trustworthy than the wide search-result
+  // snippet. EstateSales.net pages can render nearby listings close together,
+  // so a real in-person sale can inherit text from an adjacent online-only
+  // auction in rawSnippet. Once the detail page has confirmed this is an
+  // in-person sale, do not let the contaminated listing snippet remove it.
+  if (sale.detailFetched === true && sale.saleFormat === 'in-person-estate-sale') {
+    return false;
+  }
 
   const searchableText = [
     sale.title,
@@ -349,6 +390,36 @@ function extractDetailSaleBadge(html = '') {
       return match[0]
         .toLowerCase()
         .replace(/\b\w/g, (letter) => letter.toUpperCase());
+    }
+  }
+
+  return '';
+}
+
+function cleanDetailTitle(value = '') {
+  return stripHtml(value)
+    .replace(/\s*[|\-–—]\s*EstateSales\.NET.*$/i, '')
+    .replace(/\s*[|\-–—]\s*EstateSales\.net.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractDetailTitle(html = '') {
+  if (!html) return '';
+
+  const titleSources = [
+    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["'][^>]*>/i,
+    /<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']+)["'][^>]*>/i,
+    /<h1[^>]*>([\s\S]*?)<\/h1>/i,
+    /<title[^>]*>([\s\S]*?)<\/title>/i,
+  ];
+
+  for (const pattern of titleSources) {
+    const match = html.match(pattern);
+    const title = cleanDetailTitle(htmlDecode(match?.[1] || ''));
+    if (title && !/^estate\s+sale$/i.test(title)) {
+      return title;
     }
   }
 
@@ -1201,6 +1272,7 @@ function mergeDetailIntoSale(sale, detail = {}) {
 
   return {
     ...sale,
+    title: detail.title || sale.title || '',
     city: mergedCity,
     state: mergedState,
     zip: mergedZip,
@@ -1217,6 +1289,7 @@ function mergeDetailIntoSale(sale, detail = {}) {
     hasExactCoordinates,
     isApproximateLocation,
     isOnlineOnly: detail.isOnlineOnly === true || sale.isOnlineOnly === true,
+    detailFetched: detail.detailFetched === true || sale.detailFetched === true,
     saleFormat: detail.saleFormat || sale.saleFormat || '',
     saleType: detail.saleType || sale.saleType || 'estate-sale',
     saleBadge: detail.saleBadge || sale.saleBadge || 'Estate Sale',
@@ -1261,6 +1334,7 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
     });
 
     const html = typeof response.data === 'string' ? response.data : '';
+    const detailTitle = extractDetailTitle(html);
     const detailSaleBadge = extractDetailSaleBadge(html);
     const isOnlineOnly = isOnlineOnlyEstateSaleText(html);
 
@@ -1275,6 +1349,8 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
       extractScheduleFromJsonLd(html) || extractDetailSchedule(html) || {};
 
     const detail = {
+      title: detailTitle || '',
+      detailFetched: true,
       street: address.street || '',
       city: address.city || fallbackLocation.city || '',
       state: address.state || fallbackLocation.state || 'IL',
@@ -1379,7 +1455,11 @@ function parseEstateSalesFromHtml(html, requestedZip) {
     const snippet = searchableHtml.slice(Math.max(0, index - 2600), index + 3200);
 
     if (!isCurrentOrUpcoming(snippet)) continue;
-    if (isOnlineOnlyEstateSaleText(snippet)) continue;
+    // Do not exclude online-only sales from the wide listing-page snippet here.
+    // The snippet window can include text from neighboring listings, which was
+    // causing the real Candace's Antiques in-person sale to be dropped because
+    // an adjacent online auction appeared nearby in the HTML. Fetch the detail
+    // page first, then filter using detail-page evidence in shouldExcludeOnlineOnlySale().
 
     const location = extractLocationFromUrl(absoluteUrl);
     const title = extractTitle(snippet, absoluteUrl);
@@ -1405,6 +1485,7 @@ function parseEstateSalesFromHtml(html, requestedZip) {
       saleFormat: '',
       detailSaleBadge: '',
       detailSaleBadgeConfirmed: false,
+      detailFetched: false,
       source: 'estatesales-net',
       sourceLabel: 'EstateSales.net',
       url: absoluteUrl,
