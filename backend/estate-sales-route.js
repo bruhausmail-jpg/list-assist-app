@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v21-detail-first-online-only-filter';
+const ESTATE_ROUTE_VERSION = 'source-assist-v23-tomorrow-section-parse-fix';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1412,7 +1412,7 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
   }
 }
 
-function parseEstateSalesFromHtml(html, requestedZip) {
+function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
   const results = [];
   const seenUrls = new Set();
 
@@ -1420,13 +1420,24 @@ function parseEstateSalesFromHtml(html, requestedZip) {
   // did NOT match the active filters, for example "not happening today".
   // Do not parse those links into the app's Today list.
   const lowerHtml = String(html || '').toLowerCase();
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+
   const cutoffCandidates = [
     lowerHtml.indexOf("below are the sales that didn't quite match"),
     lowerHtml.indexOf('below are the sales that didn&#39;t quite match'),
-    lowerHtml.indexOf('sales that are not happening today'),
     lowerHtml.indexOf('sales more than 50 miles away'),
-  ].filter((index) => index > 0);
-  const cutoffIndex = cutoffCandidates.length ? Math.min(...cutoffCandidates) : -1;
+  ];
+
+  // Important: only cut off the "not happening today" section when the user
+  // actually asked for Today. EstateSales.net can place legitimate Tomorrow
+  // sales in that lower section, which was why Candace's Antiques was missing
+  // from Source Assist when Tomorrow was selected.
+  if (normalizedRequestedDay === 'today') {
+    cutoffCandidates.push(lowerHtml.indexOf('sales that are not happening today'));
+  }
+
+  const validCutoffs = cutoffCandidates.filter((index) => index > 0);
+  const cutoffIndex = validCutoffs.length ? Math.min(...validCutoffs) : -1;
   const searchableHtml = cutoffIndex > 0 ? html.slice(0, cutoffIndex) : html;
 
   // EstateSales.net's rendered listing page exposes sale links in this format:
@@ -1640,7 +1651,7 @@ function getEstateSalesSearchTargets(
   return targets;
 }
 
-async function fetchEstateSalesForTarget(target, radiusMiles = 50) {
+async function fetchEstateSalesForTarget(target, radiusMiles = 50, requestedDay = '') {
   const safeZip = encodeURIComponent(String(target?.zip || '60565').trim());
   const safeRadius = encodeURIComponent(String(radiusMiles || 50));
   const citySlug = encodeURIComponent(normalizeCitySlug(target?.city || 'Naperville'));
@@ -1674,7 +1685,7 @@ async function fetchEstateSalesForTarget(target, radiusMiles = 50) {
       });
 
       const html = typeof response.data === 'string' ? response.data : '';
-      const parsed = parseEstateSalesFromHtml(html, target?.zip || '60565');
+      const parsed = parseEstateSalesFromHtml(html, target?.zip || '60565', requestedDay);
 
       console.log(
         `[estate-sales-route] ${ESTATE_ROUTE_VERSION} CITY_TARGET zip=${target?.zip} city=${citySlug} radius=${safeRadius} parsed=${parsed.length} url=${url}`,
@@ -1701,18 +1712,19 @@ async function fetchEstateSalesForTarget(target, radiusMiles = 50) {
 async function fetchEstateSalesForTargets(
   targets = [],
   radiusMiles = 50,
+  requestedDay = '',
 ) {
   const targetResults = await mapWithConcurrency(
     targets,
     ZIP_FETCH_CONCURRENCY,
-    async (target) => fetchEstateSalesForTarget(target, radiusMiles),
+    async (target) => fetchEstateSalesForTarget(target, radiusMiles, requestedDay),
   );
 
   return targetResults.flat().filter(Boolean);
 }
 
-async function fetchEstateSalesForZip(zip, radiusMiles = 50, city = 'Naperville') {
-  return fetchEstateSalesForTarget({ zip, city }, radiusMiles);
+async function fetchEstateSalesForZip(zip, radiusMiles = 50, city = 'Naperville', requestedDay = '') {
+  return fetchEstateSalesForTarget({ zip, city }, radiusMiles, requestedDay);
 }
 
 async function enrichSalesWithDetailPages(sales = []) {
@@ -2610,6 +2622,7 @@ async function fetchAllEstateSales(
     const rawResults = await fetchEstateSalesForTargets(
       searchTargets,
       requestedRadiusMiles || 50,
+      requestedDay,
     );
 
     const deduped = dedupeSales(rawResults);
