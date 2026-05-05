@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v23-tomorrow-section-parse-fix';
+const ESTATE_ROUTE_VERSION = 'source-assist-v24-expanded-nearby-estate-targets';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1643,10 +1643,33 @@ function getEstateSalesSearchTargets(
     targets.push({ city: cleanCity, zip: cleanZip });
   };
 
-  // Important: use the user's actual EstateSales.net city/ZIP origin page.
-  // The old expanded seed sweep pulled other city pages and made the app drift
-  // away from what EstateSales.net actually shows for the selected origin.
+  // Always start with the user's actual EstateSales.net city/ZIP origin page.
   addTarget(requestedCity || 'Naperville', requestedZip || '60565');
+
+  const radius = Number(_requestedRadiusMiles) || 0;
+
+  // EstateSales.net's city/ZIP page can miss legitimate nearby sales that its
+  // mobile app shows inside the same radius. Candace's Antiques in Beverly is a
+  // good example: it is about 25 miles from Naperville, but it lives on the
+  // Chicago 60643 page and may not appear on the Naperville page HTML. Add a
+  // small, controlled set of nearby EstateSales.net target pages for wider
+  // searches, then still apply the user's true GPS radius after detail-page
+  // enrichment. This keeps online-only filtering intact while allowing valid
+  // in-person estate sales to surface for Tomorrow.
+  if (radius >= 25) {
+    addTarget('Chicago', '60643');
+    addTarget('Chicago', '60655');
+    addTarget('Willowbrook', '60527');
+    addTarget('Burr Ridge', '60527');
+  }
+
+  if (radius >= 50) {
+    addTarget('Chicago', '60618');
+    addTarget('Chicago', '60641');
+    addTarget('Oak Park', '60302');
+    addTarget('La Grange', '60525');
+    addTarget('Hinsdale', '60521');
+  }
 
   return targets;
 }
