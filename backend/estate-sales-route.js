@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v24-expanded-nearby-estate-targets';
+const ESTATE_ROUTE_VERSION = 'source-assist-v26-general-estatesales-discovery';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1412,6 +1412,47 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
   }
 }
 
+function extractEstateSaleLinksFromHtml(html = '') {
+  const source = String(html || '');
+  const links = [];
+  const seen = new Set();
+
+  const addLink = (rawHref = '', index = -1) => {
+    if (!rawHref) return;
+
+    let href = htmlDecode(String(rawHref || '').trim())
+      .replace(/\\u002f/gi, '/')
+      .replace(/\\\//g, '/')
+      .replace(/^https?:\/\/www\.estatesales\.net/i, '')
+      .replace(/^https?:\/\/estatesales\.net/i, '');
+
+    const pathMatch = href.match(/\/IL\/[^\s"'<>?#]+\/\d{5}\/\d+/i);
+    if (!pathMatch?.[0]) return;
+
+    href = decodeUrlPath(pathMatch[0]);
+    const absoluteUrl = `https://www.estatesales.net${href}`;
+    if (seen.has(absoluteUrl)) return;
+    seen.add(absoluteUrl);
+    links.push({ href, absoluteUrl, index });
+  };
+
+  const patterns = [
+    /href=["']([^"']*\/IL\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /["'](https?:\\?\/\\?\/www\.estatesales\.net\/IL\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /["'](\/IL\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /((?:https?:)?\\?\/\\?\/www\.estatesales\.net\\?\/IL\\?\/[^\s"'<>?#]+\\?\/\d{5}\\?\/\d+)/gi,
+    /(\\?\/IL\\?\/[^\s"'<>?#]+\\?\/\d{5}\\?\/\d+)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      addLink(match[1] || match[0], match.index ?? -1);
+    }
+  }
+
+  return links;
+}
+
 function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
   const results = [];
   const seenUrls = new Set();
@@ -1430,8 +1471,8 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
 
   // Important: only cut off the "not happening today" section when the user
   // actually asked for Today. EstateSales.net can place legitimate Tomorrow
-  // sales in that lower section, which was why Candace's Antiques was missing
-  // from Source Assist when Tomorrow was selected.
+  // sales in that lower section, which can hide valid Tomorrow listings
+  // from Source Assist when Tomorrow is selected.
   if (normalizedRequestedDay === 'today') {
     cutoffCandidates.push(lowerHtml.indexOf('sales that are not happening today'));
   }
@@ -1440,23 +1481,18 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
   const cutoffIndex = validCutoffs.length ? Math.min(...validCutoffs) : -1;
   const searchableHtml = cutoffIndex > 0 ? html.slice(0, cutoffIndex) : html;
 
-  // EstateSales.net's rendered listing page exposes sale links in this format:
-  // /IL/Downers-Grove/60516/1702897. Keep this broad enough for single/double
-  // quoted hrefs and query strings, but tight enough to avoid navigation links.
-  const linkMatches = [
-    ...searchableHtml.matchAll(/href=["'](\/IL\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi),
-  ];
+  const estateSaleLinks = extractEstateSaleLinksFromHtml(searchableHtml);
 
-  for (const match of linkMatches) {
-    const href = match[1];
+  for (const link of estateSaleLinks) {
+    const href = link.href;
     if (!href) continue;
 
-    const absoluteUrl = `https://www.estatesales.net${decodeUrlPath(href)}`;
+    const absoluteUrl = link.absoluteUrl;
 
     if (seenUrls.has(absoluteUrl)) continue;
     seenUrls.add(absoluteUrl);
 
-    const index = searchableHtml.indexOf(href);
+    const index = Number.isFinite(link.index) ? link.index : searchableHtml.indexOf(href);
     if (index === -1) continue;
 
     // The live city/ZIP listing page puts a lot of useful data around the href:
@@ -1468,8 +1504,8 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
     if (!isCurrentOrUpcoming(snippet)) continue;
     // Do not exclude online-only sales from the wide listing-page snippet here.
     // The snippet window can include text from neighboring listings, which was
-    // causing the real Candace's Antiques in-person sale to be dropped because
-    // an adjacent online auction appeared nearby in the HTML. Fetch the detail
+    // causing real in-person sales to be dropped when
+    // an adjacent online auction appears nearby in the HTML. Fetch the detail
     // page first, then filter using detail-page evidence in shouldExcludeOnlineOnlySale().
 
     const location = extractLocationFromUrl(absoluteUrl);
@@ -1648,27 +1684,40 @@ function getEstateSalesSearchTargets(
 
   const radius = Number(_requestedRadiusMiles) || 0;
 
-  // EstateSales.net's city/ZIP page can miss legitimate nearby sales that its
-  // mobile app shows inside the same radius. Candace's Antiques in Beverly is a
-  // good example: it is about 25 miles from Naperville, but it lives on the
-  // Chicago 60643 page and may not appear on the Naperville page HTML. Add a
-  // small, controlled set of nearby EstateSales.net target pages for wider
-  // searches, then still apply the user's true GPS radius after detail-page
-  // enrichment. This keeps online-only filtering intact while allowing valid
-  // in-person estate sales to surface for Tomorrow.
+  // EstateSales.net's primary city/ZIP HTML can miss nearby listings that are
+  // still inside the user's selected GPS radius, especially around large metro
+  // areas where listings are grouped under neighboring city/ZIP pages. For wider
+  // searches, check a small controlled set of nearby EstateSales.net pages, then
+  // still apply true GPS radius filtering after detail-page enrichment. This is
+  // scenario-based, not tied to any one listing.
   if (radius >= 25) {
-    addTarget('Chicago', '60643');
-    addTarget('Chicago', '60655');
-    addTarget('Willowbrook', '60527');
-    addTarget('Burr Ridge', '60527');
+    [
+      ['Chicago', '60643'],
+      ['Chicago', '60655'],
+      ['Chicago', '60652'],
+      ['Chicago', '60638'],
+      ['Willowbrook', '60527'],
+      ['Burr Ridge', '60527'],
+      ['Hinsdale', '60521'],
+      ['La Grange', '60525'],
+    ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
   }
 
   if (radius >= 50) {
-    addTarget('Chicago', '60618');
-    addTarget('Chicago', '60641');
-    addTarget('Oak Park', '60302');
-    addTarget('La Grange', '60525');
-    addTarget('Hinsdale', '60521');
+    [
+      ['Chicago', '60618'],
+      ['Chicago', '60624'],
+      ['Chicago', '60641'],
+      ['Chicago', '60629'],
+      ['Chicago', '60660'],
+      ['Oak Park', '60302'],
+      ['Berwyn', '60402'],
+      ['Orland Park', '60462'],
+      ['Tinley Park', '60477'],
+      ['Schaumburg', '60193'],
+      ['Elmhurst', '60126'],
+      ['Downers Grove', '60515'],
+    ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
   }
 
   return targets;
@@ -2601,6 +2650,7 @@ function normalizeEstateSaleCalendarData(sale = {}, requestedDay = '') {
     scheduleEntries,
   };
 }
+
 
 async function fetchAllEstateSales(
   requestedDay = '',
