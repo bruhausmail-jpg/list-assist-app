@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v20-raw-html-online-only-filter';
+const ESTATE_ROUTE_VERSION = 'source-assist-v18-filter-online-only-auctions';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -290,53 +290,21 @@ function inferSaleType(_title = '', _snippet = '') {
   return 'estate-sale';
 }
 
-function buildOnlineOnlyDetectionText(value = '') {
-  const raw = htmlDecode(String(value || ''));
-
-  // Keep BOTH versions:
-  // 1) stripHtml() gives us the normal visible page/listing text.
-  // 2) rawWithoutTags keeps words that EstateSales.net may place inside JSON,
-  //    script payloads, aria labels, or app-state data. The prior filter only
-  //    looked at visible text, so detail pages that rendered "Online Only
-  //    Auction" from app data could slip through as false in-person sales.
-  const visibleText = stripHtml(raw);
-  const rawWithoutTags = raw
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\u0026/g, '&')
-    .replace(/\u003c/gi, '<')
-    .replace(/\u003e/gi, '>')
-    .replace(/\u002f/gi, '/')
-    .replace(/\\//g, '/');
-
-  return `${visibleText} ${rawWithoutTags}`
-    .toLowerCase()
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .replace(/[-–—_]+/g, ' ')
-    .replace(/&nbsp;|&amp;|&quot;|&#39;|&apos;/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 function isOnlineOnlyEstateSaleText(value = '') {
-  const text = buildOnlineOnlyDetectionText(value);
+  const text = normalizeText(value);
   if (!text) return false;
 
-  const onlineOnlySignals = [
-    /\bonline\s+only\s+auction\b/i,
-    /\bonline\s+only\s+sale\b/i,
-    /\bonline\s+only\s+estate\s+sale\b/i,
-    /\bonline\s+auction\s+only\b/i,
-    /\bonline\s+bidding\s+only\b/i,
-    /\bbidding\s+only\b/i,
-    /\bnot\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
-    /\blocation\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
-    /\baddress\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
-    /\bthis\s+is\s+an\s+online\s+only\s+auction\b/i,
-    /\bsale\s+type\s*[:=]\s*online\s+only\s+auction\b/i,
-    /\bsale\s+format\s*[:=]\s*online\s+only\b/i,
-  ];
-
-  return onlineOnlySignals.some((pattern) => pattern.test(text));
+  return [
+    /online\s+only\s+auction/,
+    /online\s+only\s+sale/,
+    /online-only\s+auction/,
+    /online-only\s+sale/,
+    /not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
+    /location\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
+    /address\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
+    /this\s+is\s+an\s+online\s+only\s+auction/,
+    /online\s+bidding\s+only/,
+  ].some((pattern) => pattern.test(text));
 }
 
 function shouldExcludeOnlineOnlySale(sale = {}) {
