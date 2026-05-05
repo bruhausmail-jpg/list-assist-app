@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v19-hard-filter-online-only-auctions';
+const ESTATE_ROUTE_VERSION = 'source-assist-v20-raw-html-online-only-filter';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -290,13 +290,35 @@ function inferSaleType(_title = '', _snippet = '') {
   return 'estate-sale';
 }
 
-function isOnlineOnlyEstateSaleText(value = '') {
-  const text = normalizeText(value)
+function buildOnlineOnlyDetectionText(value = '') {
+  const raw = htmlDecode(String(value || ''));
+
+  // Keep BOTH versions:
+  // 1) stripHtml() gives us the normal visible page/listing text.
+  // 2) rawWithoutTags keeps words that EstateSales.net may place inside JSON,
+  //    script payloads, aria labels, or app-state data. The prior filter only
+  //    looked at visible text, so detail pages that rendered "Online Only
+  //    Auction" from app data could slip through as false in-person sales.
+  const visibleText = stripHtml(raw);
+  const rawWithoutTags = raw
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\u0026/g, '&')
+    .replace(/\u003c/gi, '<')
+    .replace(/\u003e/gi, '>')
+    .replace(/\u002f/gi, '/')
+    .replace(/\\//g, '/');
+
+  return `${visibleText} ${rawWithoutTags}`
+    .toLowerCase()
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .replace(/[-–—_]+/g, ' ')
+    .replace(/&nbsp;|&amp;|&quot;|&#39;|&apos;/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
 
+function isOnlineOnlyEstateSaleText(value = '') {
+  const text = buildOnlineOnlyDetectionText(value);
   if (!text) return false;
 
   const onlineOnlySignals = [
@@ -310,6 +332,8 @@ function isOnlineOnlyEstateSaleText(value = '') {
     /\blocation\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
     /\baddress\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
     /\bthis\s+is\s+an\s+online\s+only\s+auction\b/i,
+    /\bsale\s+type\s*[:=]\s*online\s+only\s+auction\b/i,
+    /\bsale\s+format\s*[:=]\s*online\s+only\b/i,
   ];
 
   return onlineOnlySignals.some((pattern) => pattern.test(text));
@@ -331,7 +355,6 @@ function shouldExcludeOnlineOnlySale(sale = {}) {
     sale.mapAddress,
     sale.mapsQuery,
     sale.descriptionPreview,
-    sale.saleFormat,
     sale.rawSnippet,
   ]
     .filter(Boolean)
@@ -1274,13 +1297,12 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
     const isOnlineOnly = isOnlineOnlyEstateSaleText(html);
 
     const coords = extractCoordinatesFromHtml(html);
-    const address = isOnlineOnly
-      ? {}
-      : extractAddressFromJsonLd(html) ||
-        extractAddressFromMeta(html) ||
-        extractAddressFromInlineJson(html, fallbackLocation) ||
-        extractStreetAddressFromVisibleText(html, fallbackLocation) ||
-        {};
+    const address =
+      extractAddressFromJsonLd(html) ||
+      extractAddressFromMeta(html) ||
+      extractAddressFromInlineJson(html, fallbackLocation) ||
+      extractStreetAddressFromVisibleText(html, fallbackLocation) ||
+      {};
     const schedule =
       extractScheduleFromJsonLd(html) || extractDetailSchedule(html) || {};
 
@@ -2569,11 +2591,7 @@ async function fetchAllEstateSales(
       ...prioritizedSales.slice(enrichmentTargetCount),
     ]);
 
-    const firstPassInPersonSales = combinedSales.filter(
-      (sale) => !shouldExcludeOnlineOnlySale(sale),
-    );
-
-    const addressFiltered = firstPassInPersonSales.filter((sale) =>
+    const addressFiltered = combinedSales.filter((sale) =>
       shouldKeepSale(sale),
     );
 
@@ -2614,7 +2632,7 @@ async function fetchAllEstateSales(
           preliminaryRadiusFiltered: preliminaryRadiusFiltered.length,
           enriched: enriched.length,
           addressFiltered: addressFiltered.length,
-          onlineOnlyFiltered: combinedSales.length - inPersonSales.length,
+          onlineOnlyFiltered: addressFiltered.length - inPersonSales.length,
           dayFiltered: dayFiltered.length,
           cacheHit: false,
           requestedDay: normalizedRequestedDay || null,
@@ -2625,12 +2643,8 @@ async function fetchAllEstateSales(
     );
   }
 
-  const finalInPersonSales = dayFiltered.filter(
-    (sale) => !shouldExcludeOnlineOnlySale(sale),
-  );
-
   const radiusFiltered = filterSalesByRadius(
-    finalInPersonSales,
+    dayFiltered,
     requestedRadiusMiles,
     requestedOrigin,
   );
@@ -2641,7 +2655,6 @@ async function fetchAllEstateSales(
       JSON.stringify({
         cacheHit,
         dayFiltered: dayFiltered.length,
-        finalInPerson: finalInPersonSales.length,
         radiusFiltered: radiusFiltered.length,
         requestedDay: normalizedRequestedDay || null,
         requestedRadiusMiles: requestedRadiusMiles ?? null,
