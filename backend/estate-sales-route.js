@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v18-filter-online-only-auctions';
+const ESTATE_ROUTE_VERSION = 'source-assist-v19-hard-filter-online-only-auctions';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -291,20 +291,28 @@ function inferSaleType(_title = '', _snippet = '') {
 }
 
 function isOnlineOnlyEstateSaleText(value = '') {
-  const text = normalizeText(value);
+  const text = normalizeText(value)
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/[-–—_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
   if (!text) return false;
 
-  return [
-    /online\s+only\s+auction/,
-    /online\s+only\s+sale/,
-    /online-only\s+auction/,
-    /online-only\s+sale/,
-    /not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
-    /location\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
-    /address\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
-    /this\s+is\s+an\s+online\s+only\s+auction/,
-    /online\s+bidding\s+only/,
-  ].some((pattern) => pattern.test(text));
+  const onlineOnlySignals = [
+    /\bonline\s+only\s+auction\b/i,
+    /\bonline\s+only\s+sale\b/i,
+    /\bonline\s+only\s+estate\s+sale\b/i,
+    /\bonline\s+auction\s+only\b/i,
+    /\bonline\s+bidding\s+only\b/i,
+    /\bbidding\s+only\b/i,
+    /\bnot\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
+    /\blocation\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
+    /\baddress\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/i,
+    /\bthis\s+is\s+an\s+online\s+only\s+auction\b/i,
+  ];
+
+  return onlineOnlySignals.some((pattern) => pattern.test(text));
 }
 
 function shouldExcludeOnlineOnlySale(sale = {}) {
@@ -323,6 +331,7 @@ function shouldExcludeOnlineOnlySale(sale = {}) {
     sale.mapAddress,
     sale.mapsQuery,
     sale.descriptionPreview,
+    sale.saleFormat,
     sale.rawSnippet,
   ]
     .filter(Boolean)
@@ -1265,12 +1274,13 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
     const isOnlineOnly = isOnlineOnlyEstateSaleText(html);
 
     const coords = extractCoordinatesFromHtml(html);
-    const address =
-      extractAddressFromJsonLd(html) ||
-      extractAddressFromMeta(html) ||
-      extractAddressFromInlineJson(html, fallbackLocation) ||
-      extractStreetAddressFromVisibleText(html, fallbackLocation) ||
-      {};
+    const address = isOnlineOnly
+      ? {}
+      : extractAddressFromJsonLd(html) ||
+        extractAddressFromMeta(html) ||
+        extractAddressFromInlineJson(html, fallbackLocation) ||
+        extractStreetAddressFromVisibleText(html, fallbackLocation) ||
+        {};
     const schedule =
       extractScheduleFromJsonLd(html) || extractDetailSchedule(html) || {};
 
@@ -2559,7 +2569,11 @@ async function fetchAllEstateSales(
       ...prioritizedSales.slice(enrichmentTargetCount),
     ]);
 
-    const addressFiltered = combinedSales.filter((sale) =>
+    const firstPassInPersonSales = combinedSales.filter(
+      (sale) => !shouldExcludeOnlineOnlySale(sale),
+    );
+
+    const addressFiltered = firstPassInPersonSales.filter((sale) =>
       shouldKeepSale(sale),
     );
 
@@ -2600,7 +2614,7 @@ async function fetchAllEstateSales(
           preliminaryRadiusFiltered: preliminaryRadiusFiltered.length,
           enriched: enriched.length,
           addressFiltered: addressFiltered.length,
-          onlineOnlyFiltered: addressFiltered.length - inPersonSales.length,
+          onlineOnlyFiltered: combinedSales.length - inPersonSales.length,
           dayFiltered: dayFiltered.length,
           cacheHit: false,
           requestedDay: normalizedRequestedDay || null,
@@ -2611,8 +2625,12 @@ async function fetchAllEstateSales(
     );
   }
 
+  const finalInPersonSales = dayFiltered.filter(
+    (sale) => !shouldExcludeOnlineOnlySale(sale),
+  );
+
   const radiusFiltered = filterSalesByRadius(
-    dayFiltered,
+    finalInPersonSales,
     requestedRadiusMiles,
     requestedOrigin,
   );
@@ -2623,6 +2641,7 @@ async function fetchAllEstateSales(
       JSON.stringify({
         cacheHit,
         dayFiltered: dayFiltered.length,
+        finalInPerson: finalInPersonSales.length,
         radiusFiltered: radiusFiltered.length,
         requestedDay: normalizedRequestedDay || null,
         requestedRadiusMiles: requestedRadiusMiles ?? null,
