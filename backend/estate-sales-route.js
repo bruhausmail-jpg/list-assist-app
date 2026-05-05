@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v17-estatesales-badge-force';
+const ESTATE_ROUTE_VERSION = 'source-assist-v18-filter-online-only-auctions';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -288,6 +288,47 @@ function inferSaleType(_title = '', _snippet = '') {
   // Returning estate-sale here prevents those real listings from being dropped
   // later by frontend/backend filters that expect saleType === 'estate-sale'.
   return 'estate-sale';
+}
+
+function isOnlineOnlyEstateSaleText(value = '') {
+  const text = normalizeText(value);
+  if (!text) return false;
+
+  return [
+    /online\s+only\s+auction/,
+    /online\s+only\s+sale/,
+    /online-only\s+auction/,
+    /online-only\s+sale/,
+    /not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
+    /location\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
+    /address\s+not\s+available\s*\(\s*online\s+only\s+auction\s*\)/,
+    /this\s+is\s+an\s+online\s+only\s+auction/,
+    /online\s+bidding\s+only/,
+  ].some((pattern) => pattern.test(text));
+}
+
+function shouldExcludeOnlineOnlySale(sale = {}) {
+  if (sale.isOnlineOnly === true) return true;
+
+  const searchableText = [
+    sale.title,
+    sale.saleType,
+    sale.saleBadge,
+    sale.detailSaleBadge,
+    sale.statusText,
+    sale.dateText,
+    sale.company,
+    sale.street,
+    sale.addressLabel,
+    sale.mapAddress,
+    sale.mapsQuery,
+    sale.descriptionPreview,
+    sale.rawSnippet,
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  return isOnlineOnlyEstateSaleText(searchableText);
 }
 
 function extractDetailSaleBadge(html = '') {
@@ -1175,6 +1216,8 @@ function mergeDetailIntoSale(sale, detail = {}) {
     isProbableSale: probableSale,
     hasExactCoordinates,
     isApproximateLocation,
+    isOnlineOnly: detail.isOnlineOnly === true || sale.isOnlineOnly === true,
+    saleFormat: detail.saleFormat || sale.saleFormat || '',
     saleType: detail.saleType || sale.saleType || 'estate-sale',
     saleBadge: detail.saleBadge || sale.saleBadge || 'Estate Sale',
     detailSaleBadge: detail.detailSaleBadge || sale.detailSaleBadge || '',
@@ -1219,6 +1262,7 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
 
     const html = typeof response.data === 'string' ? response.data : '';
     const detailSaleBadge = extractDetailSaleBadge(html);
+    const isOnlineOnly = isOnlineOnlyEstateSaleText(html);
 
     const coords = extractCoordinatesFromHtml(html);
     const address =
@@ -1246,6 +1290,8 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
       latitude: coords?.latitude,
       longitude: coords?.longitude,
       coordinateSource: coords ? 'detail-page' : undefined,
+      isOnlineOnly,
+      saleFormat: isOnlineOnly ? 'online-only-auction' : 'in-person-estate-sale',
       saleType: 'estate-sale',
       saleBadge: detailSaleBadge || 'Estate Sale',
       detailSaleBadge: detailSaleBadge || '',
@@ -1333,6 +1379,7 @@ function parseEstateSalesFromHtml(html, requestedZip) {
     const snippet = searchableHtml.slice(Math.max(0, index - 2600), index + 3200);
 
     if (!isCurrentOrUpcoming(snippet)) continue;
+    if (isOnlineOnlyEstateSaleText(snippet)) continue;
 
     const location = extractLocationFromUrl(absoluteUrl);
     const title = extractTitle(snippet, absoluteUrl);
@@ -1354,6 +1401,8 @@ function parseEstateSalesFromHtml(html, requestedZip) {
       title,
       saleType,
       saleBadge: 'Estate Sale',
+      isOnlineOnly: false,
+      saleFormat: '',
       detailSaleBadge: '',
       detailSaleBadgeConfirmed: false,
       source: 'estatesales-net',
@@ -2514,7 +2563,11 @@ async function fetchAllEstateSales(
       shouldKeepSale(sale),
     );
 
-    const calendarNormalized = addressFiltered.map((sale) =>
+    const inPersonSales = addressFiltered.filter(
+      (sale) => !shouldExcludeOnlineOnlySale(sale),
+    );
+
+    const calendarNormalized = inPersonSales.map((sale) =>
       normalizeEstateSaleCalendarData(sale, requestedDay),
     );
 
@@ -2547,6 +2600,7 @@ async function fetchAllEstateSales(
           preliminaryRadiusFiltered: preliminaryRadiusFiltered.length,
           enriched: enriched.length,
           addressFiltered: addressFiltered.length,
+          onlineOnlyFiltered: addressFiltered.length - inPersonSales.length,
           dayFiltered: dayFiltered.length,
           cacheHit: false,
           requestedDay: normalizedRequestedDay || null,
