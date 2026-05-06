@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v47-upcoming-exclude-tomorrow';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v47-upcoming-exclude-tomorrow';
+const ESTATE_ROUTE_VERSION = 'source-assist-v48-upcoming-2day-exact-badge-dedupe';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v48-upcoming-2day-exact-badge-dedupe';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1323,15 +1323,18 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
     return /\bestate\s+sale\b/i.test(badgeText);
   }
 
-  // Upcoming rule:
-  // Upcoming means the sale STARTS day-after-tomorrow or later.
-  // Do not include Tomorrow sales, even if they also continue into later days.
-  // It still must have the exact detail-page badge text "Estate Sale".
-  // Today/Tomorrow behavior above is untouched.
+  // Upcoming rule, locked down:
+  // Upcoming means any confirmed sale date that is day-after-tomorrow or later.
+  // It must be confirmed from the sale detail page as exactly "Estate Sale".
+  // This intentionally allows multi-day sales when one of their shown dates is
+  // in the Upcoming window, but it still blocks sales that only show Today or
+  // Tomorrow dates. Today/Tomorrow behavior above is untouched.
   if (normalizedRequestedDay === 'upcoming') {
     const todayKey = getChicagoDateKey(new Date());
     const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
 
+    if (sale.detailFetched !== true) return false;
+    if (sale.detailSaleBadgeConfirmed !== true) return false;
     if (!isExactEstateSaleBadge(sale.detailSaleBadge)) return false;
 
     const textDateKeys = collectSaleDateKeysFromText(
@@ -1358,9 +1361,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
 
     if (!allDateKeys.length) return false;
 
-    const firstSaleDateKey = allDateKeys[0];
-
-    return firstSaleDateKey >= dayAfterTomorrowKey;
+    return allDateKeys.some((dateKey) => dateKey >= dayAfterTomorrowKey);
   }
 
   if (hasExactTodayDate) return true;
@@ -2330,12 +2331,59 @@ async function enrichSalesWithDetailPages(sales = []) {
   return [...enrichedSales, ...remainingSales];
 }
 
+function normalizeSaleUrlForDedupe(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  try {
+    const parsed = new URL(raw);
+    parsed.hash = '';
+    parsed.search = '';
+    return parsed.toString().replace(/\/$/, '').toLowerCase();
+  } catch {
+    return raw.split(/[?#]/)[0].replace(/\/$/, '').toLowerCase();
+  }
+}
+
+function getSaleDedupeKey(sale = {}) {
+  const sourceListingId = String(sale.sourceListingId || '').trim();
+  if (sourceListingId) return `source-id:${sourceListingId}`;
+
+  const normalizedUrl =
+    normalizeSaleUrlForDedupe(sale.url) ||
+    normalizeSaleUrlForDedupe(sale.externalUrl) ||
+    normalizeSaleUrlForDedupe(sale.website) ||
+    normalizeSaleUrlForDedupe(sale.craigslistUrl);
+  if (normalizedUrl) return `url:${normalizedUrl}`;
+
+  return `fallback:${[sale.title, sale.city, sale.state, sale.zip, sale.dateText]
+    .map((part) => String(part || '').trim().toLowerCase())
+    .filter(Boolean)
+    .join('|')}`;
+}
+
+function getSaleQualityScore(sale = {}) {
+  return (
+    (sale.detailFetched === true ? 80 : 0) +
+    (sale.detailSaleBadgeConfirmed === true ? 60 : 0) +
+    (isExactEstateSaleBadge(sale.detailSaleBadge) ? 50 : 0) +
+    (sale.saleFormat === 'in-person-estate-sale' ? 35 : 0) +
+    (sale.coordinateSource === 'detail-page' ? 25 : 0) +
+    (sale.street ? 25 : 0) +
+    (sale.addressLabel ? 15 : 0) +
+    (sale.dateText ? 10 : 0) +
+    (Array.isArray(sale.scheduleEntries) ? sale.scheduleEntries.length * 8 : 0) +
+    (Array.isArray(sale.detailDateKeys) ? sale.detailDateKeys.length * 6 : 0) +
+    (sale.statusText ? 5 : 0) +
+    (sale.imageCount || 0)
+  );
+}
+
 function dedupeSales(sales = []) {
   const map = new Map();
 
   for (const sale of sales) {
-    const key =
-      sale.url || `${sale.title}-${sale.city}-${sale.zip}-${sale.dateText}`;
+    const key = getSaleDedupeKey(sale);
 
     if (!map.has(key)) {
       map.set(key, sale);
@@ -2343,22 +2391,7 @@ function dedupeSales(sales = []) {
     }
 
     const existing = map.get(key);
-
-    const existingScore =
-      (existing.imageCount || 0) +
-      (existing.statusText ? 10 : 0) +
-      (existing.dateText ? 5 : 0) +
-      (existing.street ? 25 : 0) +
-      (existing.coordinateSource === 'detail-page' ? 20 : 0);
-
-    const incomingScore =
-      (sale.imageCount || 0) +
-      (sale.statusText ? 10 : 0) +
-      (sale.dateText ? 5 : 0) +
-      (sale.street ? 25 : 0) +
-      (sale.coordinateSource === 'detail-page' ? 20 : 0);
-
-    if (incomingScore > existingScore) {
+    if (getSaleQualityScore(sale) > getSaleQualityScore(existing)) {
       map.set(key, sale);
     }
   }
@@ -3309,7 +3342,10 @@ async function fetchAllEstateSales(
 
       // Do not fall back to all days when the user selected Today/Tomorrow.
       // That fallback is what made Saturday/Friday cards appear under Today.
-      dayFiltered = strictDayMatches;
+      dayFiltered =
+        normalizedRequestedDay === 'upcoming'
+          ? dedupeSales(strictDayMatches)
+          : strictDayMatches;
     } else {
       dayFiltered = calendarNormalized;
     }
@@ -3347,7 +3383,7 @@ async function fetchAllEstateSales(
     requestedRadiusMiles,
     requestedOrigin,
   );
-  const sorted = sortSales(radiusFiltered);
+  const sorted = sortSales(dedupeSales(radiusFiltered));
 
   console.log(
     `[estate-sales-route] ${ESTATE_ROUTE_VERSION} response ` +
