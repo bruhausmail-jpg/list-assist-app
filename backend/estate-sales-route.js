@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v53-upcoming-include-lower-future-section';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v53-upcoming-include-lower-future-section';
+const ESTATE_ROUTE_VERSION = 'source-assist-v54-render-upcoming-2-14-no-cache';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v54-render-upcoming-2-14-no-cache';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -26,7 +26,10 @@ const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
 const estateSalesSearchCache = new Map();
-const ESTATE_SALES_CACHE_TTL_MS = 10 * 60 * 1000;
+// Keep backend results fresh while tuning the mobile app. The frontend also sends
+// _ / _t / cacheBust values, but disabling this in-memory route cache prevents
+// stale Upcoming counts from surviving after a Render redeploy.
+const ESTATE_SALES_CACHE_TTL_MS = 0;
 
 function setNoCacheHeaders(res) {
   if (!res || typeof res.set !== 'function') return;
@@ -113,6 +116,8 @@ function getCachedEstateSalesPool(
   requestedRadiusMiles = null,
   requestedOrigin = {},
 ) {
+  if (!ESTATE_SALES_CACHE_TTL_MS || ESTATE_SALES_CACHE_TTL_MS <= 0) return null;
+
   const cacheKey = buildEstateSalesCacheKey(
     requestedDay,
     searchZips,
@@ -139,6 +144,8 @@ function setCachedEstateSalesPool(
   requestedRadiusMiles = null,
   requestedOrigin = {},
 ) {
+  if (!ESTATE_SALES_CACHE_TTL_MS || ESTATE_SALES_CACHE_TTL_MS <= 0) return;
+
   const cacheKey = buildEstateSalesCacheKey(
     requestedDay,
     searchZips,
@@ -1050,6 +1057,14 @@ function getTargetDateKeyForRequestedDay(requestedDay = '') {
   return '';
 }
 
+function getUpcomingDateWindowKeys() {
+  const todayKey = getChicagoDateKey(new Date());
+  return {
+    upcomingStartDate: addDaysToDateKey(todayKey, 2),
+    upcomingEndDate: addDaysToDateKey(todayKey, UPCOMING_MAX_DAYS_OUT),
+  };
+}
+
 function dateKeyFromDetailMonthDay(monthText = '', dayText = '', fallbackYear = null) {
   const monthNumber = monthNameToNumber(monthText);
   const dayNumber = Number(String(dayText || '').replace(/\D+/g, ''));
@@ -1333,9 +1348,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   // in the Upcoming window, but it still blocks sales that only show Today or
   // Tomorrow dates. Today/Tomorrow behavior above is untouched.
   if (normalizedRequestedDay === 'upcoming') {
-    const todayKey = getChicagoDateKey(new Date());
-    const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
-    const maxUpcomingDateKey = addDaysToDateKey(todayKey, UPCOMING_MAX_DAYS_OUT);
+    const { upcomingStartDate: dayAfterTomorrowKey, upcomingEndDate: maxUpcomingDateKey } = getUpcomingDateWindowKeys();
 
     if (sale.detailFetched !== true) return false;
     if (sale.detailSaleBadgeConfirmed !== true) return false;
@@ -2976,9 +2989,7 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
   // capped at 14 days out, so the app never renders it as a Today/Tomorrow
   // result or floods with far-future listings.
   if (normalizedRequestedDay === 'upcoming') {
-    const todayKey = getChicagoDateKey(new Date());
-    const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
-    const maxUpcomingDateKey = addDaysToDateKey(todayKey, UPCOMING_MAX_DAYS_OUT);
+    const { upcomingStartDate: dayAfterTomorrowKey, upcomingEndDate: maxUpcomingDateKey } = getUpcomingDateWindowKeys();
     const dateKeys = [];
     const seenDateKeys = new Set();
     const pushDateKey = (value) => {
@@ -3766,7 +3777,17 @@ async function fetchAllEstateSales(
     requestedRadiusMiles,
     requestedOrigin,
   );
-  const sorted = sortSales(dedupeSales(radiusFiltered));
+
+  // Final contract guard for the mobile frontend:
+  // Upcoming is always 2 days out through 14 days out, in-person only,
+  // exact Estate Sale badge confirmed on the detail page, and inside radius.
+  // This keeps /api/estate-sales?day=upcoming aligned with the app's Upcoming tab.
+  const contractFiltered =
+    normalizedRequestedDay === 'upcoming'
+      ? radiusFiltered.filter((sale) => saleMatchesRequestedDetailDate(sale, 'upcoming'))
+      : radiusFiltered;
+
+  const sorted = sortSales(dedupeSales(contractFiltered));
 
   console.log(
     `[estate-sales-route] ${ESTATE_ROUTE_VERSION} response ` +
@@ -3774,6 +3795,7 @@ async function fetchAllEstateSales(
         cacheHit,
         dayFiltered: dayFiltered.length,
         radiusFiltered: radiusFiltered.length,
+        contractFiltered: contractFiltered.length,
         requestedDay: normalizedRequestedDay || null,
         requestedRadiusMiles: requestedRadiusMiles ?? null,
         requestedLatitude: requestedOrigin?.latitude ?? null,
@@ -3818,13 +3840,17 @@ router.get('/', async (req, res) => {
       requestedOrigin,
     );
     const sourceAssistSales = sales.map(formatSaleForSourceAssist);
+    const upcomingWindow = requestedDay === 'upcoming' ? getUpcomingDateWindowKeys() : {};
 
     return res.json({
       success: true,
       routeVersion: ESTATE_ROUTE_VERSION,
+      deployTarget: 'render',
       source: 'estatesales-net',
       requestedDay,
       requestedRadiusMiles,
+      upcomingMaxDaysOut: requestedDay === 'upcoming' ? UPCOMING_MAX_DAYS_OUT : null,
+      ...upcomingWindow,
       count: sourceAssistSales.length,
       searchMode: 'multi-city-radius-sweep',
       fetchedAt: new Date().toISOString(),
@@ -3843,6 +3869,7 @@ router.get('/', async (req, res) => {
       warning: 'ESTATE_SALES_FETCH_FAILED_EMPTY_RESULTS_RETURNED',
       message: error?.message || 'EstateSales.net fetch failed',
       routeVersion: ESTATE_ROUTE_VERSION,
+      deployTarget: 'render',
       source: 'estatesales-net',
       requestedDay,
       requestedRadiusMiles,
