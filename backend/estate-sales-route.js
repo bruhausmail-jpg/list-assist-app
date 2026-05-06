@@ -1059,11 +1059,23 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
     ? sale.detailDateKeys.map((key) => String(key || '').slice(0, 10)).filter(Boolean)
     : [];
 
-  // Once detail-page date cards are available, they are the source of truth.
-  // This blocks search-result bleed-through such as a nearby “May 5 to May 8”
-  // snippet making a Thu/Fri/Sat sale appear under Today.
+  // Primary: use extracted detail date keys
   if (detailDateKeys.length) {
     return detailDateKeys.includes(targetDateKey);
+  }
+
+  // NEW: fallback for edge cases where schedule parser misses single-day cards
+  if (sale.searchHasFullAddress === true && sale.detailFetched === true) {
+    const todayWeekday = getChicagoDateParts(new Date()).weekday.toLowerCase();
+    const dayLabel = String(sale.dayLabel || '').toLowerCase();
+    const dateText = String(sale.dateText || '').toLowerCase();
+
+    if (
+      dayLabel.includes(todayWeekday.slice(0, 3)) ||
+      dateText.includes('today')
+    ) {
+      return true;
+    }
   }
 
   return saleMatchesRequestedDay(sale, requestedDay);
