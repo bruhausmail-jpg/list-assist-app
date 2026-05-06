@@ -7,7 +7,7 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v37-fix-estatesales-url-state';
+const ESTATE_ROUTE_VERSION = 'source-assist-v38-strict-today-full-address-date';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1057,6 +1057,15 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   if (!targetDateKey) return true;
 
   const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+
+  const hasFullAddress =
+    sale.searchHasFullAddress === true ||
+    streetHasHouseNumber(sale.street || '') ||
+    streetHasHouseNumber(sale.addressLabel || '') ||
+    streetHasHouseNumber(sale.mapAddress || '') ||
+    streetHasHouseNumber(sale.displayAddress || '') ||
+    streetHasHouseNumber(sale.address || '');
+
   const dateKeyCandidates = [];
   const pushDateKey = (value) => {
     const raw = String(value || '').trim();
@@ -1093,15 +1102,25 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   pushDateKey(sale.saleDateTime);
   pushDateKey(sale.date);
 
-  if (dateKeyCandidates.includes(targetDateKey)) return true;
+  const hasExactTodayDate = dateKeyCandidates.includes(targetDateKey);
 
-  // User-approved Today rule: if a physical sale has a full address and the
-  // listing/detail text says it is Today, it passes. Do not require the small
-  // badge area to say "Estate Sale".
+  // Today rule, locked down:
+  // A sale gets into Today only when it has a full address AND the sale's own
+  // detail/listing date evidence shows today. If date keys exist and none are
+  // today's date, it must stay out even if nearby snippet text says "Going on Now".
   if (normalizedRequestedDay === 'today') {
+    if (!hasFullAddress) return false;
+
+    if (hasExactTodayDate) return true;
+
+    // If we have explicit date keys but none match today, trust those keys and reject it.
+    // This blocks tomorrow sales with full addresses from sneaking into Today.
+    if (dateKeyCandidates.length) return false;
+
     const todayWeekday = getChicagoDateParts(new Date()).weekday.toLowerCase();
     const todayShort = todayWeekday.slice(0, 3);
     const todayMonthDay = getChicagoMonthDayLabel(new Date()).toLowerCase();
+
     const searchableText = [
       sale.statusText,
       sale.dateText,
@@ -1115,13 +1134,14 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
       .join(' ')
       .toLowerCase();
 
-    if (
+    const saysToday =
       /\b(today|starts today|ends today|going on now)\b/i.test(searchableText) ||
-      (searchableText.includes(todayShort) && searchableText.includes(todayMonthDay))
-    ) {
-      return true;
-    }
+      (searchableText.includes(todayShort) && searchableText.includes(todayMonthDay));
+
+    return saysToday;
   }
+
+  if (hasExactTodayDate) return true;
 
   return saleMatchesRequestedDay(sale, requestedDay);
 }
