@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v27-today-physical-estatesale-confirmed';
+const ESTATE_ROUTE_VERSION = 'source-assist-v28-today-address-helper-fixed';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1455,6 +1455,60 @@ function extractEstateSaleLinksFromHtml(html = '') {
   return links;
 }
 
+
+function extractSearchResultFullAddress(snippet = '', fallbackLocation = {}) {
+  const text = stripHtml(snippet);
+  if (!text) return null;
+
+  const streetTypes =
+    '(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Court|Ct|Circle|Cir|Boulevard|Blvd|Place|Pl|Way|Terrace|Ter|Parkway|Pkwy|Highway|Hwy|Trail|Trl|Cove|Cv|Loop|Square|Sq|Bell)';
+
+  const fullAddressPatterns = [
+    new RegExp(
+      `\\b(\\d{2,6}[A-Za-z0-9-]*\\s+[A-Za-z0-9.'#&\\-\\s]{2,80}\\s+${streetTypes}\\.?)\\s*,\\s*([A-Za-z][A-Za-z.'\\-\\s]{2,40})\\s*,?\\s*(IL|Illinois)?\\s*(\\d{5})?\\b`,
+      'i',
+    ),
+    new RegExp(
+      `\\b(\\d{2,6}[A-Za-z0-9-]*\\s+[A-Za-z0-9.'#&\\-\\s]{2,80}\\s+${streetTypes}\\.?)\\s+([A-Za-z][A-Za-z.'\\-\\s]{2,40})\\s+(IL|Illinois)\\s*(\\d{5})?\\b`,
+      'i',
+    ),
+  ];
+
+  for (const pattern of fullAddressPatterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+
+    const street = normalizeAddressLine(match[1] || '');
+    const city = normalizeAddressLine(match[2] || fallbackLocation.city || '');
+    const state = normalizeAddressLine(match[3] || fallbackLocation.state || 'IL');
+    const zip = normalizeAddressLine(match[4] || fallbackLocation.zip || '');
+
+    if (!streetHasHouseNumber(street) || !city) continue;
+
+    const addressLabel = buildAddressLabel({ street, city, state, zip });
+    if (!addressLabel) continue;
+
+    return {
+      street,
+      city,
+      state,
+      zip,
+      addressLabel,
+      searchHasFullAddress: true,
+    };
+  }
+
+  const visibleAddress = extractStreetAddressFromVisibleText(snippet, fallbackLocation);
+  if (visibleAddress?.street && streetHasHouseNumber(visibleAddress.street)) {
+    return {
+      ...visibleAddress,
+      searchHasFullAddress: true,
+    };
+  }
+
+  return null;
+}
+
 function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
   const results = [];
   const seenUrls = new Set();
@@ -1512,9 +1566,9 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
 
     const location = extractLocationFromUrl(absoluteUrl);
     const searchAddress = extractSearchResultFullAddress(snippet, {
-      city: searchAddress?.city || location.city || '',
-      state: searchAddress?.state || location.state || 'IL',
-      zip: searchAddress?.zip || location.zip || requestedZip || '',
+      city: location.city || '',
+      state: location.state || 'IL',
+      zip: location.zip || requestedZip || '',
     });
     const title = extractTitle(snippet, absoluteUrl);
     const statusText = extractStatusText(snippet);
