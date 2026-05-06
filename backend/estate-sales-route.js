@@ -7,18 +7,18 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v49-upcoming-project-future-dates';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v49-upcoming-project-future-dates';
+const ESTATE_ROUTE_VERSION = 'source-assist-v50-true-50-mile-radius-sweep';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v50-true-50-mile-radius-sweep';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
-const MAX_RESULTS = 100;
+const MAX_RESULTS = 150;
 const DETAIL_FETCH_DELAY_MS = 700;
-const MAX_DETAIL_FETCHES = 90;
+const MAX_DETAIL_FETCHES = 140;
 const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
-const ZIP_FETCH_CONCURRENCY = 4;
-const DETAIL_FETCH_CONCURRENCY = 6;
-const DETAIL_ENRICH_TARGET_COUNT = 90;
+const ZIP_FETCH_CONCURRENCY = 5;
+const DETAIL_FETCH_CONCURRENCY = 8;
+const DETAIL_ENRICH_TARGET_COUNT = 140;
 const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
@@ -2097,64 +2097,104 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
 
 
 const ESTATE_SALES_CITY_ZIP_SEEDS = [
-  // West / southwest suburbs around Naperville.
-  { city: 'Naperville', zip: '60565' },
-  { city: 'Naperville', zip: '60563' },
-  { city: 'Naperville', zip: '60540' },
-  { city: 'Aurora', zip: '60504' },
-  { city: 'Aurora', zip: '60506' },
-  { city: 'North Aurora', zip: '60542' },
-  { city: 'Plainfield', zip: '60544' },
-  { city: 'Oswego', zip: '60543' },
-  { city: 'Montgomery', zip: '60538' },
-  { city: 'Yorkville', zip: '60560' },
-  { city: 'Bolingbrook', zip: '60440' },
-  { city: 'Romeoville', zip: '60446' },
-  { city: 'Lockport', zip: '60441' },
-  { city: 'Woodridge', zip: '60517' },
-  { city: 'Darien', zip: '60561' },
-  { city: 'Downers Grove', zip: '60515' },
-  { city: 'Lisle', zip: '60532' },
-  { city: 'Warrenville', zip: '60555' },
-  { city: 'Winfield', zip: '60190' },
-  { city: 'Wheaton', zip: '60187' },
-  { city: 'Glen Ellyn', zip: '60137' },
-  { city: 'Lombard', zip: '60148' },
-  { city: 'Villa Park', zip: '60181' },
-  { city: 'Batavia', zip: '60510' },
-  { city: 'Geneva', zip: '60134' },
-  { city: 'St Charles', zip: '60174' },
-  { city: 'Elgin', zip: '60120' },
-  { city: 'South Elgin', zip: '60177' },
-  { city: 'Joliet', zip: '60435' },
-  { city: 'Joliet', zip: '60404' },
-  { city: 'Shorewood', zip: '60404' },
-  { city: 'New Lenox', zip: '60451' },
-  { city: 'Mokena', zip: '60448' },
-  { city: 'Frankfort', zip: '60423' },
-  { city: 'Lemont', zip: '60439' },
-  { city: 'Homer Glen', zip: '60491' },
-  { city: 'Elmhurst', zip: '60126' },
-  { city: 'Oak Brook', zip: '60523' },
-  { city: 'Hinsdale', zip: '60521' },
-  { city: 'La Grange', zip: '60525' },
-  { city: 'Western Springs', zip: '60558' },
-  { city: 'Brookfield', zip: '60513' },
-  { city: 'Orland Park', zip: '60462' },
-  { city: 'Tinley Park', zip: '60477' },
-  { city: 'Palos Heights', zip: '60463' },
-  { city: 'Schaumburg', zip: '60193' },
-  { city: 'Streamwood', zip: '60107' },
-  { city: 'Bartlett', zip: '60103' },
-  { city: 'Carol Stream', zip: '60188' },
-  { city: 'Addison', zip: '60101' },
-  { city: 'Roselle', zip: '60172' },
-  // Chicago edge pages that EstateSales.net surfaces from nearby suburban pages.
-  { city: 'Chicago', zip: '60618' },
-  { city: 'Chicago', zip: '60624' },
-  { city: 'Chicago', zip: '60641' },
-  { city: 'Berwyn', zip: '60402' },
-  { city: 'Oak Park', zip: '60302' },
+  // 50-mile Source Assist sweep around Naperville.
+  // Each target is a real EstateSales.net city/ZIP page. The route fetches all
+  // targets within the requested radius + a small buffer, then still applies the
+  // final GPS radius filter after detail-page coordinates are known. This fixes
+  // missed sales like Bolingbrook 60490 that do not always surface from only the
+  // Naperville origin page.
+  { city: 'Naperville', zip: '60565', latitude: 41.7508, longitude: -88.1535 },
+  { city: 'Naperville', zip: '60563', latitude: 41.7990, longitude: -88.1450 },
+  { city: 'Naperville', zip: '60540', latitude: 41.7670, longitude: -88.1487 },
+  { city: 'Aurora', zip: '60504', latitude: 41.7456, longitude: -88.2152 },
+  { city: 'Aurora', zip: '60506', latitude: 41.7706, longitude: -88.3431 },
+  { city: 'Aurora', zip: '60502', latitude: 41.7865, longitude: -88.2556 },
+  { city: 'North Aurora', zip: '60542', latitude: 41.8061, longitude: -88.3273 },
+  { city: 'Plainfield', zip: '60544', latitude: 41.6160, longitude: -88.2039 },
+  { city: 'Plainfield', zip: '60585', latitude: 41.7000, longitude: -88.2400 },
+  { city: 'Oswego', zip: '60543', latitude: 41.6832, longitude: -88.3388 },
+  { city: 'Montgomery', zip: '60538', latitude: 41.7306, longitude: -88.3459 },
+  { city: 'Yorkville', zip: '60560', latitude: 41.6411, longitude: -88.4473 },
+  { city: 'Sugar Grove', zip: '60554', latitude: 41.7614, longitude: -88.4437 },
+  { city: 'Bolingbrook', zip: '60440', latitude: 41.7003, longitude: -88.0718 },
+  { city: 'Bolingbrook', zip: '60490', latitude: 41.7050, longitude: -88.1250 },
+  { city: 'Romeoville', zip: '60446', latitude: 41.6475, longitude: -88.0895 },
+  { city: 'Lockport', zip: '60441', latitude: 41.5895, longitude: -88.0578 },
+  { city: 'Crest Hill', zip: '60403', latitude: 41.5548, longitude: -88.0987 },
+  { city: 'Joliet', zip: '60435', latitude: 41.5445, longitude: -88.1286 },
+  { city: 'Joliet', zip: '60431', latitude: 41.5341, longitude: -88.1998 },
+  { city: 'Joliet', zip: '60432', latitude: 41.5250, longitude: -88.0817 },
+  { city: 'Shorewood', zip: '60404', latitude: 41.5200, longitude: -88.2017 },
+  { city: 'Minooka', zip: '60447', latitude: 41.4553, longitude: -88.2617 },
+  { city: 'Channahon', zip: '60410', latitude: 41.4295, longitude: -88.2287 },
+  { city: 'Woodridge', zip: '60517', latitude: 41.7469, longitude: -88.0503 },
+  { city: 'Darien', zip: '60561', latitude: 41.7519, longitude: -87.9739 },
+  { city: 'Downers Grove', zip: '60515', latitude: 41.8089, longitude: -88.0112 },
+  { city: 'Downers Grove', zip: '60516', latitude: 41.7675, longitude: -88.0140 },
+  { city: 'Lisle', zip: '60532', latitude: 41.8011, longitude: -88.0748 },
+  { city: 'Warrenville', zip: '60555', latitude: 41.8178, longitude: -88.1734 },
+  { city: 'Winfield', zip: '60190', latitude: 41.8703, longitude: -88.1609 },
+  { city: 'Wheaton', zip: '60187', latitude: 41.8661, longitude: -88.1070 },
+  { city: 'Wheaton', zip: '60189', latitude: 41.8358, longitude: -88.1012 },
+  { city: 'Glen Ellyn', zip: '60137', latitude: 41.8775, longitude: -88.0670 },
+  { city: 'Lombard', zip: '60148', latitude: 41.8800, longitude: -88.0078 },
+  { city: 'Villa Park', zip: '60181', latitude: 41.8898, longitude: -87.9789 },
+  { city: 'Batavia', zip: '60510', latitude: 41.8500, longitude: -88.3126 },
+  { city: 'Geneva', zip: '60134', latitude: 41.8875, longitude: -88.3054 },
+  { city: 'St Charles', zip: '60174', latitude: 41.9137, longitude: -88.3110 },
+  { city: 'South Elgin', zip: '60177', latitude: 41.9942, longitude: -88.2923 },
+  { city: 'Elgin', zip: '60120', latitude: 42.0354, longitude: -88.2826 },
+  { city: 'New Lenox', zip: '60451', latitude: 41.5119, longitude: -87.9656 },
+  { city: 'Mokena', zip: '60448', latitude: 41.5261, longitude: -87.8892 },
+  { city: 'Frankfort', zip: '60423', latitude: 41.4959, longitude: -87.8487 },
+  { city: 'Lemont', zip: '60439', latitude: 41.6736, longitude: -87.9876 },
+  { city: 'Homer Glen', zip: '60491', latitude: 41.6000, longitude: -87.9381 },
+  { city: 'Orland Park', zip: '60462', latitude: 41.6303, longitude: -87.8539 },
+  { city: 'Tinley Park', zip: '60477', latitude: 41.5734, longitude: -87.7845 },
+  { city: 'Tinley Park', zip: '60487', latitude: 41.5652, longitude: -87.8308 },
+  { city: 'Palos Heights', zip: '60463', latitude: 41.6681, longitude: -87.7964 },
+  { city: 'Oak Forest', zip: '60452', latitude: 41.6028, longitude: -87.7439 },
+  { city: 'Alsip', zip: '60803', latitude: 41.6689, longitude: -87.7387 },
+  { city: 'Willowbrook', zip: '60527', latitude: 41.7698, longitude: -87.9359 },
+  { city: 'Burr Ridge', zip: '60527', latitude: 41.7489, longitude: -87.9184 },
+  { city: 'Hinsdale', zip: '60521', latitude: 41.8009, longitude: -87.9370 },
+  { city: 'Oak Brook', zip: '60523', latitude: 41.8398, longitude: -87.9536 },
+  { city: 'Elmhurst', zip: '60126', latitude: 41.8995, longitude: -87.9403 },
+  { city: 'Addison', zip: '60101', latitude: 41.9317, longitude: -87.9889 },
+  { city: 'Carol Stream', zip: '60188', latitude: 41.9125, longitude: -88.1348 },
+  { city: 'Bartlett', zip: '60103', latitude: 41.9950, longitude: -88.1856 },
+  { city: 'Streamwood', zip: '60107', latitude: 42.0256, longitude: -88.1784 },
+  { city: 'Roselle', zip: '60172', latitude: 41.9847, longitude: -88.0798 },
+  { city: 'Schaumburg', zip: '60193', latitude: 42.0216, longitude: -88.0798 },
+  { city: 'La Grange', zip: '60525', latitude: 41.8050, longitude: -87.8692 },
+  { city: 'Western Springs', zip: '60558', latitude: 41.8098, longitude: -87.9006 },
+  { city: 'Brookfield', zip: '60513', latitude: 41.8239, longitude: -87.8517 },
+  { city: 'Berwyn', zip: '60402', latitude: 41.8506, longitude: -87.7937 },
+  { city: 'Oak Park', zip: '60302', latitude: 41.8917, longitude: -87.7897 },
+  { city: 'Riverside', zip: '60546', latitude: 41.8350, longitude: -87.8228 },
+  { city: 'Forest Park', zip: '60130', latitude: 41.8795, longitude: -87.8137 },
+  { city: 'Chicago', zip: '60655', latitude: 41.6947, longitude: -87.7037 },
+  { city: 'Chicago', zip: '60643', latitude: 41.7002, longitude: -87.6628 },
+  { city: 'Chicago', zip: '60652', latitude: 41.7460, longitude: -87.7140 },
+  { city: 'Chicago', zip: '60638', latitude: 41.7870, longitude: -87.7710 },
+  { city: 'Chicago', zip: '60629', latitude: 41.7759, longitude: -87.7115 },
+  { city: 'Chicago', zip: '60641', latitude: 41.9460, longitude: -87.7460 },
+  { city: 'Chicago', zip: '60618', latitude: 41.9465, longitude: -87.7024 },
+  { city: 'Chicago', zip: '60624', latitude: 41.8810, longitude: -87.7220 },
+  { city: 'Chicago', zip: '60660', latitude: 41.9910, longitude: -87.6660 },
+  { city: 'Chicago', zip: '60626', latitude: 42.0090, longitude: -87.6690 },
+  { city: 'Chicago', zip: '60622', latitude: 41.9020, longitude: -87.6810 },
+  { city: 'Evanston', zip: '60201', latitude: 42.0641, longitude: -87.7322 },
+  { city: 'Skokie', zip: '60076', latitude: 42.0347, longitude: -87.7571 },
+  { city: 'Des Plaines', zip: '60016', latitude: 42.0451, longitude: -87.8869 },
+  { city: 'Arlington Heights', zip: '60004', latitude: 42.1139, longitude: -87.9806 },
+  { city: 'Wheeling', zip: '60090', latitude: 42.1396, longitude: -87.9455 },
+  { city: 'Gary', zip: '46410', state: 'IN', latitude: 41.4839, longitude: -87.3328 },
+  { city: 'Dyer', zip: '46311', state: 'IN', latitude: 41.4942, longitude: -87.5217 },
+  { city: 'St John', zip: '46373', state: 'IN', latitude: 41.4500, longitude: -87.4700 },
+  { city: 'Saint John', zip: '46373', state: 'IN', latitude: 41.4500, longitude: -87.4700 },
+  { city: 'Schererville', zip: '46375', state: 'IN', latitude: 41.4789, longitude: -87.4548 },
+  { city: 'Merrillville', zip: '46410', state: 'IN', latitude: 41.4828, longitude: -87.3328 },
 ];
 
 function normalizeCitySlug(city = '') {
@@ -2168,60 +2208,72 @@ function getEstateSalesSearchTargets(
   requestedZip = '60565',
   requestedCity = 'Naperville',
   _requestedRadiusMiles = 50,
+  requestedOrigin = {},
 ) {
   const targets = [];
   const seen = new Set();
 
-  const addTarget = (city, zip) => {
+  const addTarget = (city, zip, state = 'IL', latitude = null, longitude = null, distanceFromOrigin = null) => {
     const cleanCity = String(city || '').split(',')[0].trim();
     const cleanZip = String(zip || '').trim().replace(/[^0-9]/g, '');
     if (!cleanCity || !cleanZip) return;
     const key = `${cleanCity.toLowerCase()}|${cleanZip}`;
     if (seen.has(key)) return;
     seen.add(key);
-    targets.push({ city: cleanCity, zip: cleanZip });
+    targets.push({
+      city: cleanCity,
+      zip: cleanZip,
+      state: String(state || 'IL').toUpperCase(),
+      latitude,
+      longitude,
+      distanceFromOrigin,
+    });
   };
 
-  // Always start with the user's actual EstateSales.net city/ZIP origin page.
+  const radius = Number(_requestedRadiusMiles) || 50;
+  const originLatitude = Number(requestedOrigin?.latitude);
+  const originLongitude = Number(requestedOrigin?.longitude);
+  const hasOriginCoordinates = Number.isFinite(originLatitude) && Number.isFinite(originLongitude);
+  const radiusBufferMiles = radius >= 50 ? 8 : 4;
+
+  // Always fetch the user's selected origin page first.
   addTarget(requestedCity || 'Naperville', requestedZip || '60565');
 
-  const radius = Number(_requestedRadiusMiles) || 0;
+  const seedCandidates = ESTATE_SALES_CITY_ZIP_SEEDS
+    .map((seed) => {
+      const seedLatitude = Number(seed.latitude);
+      const seedLongitude = Number(seed.longitude);
+      const distanceFromOrigin = hasOriginCoordinates && Number.isFinite(seedLatitude) && Number.isFinite(seedLongitude)
+        ? calculateDistanceMiles(originLatitude, originLongitude, seedLatitude, seedLongitude)
+        : null;
 
-  // EstateSales.net can surface day-of physical sales from nearby city pages,
-  // especially around Chicago. For Today, keep discovery broad enough to find
-  // those real physical sales, then filter them hard: full address on the search
-  // card + exact "Estate Sale" badge on the detail page + requested-day match.
-  if (radius >= 25) {
-    [
-      ['Chicago', '60643'],
-      ['Chicago', '60655'],
-      ['Chicago', '60652'],
-      ['Chicago', '60638'],
-      ['Willowbrook', '60527'],
-      ['Burr Ridge', '60527'],
-      ['Hinsdale', '60521'],
-      ['La Grange', '60525'],
-    ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
-  }
+      return {
+        ...seed,
+        distanceFromOrigin,
+      };
+    })
+    .filter((seed) => {
+      // If GPS coordinates are available, use them to make this a real radius
+      // sweep instead of a hard-coded handful of city pages. The small buffer
+      // keeps edge-of-radius sales discoverable before the final detail-page
+      // radius filter runs.
+      if (hasOriginCoordinates && Number.isFinite(seed.distanceFromOrigin)) {
+        return seed.distanceFromOrigin <= radius + radiusBufferMiles;
+      }
 
-  if (radius >= 50) {
-    [
-      ['Chicago', '60618'],
-      ['Chicago', '60624'],
-      ['Chicago', '60641'],
-      ['Chicago', '60629'],
-      ['Chicago', '60660'],
-      ['Oak Park', '60302'],
-      ['Berwyn', '60402'],
-      ['Orland Park', '60462'],
-      ['Tinley Park', '60477'],
-      ['Schaumburg', '60193'],
-      ['Elmhurst', '60126'],
-      ['Downers Grove', '60515'],
-      ['St John', '46373'],
-      ['Saint John', '46373'],
-    ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
-  }
+      // Without GPS, keep the curated list broad for 50 miles and narrower for
+      // smaller radius requests.
+      return radius >= 50 || String(seed.zip || '') === String(requestedZip || '');
+    })
+    .sort((a, b) => {
+      const aDistance = Number.isFinite(a.distanceFromOrigin) ? a.distanceFromOrigin : Number.MAX_SAFE_INTEGER;
+      const bDistance = Number.isFinite(b.distanceFromOrigin) ? b.distanceFromOrigin : Number.MAX_SAFE_INTEGER;
+      return aDistance - bDistance;
+    });
+
+  seedCandidates.forEach((seed) => {
+    addTarget(seed.city, seed.zip, seed.state || 'IL', seed.latitude, seed.longitude, seed.distanceFromOrigin);
+  });
 
   return targets;
 }
@@ -3399,6 +3451,7 @@ async function fetchAllEstateSales(
     searchZip,
     city,
     requestedRadiusMiles || 50,
+    requestedOrigin,
   );
   const cacheKeyZips = searchTargets.map((target) => target.zip);
   const cachedDayFiltered = getCachedEstateSalesPool(
@@ -3540,7 +3593,7 @@ async function fetchAllEstateSales(
 
 router.get('/', async (req, res) => {
   setNoCacheHeaders(res);
-  console.log(`[estate-sales-route] ${ESTATE_ROUTE_VERSION} NO_ZIP_SWEEP route start`);
+  console.log(`[estate-sales-route] ${ESTATE_ROUTE_VERSION} RADIUS_SWEEP route start`);
   const requestStartedAt = Date.now();
   // The mobile Source Assist screen labels this view as Today, but current
   // frontend builds have been calling this route without a day parameter:
@@ -3578,7 +3631,7 @@ router.get('/', async (req, res) => {
       requestedDay,
       requestedRadiusMiles,
       count: sourceAssistSales.length,
-      searchMode: 'single-city-zip',
+      searchMode: 'multi-city-radius-sweep',
       fetchedAt: new Date().toISOString(),
       elapsedMs: Date.now() - requestStartedAt,
       sales: sourceAssistSales,
@@ -3599,7 +3652,7 @@ router.get('/', async (req, res) => {
       requestedDay,
       requestedRadiusMiles,
       count: 0,
-      searchMode: 'single-city-zip',
+      searchMode: 'multi-city-radius-sweep',
       fetchedAt: new Date().toISOString(),
       elapsedMs: Date.now() - requestStartedAt,
       sales: [],
