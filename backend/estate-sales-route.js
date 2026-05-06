@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v46-upcoming-date-text-badge-only';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v46-upcoming-date-text-badge-only';
+const ESTATE_ROUTE_VERSION = 'source-assist-v47-upcoming-exclude-tomorrow';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v47-upcoming-exclude-tomorrow';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1324,10 +1324,10 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   }
 
   // Upcoming rule:
-  // Any sale that is going on 2 days from now or later gets through ONLY when
-  // the detail-page little badge section is exactly "Estate Sale".
-  // It can prove the upcoming date from structured detail keys OR visible date
-  // text like "May 8, 9, 10". Today/Tomorrow behavior above is untouched.
+  // Upcoming means the sale STARTS day-after-tomorrow or later.
+  // Do not include Tomorrow sales, even if they also continue into later days.
+  // It still must have the exact detail-page badge text "Estate Sale".
+  // Today/Tomorrow behavior above is untouched.
   if (normalizedRequestedDay === 'upcoming') {
     const todayKey = getChicagoDateKey(new Date());
     const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
@@ -1352,11 +1352,15 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
 
     const allDateKeys = Array.from(
       new Set([...uniqueDateKeyCandidates, ...textDateKeys].filter(Boolean)),
-    );
+    )
+      .filter((key) => /^20\d{2}-\d{2}-\d{2}$/.test(key))
+      .sort();
 
-    return allDateKeys.some(
-      (key) => /^20\d{2}-\d{2}-\d{2}$/.test(key) && key >= dayAfterTomorrowKey,
-    );
+    if (!allDateKeys.length) return false;
+
+    const firstSaleDateKey = allDateKeys[0];
+
+    return firstSaleDateKey >= dayAfterTomorrowKey;
   }
 
   if (hasExactTodayDate) return true;
