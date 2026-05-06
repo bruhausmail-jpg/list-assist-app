@@ -7,21 +7,21 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v55-upcoming-full-app-request-deeper-discovery';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v55-upcoming-full-app-request-deeper-discovery';
+const ESTATE_ROUTE_VERSION = 'source-assist-v56-upcoming-date-range-and-deeper-pages';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v56-upcoming-date-range-and-deeper-pages';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
-const REQUEST_TIMEOUT_MS = 15000;
+const REQUEST_TIMEOUT_MS = 20000;
 const MAX_RESULTS = 150;
 const DETAIL_FETCH_DELAY_MS = 700;
-const MAX_DETAIL_FETCHES = 360;
+const MAX_DETAIL_FETCHES = 520;
 const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
 const ZIP_FETCH_CONCURRENCY = 3;
-const DETAIL_FETCH_CONCURRENCY = 6;
-const DETAIL_ENRICH_TARGET_COUNT = 360;
+const DETAIL_FETCH_CONCURRENCY = 5;
+const DETAIL_ENRICH_TARGET_COUNT = 520;
 const UPCOMING_MAX_DAYS_OUT = 14;
 const ESTATE_SALES_DEFAULT_PAGE_LIMIT = 1;
-const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 8;
+const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 14;
 const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
@@ -3072,11 +3072,19 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
       .sort((a, b) => String(a.startDate).localeCompare(String(b.startDate)));
 
     const firstFutureKey = futureDateKeys[0];
+    const displayDateRangeLabel = futureDateKeys
+      .map((key) => monthDayLabelFromDateKey(key))
+      .filter(Boolean)
+      .join(', ');
+    const displayDayRangeLabel = futureDateKeys.length > 1
+      ? displayDateRangeLabel
+      : weekdayLabelFromDateKey(firstFutureKey);
+
     const matchedEntry =
       futureEntries.find((entry) => String(entry.startDate).slice(0, 10) === firstFutureKey) ||
       {
-        dayLabel: weekdayLabelFromDateKey(firstFutureKey),
-        dateLabel: monthDayLabelFromDateKey(firstFutureKey),
+        dayLabel: displayDayRangeLabel || weekdayLabelFromDateKey(firstFutureKey),
+        dateLabel: displayDateRangeLabel || monthDayLabelFromDateKey(firstFutureKey),
         timeLabel: stripLeadingWeekdayFromTime(sale.timeLabel || sale.openingHours || ''),
         startTime: sale.startTime || '',
         endTime: sale.endTime || '',
@@ -3118,8 +3126,12 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
 
     return {
       ...sale,
-      dayLabel: matchedEntry.dayLabel || weekdayLabelFromDateKey(firstFutureKey) || '',
-      dateLabel: matchedEntry.dateLabel || monthDayLabelFromDateKey(firstFutureKey) || '',
+      // For Upcoming, show the whole eligible 2-14 day date range on the app card.
+      // Otherwise multi-day sales looked like they were only Friday even when
+      // Saturday/Sunday were correctly included in scheduleEntries.
+      dayLabel: displayDayRangeLabel || matchedEntry.dayLabel || weekdayLabelFromDateKey(firstFutureKey) || '',
+      dateLabel: displayDateRangeLabel || matchedEntry.dateLabel || monthDayLabelFromDateKey(firstFutureKey) || '',
+      upcomingDateRangeLabel: displayDateRangeLabel || '',
       timeLabel: stripLeadingWeekdayFromTime(matchedEntry.timeLabel || sale.timeLabel || ''),
       startTime: matchedEntry.startTime || sale.startTime || '',
       endTime: matchedEntry.endTime || sale.endTime || '',
