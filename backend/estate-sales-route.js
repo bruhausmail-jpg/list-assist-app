@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v40-health-cache-verify';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v40-health-cache-verify';
+const ESTATE_ROUTE_VERSION = 'source-assist-v41-full-estatesales-titles';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v41-full-estatesales-titles';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -241,16 +241,69 @@ function extractLocationFromUrl(url = '') {
   };
 }
 
+function cleanEstateSalesVisibleTitle(value = '') {
+  return stripHtml(value)
+    .replace(/\s+/g, ' ')
+    .replace(/^\s*\d+\s+/, '')
+    .replace(/\s+Listed\s+by\s+[\s\S]*$/i, '')
+    .replace(/\s+Privately\s+Listed\s+Sale[\s\S]*$/i, '')
+    .replace(/\s+Last\s+modified[\s\S]*$/i, '')
+    .replace(/\s+starts\s+on\s+\d{1,2}\/\d{1,2}\/20\d{2}\s*$/i, '')
+    .replace(/\s+in\s+[A-Za-z .'-]+,\s*(?:IL|IN)\s+starts\s+on\s+\d{1,2}\/\d{1,2}\/20\d{2}\s*$/i, '')
+    .replace(/^Locally\s+Featured\s+/i, '')
+    .replace(/^[\s•,._=-]+|[\s•,._=-]+$/g, '')
+    .trim();
+}
+
+function extractVisibleEstateSaleTitleFromSnippet(snippet = '') {
+  const text = stripHtml(snippet)
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!text) return '';
+
+  const patterns = [
+    // Most reliable sale-row shape:
+    // "... 22 miles away 146 Candace's Antiques ... Listed by ..."
+    /\b\d+(?:\.\d+)?\s*miles?\s+away\s+(?:\d+\s+)?([A-Z0-9][\s\S]{4,220}?)\s+(?:Listed\s+by|Privately\s+Listed\s+Sale|Last\s+modified)\b/i,
+
+    // Backup when the title is near the picture count:
+    // "... 146 Candace's Antiques ... Listed by ..."
+    /\b\d+\s+(?!miles?\b)([A-Z0-9][\s\S]{4,220}?)\s+(?:Listed\s+by|Privately\s+Listed\s+Sale|Last\s+modified)\b/i,
+  ];
+
+  for (const pattern of patterns) {
+    const matches = [...text.matchAll(pattern)];
+    for (let index = matches.length - 1; index >= 0; index -= 1) {
+      const candidate = cleanEstateSalesVisibleTitle(matches[index]?.[1] || '');
+      if (
+        candidate &&
+        candidate.length >= 5 &&
+        !/^estate\s+sale$/i.test(candidate) &&
+        !/^(today|tomorrow|going on now|starts today|starts tomorrow)$/i.test(candidate) &&
+        !/\b(?:miles?\s+away|pictures?|last\s+modified|listed\s+by)\b/i.test(candidate)
+      ) {
+        return candidate;
+      }
+    }
+  }
+
+  return '';
+}
+
 function extractTitle(snippet = '', absoluteUrl = '') {
+  const visibleListingTitle = extractVisibleEstateSaleTitleFromSnippet(snippet);
+  if (visibleListingTitle) return visibleListingTitle;
+
   const h3Match = snippet.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
   if (h3Match) {
-    const title = stripHtml(h3Match[1]);
+    const title = cleanEstateSalesVisibleTitle(h3Match[1]);
     if (title) return title;
   }
 
   const titleAttrMatch = snippet.match(/title="([^"]+)"/i);
   if (titleAttrMatch) {
-    const title = stripHtml(titleAttrMatch[1]);
+    const title = cleanEstateSalesVisibleTitle(titleAttrMatch[1]);
     if (title) return title;
   }
 
@@ -1505,7 +1558,11 @@ function mergeDetailIntoSale(sale, detail = {}) {
 
   return {
     ...sale,
-    title: detail.title || sale.title || '',
+    title:
+      String(detail.title || '').length >= String(sale.listingTitle || sale.title || '').length
+        ? detail.title
+        : sale.listingTitle || sale.title || '',
+    listingTitle: sale.listingTitle || sale.title || '',
     city: mergedCity,
     state: mergedState,
     zip: mergedZip,
@@ -1848,6 +1905,7 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
       id: makeStableId(absoluteUrl),
       sourceListingId: location.sourceListingId || '',
       title,
+      listingTitle: title,
       saleType,
       saleBadge: 'Estate Sale',
       isOnlineOnly: false,
