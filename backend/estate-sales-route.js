@@ -7,19 +7,21 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v51-upcoming-14-day-window';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v51-upcoming-14-day-window';
+const ESTATE_ROUTE_VERSION = 'source-assist-v52-upcoming-deeper-14-day-discovery';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v52-upcoming-deeper-14-day-discovery';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RESULTS = 150;
 const DETAIL_FETCH_DELAY_MS = 700;
-const MAX_DETAIL_FETCHES = 140;
+const MAX_DETAIL_FETCHES = 220;
 const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
 const ZIP_FETCH_CONCURRENCY = 5;
 const DETAIL_FETCH_CONCURRENCY = 8;
-const DETAIL_ENRICH_TARGET_COUNT = 140;
+const DETAIL_ENRICH_TARGET_COUNT = 220;
 const UPCOMING_MAX_DAYS_OUT = 14;
+const ESTATE_SALES_DEFAULT_PAGE_LIMIT = 1;
+const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 4;
 const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
@@ -2282,6 +2284,144 @@ function getEstateSalesSearchTargets(
   return targets;
 }
 
+
+function makeAbsoluteEstateSalesUrl(href = '', baseUrl = 'https://www.estatesales.net/') {
+  const raw = String(href || '').trim();
+  if (!raw) return '';
+
+  try {
+    return new URL(raw, baseUrl).toString();
+  } catch {
+    return '';
+  }
+}
+
+function isEstateSalesListingDetailUrl(url = '') {
+  return /\/((?:IL|IN))\/[^/]+\/\d{5}\/\d+(?:[/?#]|$)/i.test(String(url || ''));
+}
+
+function extractPaginationUrlsFromHtml(html = '', currentUrl = '') {
+  const pageUrls = [];
+  const seen = new Set();
+  const source = String(html || '');
+
+  const pushUrl = (href = '') => {
+    const absoluteUrl = makeAbsoluteEstateSalesUrl(href, currentUrl);
+    if (!absoluteUrl) return;
+    if (!/^https:\/\/www\.estatesales\.net\//i.test(absoluteUrl)) return;
+    if (isEstateSalesListingDetailUrl(absoluteUrl)) return;
+    if (absoluteUrl.split('#')[0] === String(currentUrl || '').split('#')[0]) return;
+    if (seen.has(absoluteUrl)) return;
+    seen.add(absoluteUrl);
+    pageUrls.push(absoluteUrl);
+  };
+
+  // Prefer explicit pagination/next links from the live page.
+  for (const match of source.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    const tag = match[0] || '';
+    const href = htmlDecode(match[1] || '');
+    const label = stripHtml(match[2] || '').toLowerCase();
+    const tagText = stripHtml(tag).toLowerCase();
+    const searchable = `${tag.toLowerCase()} ${label} ${tagText} ${href.toLowerCase()}`;
+
+    if (
+      /\bnext\b/.test(searchable) ||
+      /aria-label=["']next/i.test(tag) ||
+      /rel=["']next/i.test(tag) ||
+      /(?:[?&](?:page|p|pg|pageNumber|currentPage)=\d+)/i.test(href)
+    ) {
+      pushUrl(href);
+    }
+  }
+
+  return pageUrls;
+}
+
+function addQueryParamToUrl(url = '', key = '', value = '') {
+  if (!url || !key) return '';
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set(key, String(value));
+    return parsed.toString();
+  } catch {
+    return '';
+  }
+}
+
+function getSpeculativePaginationUrls(baseUrl = '', pageNumber = 2) {
+  const keys = ['page', 'p', 'pg', 'pageNumber', 'currentPage'];
+  return keys
+    .map((key) => addQueryParamToUrl(baseUrl, key, pageNumber))
+    .filter(Boolean);
+}
+
+async function fetchEstateSalesListingPage(url = '', target = {}, requestedDay = '') {
+  const response = await axios.get(url, {
+    timeout: REQUEST_TIMEOUT_MS,
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      Referer: 'https://www.google.com/',
+      Connection: 'keep-alive',
+    },
+  });
+
+  const html = typeof response.data === 'string' ? response.data : '';
+  const parsed = parseEstateSalesFromHtml(html, target?.zip || '60565', requestedDay);
+  return { html, parsed };
+}
+
+async function fetchEstateSalesListingPages(baseUrl = '', target = {}, requestedDay = '') {
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  const maxPages = normalizedRequestedDay === 'upcoming'
+    ? ESTATE_SALES_UPCOMING_PAGE_LIMIT
+    : ESTATE_SALES_DEFAULT_PAGE_LIMIT;
+  const allParsed = [];
+  const visitedUrls = new Set();
+  const queuedUrls = [baseUrl];
+
+  for (let pageIndex = 0; pageIndex < queuedUrls.length && pageIndex < maxPages; pageIndex += 1) {
+    const pageUrl = queuedUrls[pageIndex];
+    if (!pageUrl || visitedUrls.has(pageUrl)) continue;
+    visitedUrls.add(pageUrl);
+
+    const { html, parsed } = await fetchEstateSalesListingPage(pageUrl, target, requestedDay);
+    allParsed.push(...parsed);
+
+    console.log(
+      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} PAGE_FETCH zip=${target?.zip} city=${target?.city} page=${pageIndex + 1}/${maxPages} parsed=${parsed.length} url=${pageUrl}`,
+    );
+
+    if (maxPages <= 1) continue;
+
+    const nextUrls = extractPaginationUrlsFromHtml(html, pageUrl);
+    for (const nextUrl of nextUrls) {
+      if (!visitedUrls.has(nextUrl) && !queuedUrls.includes(nextUrl)) {
+        queuedUrls.push(nextUrl);
+      }
+    }
+
+    // Some EstateSales.net builds do not expose ordinary <a> next links in the
+    // server-rendered HTML. For Upcoming only, try a small set of common page
+    // query names. Duplicate/unsupported pages collapse harmlessly during URL
+    // de-dupe, but this gives the scraper a chance to reach May 14-16 style rows.
+    if (normalizedRequestedDay === 'upcoming' && pageIndex === 0 && queuedUrls.length < maxPages) {
+      for (let pageNumber = 2; pageNumber <= maxPages; pageNumber += 1) {
+        for (const speculativeUrl of getSpeculativePaginationUrls(baseUrl, pageNumber)) {
+          if (!visitedUrls.has(speculativeUrl) && !queuedUrls.includes(speculativeUrl)) {
+            queuedUrls.push(speculativeUrl);
+          }
+        }
+      }
+    }
+  }
+
+  return dedupeSales(allParsed);
+}
+
 async function fetchEstateSalesForTarget(target, radiusMiles = 50, requestedDay = '') {
   const rawZip = String(target?.zip || '60565').trim();
   const safeZip = encodeURIComponent(rawZip);
@@ -2309,27 +2449,15 @@ async function fetchEstateSalesForTarget(target, radiusMiles = 50, requestedDay 
     try {
       console.log('EstateSales URL:', url);
 
-      const response = await axios.get(url, {
-        timeout: REQUEST_TIMEOUT_MS,
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15',
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          Referer: 'https://www.google.com/',
-          Connection: 'keep-alive',
-        },
-      });
-
-      const html = typeof response.data === 'string' ? response.data : '';
-      const parsed = parseEstateSalesFromHtml(html, target?.zip || '60565', requestedDay);
+      const parsed = await fetchEstateSalesListingPages(url, target, requestedDay);
 
       console.log(
         `[estate-sales-route] ${ESTATE_ROUTE_VERSION} CITY_TARGET zip=${target?.zip} city=${citySlug} radius=${safeRadius} parsed=${parsed.length} url=${url}`,
       );
 
-      return parsed;
+      // If a URL succeeds but produces no listings, try the next shape. If it
+      // produces listings, stop here so the same target does not multiply dupes.
+      if (parsed.length > 0) return parsed;
     } catch (error) {
       lastError = error;
       console.warn(
@@ -3443,6 +3571,58 @@ function isConfirmedTodayPhysicalEstateSale(sale = {}) {
 }
 
 
+
+function getUpcomingWindowDateKeys() {
+  const todayKey = getChicagoDateKey(new Date());
+  return {
+    startKey: addDaysToDateKey(todayKey, 2),
+    endKey: addDaysToDateKey(todayKey, UPCOMING_MAX_DAYS_OUT),
+  };
+}
+
+function saleHasUpcomingWindowDateEvidence(sale = {}) {
+  const { startKey, endKey } = getUpcomingWindowDateKeys();
+  if (!startKey || !endKey) return false;
+
+  const candidateKeys = collectSaleDateKeysFromText(
+    [
+      sale.dateText,
+      sale.dateLabel,
+      sale.dayLabel,
+      sale.timeLabel,
+      sale.rawSnippet,
+      sale.descriptionPreview,
+      sale.bodyPreview,
+      sale.title,
+    ]
+      .filter(Boolean)
+      .join(' '),
+    getChicagoDateParts(new Date()).year,
+  );
+
+  return candidateKeys.some((key) => key >= startKey && key <= endKey);
+}
+
+function sortSalesForDetailEnrichment(sales = [], requestedDay = '') {
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  if (normalizedRequestedDay !== 'upcoming') return sortSales(sales);
+
+  return [...sales].sort((a, b) => {
+    const aUpcoming = saleHasUpcomingWindowDateEvidence(a) ? 1 : 0;
+    const bUpcoming = saleHasUpcomingWindowDateEvidence(b) ? 1 : 0;
+    if (aUpcoming !== bUpcoming) return bUpcoming - aUpcoming;
+
+    const aDistance = Number.isFinite(Number(a.distanceMiles)) ? Number(a.distanceMiles) : Number.MAX_SAFE_INTEGER;
+    const bDistance = Number.isFinite(Number(b.distanceMiles)) ? Number(b.distanceMiles) : Number.MAX_SAFE_INTEGER;
+    if (aDistance !== bDistance) return aDistance - bDistance;
+
+    const imageDiff = (b.imageCount || 0) - (a.imageCount || 0);
+    if (imageDiff !== 0) return imageDiff;
+
+    return (a.title || '').localeCompare(b.title || '');
+  });
+}
+
 async function fetchAllEstateSales(
   requestedDay = '',
   requestedRadiusMiles = null,
@@ -3481,7 +3661,7 @@ async function fetchAllEstateSales(
     cacheHit = true;
   } else {
     console.log(
-      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} DIRECT_SINGLE_CITY_ZIP_START zip=${searchZip} city=${city} radius=${requestedRadiusMiles ?? 'default'} day=${normalizedRequestedDay || 'all'}`,
+      `[estate-sales-route] ${ESTATE_ROUTE_VERSION} RADIUS_SWEEP_DEEP_DISCOVERY_START zip=${searchZip} city=${city} radius=${requestedRadiusMiles ?? 'default'} day=${normalizedRequestedDay || 'all'}`,
     );
 
     const rawResults = await fetchEstateSalesForTargets(
@@ -3496,7 +3676,7 @@ async function fetchAllEstateSales(
     // shown on the search page. That distance is relative to the EstateSales.net
     // page being scraped, not always the user's actual GPS origin. Enrich first,
     // get real detail-page coordinates, then apply the true requested radius.
-    const prioritizedSales = sortSales(deduped);
+    const prioritizedSales = sortSalesForDetailEnrichment(deduped, requestedDay);
 
     const enrichmentTargetCount = Math.min(
       prioritizedSales.length,
