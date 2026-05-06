@@ -3184,7 +3184,7 @@ router.get('/', async (req, res) => {
 
     // Never let a backend fetch/parser error leave the mobile app showing old
     // estate-sale results. Return a successful empty payload so the frontend
-    // clears the list instead of keeping stale cached cards.
+    // clears the list instead of keeping stale cached cards
     return res.json({
       success: true,
       warning: 'ESTATE_SALES_FETCH_FAILED_EMPTY_RESULTS_RETURNED',
