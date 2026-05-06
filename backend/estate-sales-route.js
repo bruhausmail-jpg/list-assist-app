@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v41-full-estatesales-titles';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v41-full-estatesales-titles';
+const ESTATE_ROUTE_VERSION = 'source-assist-v42-broad-targets-title-date-fix';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v42-broad-targets-title-date-fix';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1118,7 +1118,7 @@ function extractDetailScheduleDateKeys(detailHtmlOrText = '', fallbackYear = nul
 
   // Detail-page cards render like: Thu May 7 9am to 3:30pm.
   const dayCardPattern = new RegExp(
-    `\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\b\s+${monthWord}\s+(\d{1,2})(?:st|nd|rd|th)?\b`,
+    `\\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\\b\\s+${monthWord}\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`,
     'gi',
   );
   for (const match of text.matchAll(dayCardPattern)) {
@@ -1127,7 +1127,7 @@ function extractDetailScheduleDateKeys(detailHtmlOrText = '', fallbackYear = nul
 
   // Detail/list text can also render like: May 6, 7, 8.
   const compactListPattern = new RegExp(
-    `\b${monthWord}\s+(\d{1,2}(?:st|nd|rd|th)?(?:\s*,\s*\d{1,2}(?:st|nd|rd|th)?){1,10})`,
+    `\\b${monthWord}\\s+(\\d{1,2}(?:st|nd|rd|th)?(?:\\s*,\\s*\\d{1,2}(?:st|nd|rd|th)?){1,10})`,
     'gi',
   );
   for (const match of text.matchAll(compactListPattern)) {
@@ -1144,7 +1144,7 @@ function extractDetailScheduleDateKeys(detailHtmlOrText = '', fallbackYear = nul
   // Use single detail-card dates only when they are near a weekday/schedule card.
   // Avoid using random SEO text like “address released May 6” as sale proof.
   const scheduleLikePattern = new RegExp(
-    `\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\b[\s\S]{0,40}?${monthWord}\s+(\d{1,2})(?:st|nd|rd|th)?[\s\S]{0,40}?\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b`,
+    `\\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\\b[\\s\\S]{0,40}?${monthWord}\\s+(\\d{1,2})(?:st|nd|rd|th)?[\\s\\S]{0,40}?\\b\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)\\b`,
     'gi',
   );
   for (const match of text.matchAll(scheduleLikePattern)) {
@@ -3281,7 +3281,7 @@ router.get('/', async (req, res) => {
       requestedDay,
       requestedRadiusMiles,
       count: sourceAssistSales.length,
-      searchMode: 'single-city-zip',
+      searchMode: 'estate-sales-net-city-pages',
       fetchedAt: new Date().toISOString(),
       elapsedMs: Date.now() - requestStartedAt,
       sales: sourceAssistSales,
@@ -3292,7 +3292,7 @@ router.get('/', async (req, res) => {
 
     // Never let a backend fetch/parser error leave the mobile app showing old
     // estate-sale results. Return a successful empty payload so the frontend
-    // clears the list instead of keeping stale cached cards
+    // clears the list instead of keeping stale cached cards.
     return res.json({
       success: true,
       warning: 'ESTATE_SALES_FETCH_FAILED_EMPTY_RESULTS_RETURNED',
@@ -3302,7 +3302,7 @@ router.get('/', async (req, res) => {
       requestedDay,
       requestedRadiusMiles,
       count: 0,
-      searchMode: 'single-city-zip',
+      searchMode: 'estate-sales-net-city-pages',
       fetchedAt: new Date().toISOString(),
       elapsedMs: Date.now() - requestStartedAt,
       sales: [],
