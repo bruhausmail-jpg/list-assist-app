@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v44-upcoming-estate-sales';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v44-upcoming-estate-sales';
+const ESTATE_ROUTE_VERSION = 'source-assist-v45-upcoming-2days-estate-badge-only';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v45-upcoming-2days-estate-badge-only';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -456,6 +456,13 @@ function extractDetailSaleBadge(html = '') {
   }
 
   return '';
+}
+
+function isExactEstateSaleBadge(value = '') {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase() === 'estate sale';
 }
 
 function cleanDetailTitle(value = '') {
@@ -1242,7 +1249,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
       sale.detailSaleBadge,
       sale.saleBadge,
       sale.saleType,
-      sale.detailSaleBadgeConfirmed === true ? 'Estate Sale' : '',
+      sale.detailSaleBadgeConfirmed === true && isExactEstateSaleBadge(detailSaleBadge) ? 'Estate Sale' : '',
     ]
       .filter(Boolean)
       .join(' ');
@@ -1251,8 +1258,11 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   }
 
   // Upcoming rule:
-  // Day-after-tomorrow or later, and the detail/listing badge area must say
-  // Estate Sale. Today/Tomorrow behavior above is not changed.
+  // Any sale that is going on 2 days from now or later gets through ONLY when
+  // the detail-page little badge section is exactly "Estate Sale".
+  // Do not use full-address logic here, and do not allow online / auction /
+  // moving / tag sale wording to satisfy this rule.
+  // Today/Tomorrow behavior above is intentionally untouched.
   if (normalizedRequestedDay === 'upcoming') {
     const todayKey = getChicagoDateKey(new Date());
     const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
@@ -1263,15 +1273,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
 
     if (!hasUpcomingDate) return false;
 
-    const badgeText = [
-      sale.detailSaleBadge,
-      sale.saleBadge,
-      sale.detailSaleBadgeConfirmed === true ? 'Estate Sale' : '',
-    ]
-      .filter(Boolean)
-      .join(' ');
-
-    return /\bestate\s+sale\b/i.test(badgeText);
+    return isExactEstateSaleBadge(sale.detailSaleBadge);
   }
 
   if (hasExactTodayDate) return true;
@@ -1717,7 +1719,7 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
       saleType: 'estate-sale',
       saleBadge: detailSaleBadge || 'Estate Sale',
       detailSaleBadge: detailSaleBadge || '',
-      detailSaleBadgeConfirmed: /estate\s+sale/i.test(detailSaleBadge),
+      detailSaleBadgeConfirmed: isExactEstateSaleBadge(detailSaleBadge),
       mapAddress:
         address.addressLabel ||
         buildAddressLabel({
