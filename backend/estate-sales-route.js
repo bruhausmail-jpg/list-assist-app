@@ -7,21 +7,21 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v56-upcoming-date-range-and-deeper-pages';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v56-upcoming-date-range-and-deeper-pages';
+const ESTATE_ROUTE_VERSION = 'source-assist-v57-today-tomorrow-radius-sweep-no-upcoming';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v57-today-tomorrow-radius-sweep-no-upcoming';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
-const REQUEST_TIMEOUT_MS = 20000;
+const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RESULTS = 150;
 const DETAIL_FETCH_DELAY_MS = 700;
-const MAX_DETAIL_FETCHES = 520;
+const MAX_DETAIL_FETCHES = 220;
 const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
-const ZIP_FETCH_CONCURRENCY = 3;
-const DETAIL_FETCH_CONCURRENCY = 5;
-const DETAIL_ENRICH_TARGET_COUNT = 520;
+const ZIP_FETCH_CONCURRENCY = 6;
+const DETAIL_FETCH_CONCURRENCY = 8;
+const DETAIL_ENRICH_TARGET_COUNT = 220;
 const UPCOMING_MAX_DAYS_OUT = 14;
-const ESTATE_SALES_DEFAULT_PAGE_LIMIT = 1;
-const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 14;
+const ESTATE_SALES_DEFAULT_PAGE_LIMIT = 2;
+const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 2;
 const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
@@ -3852,9 +3852,17 @@ router.get('/', async (req, res) => {
   // If we leave requestedDay blank, the backend returns any upcoming sale and
   // the app shows Friday/Saturday cards under the Today header. Default the
   // estate-sales route to today unless the client explicitly sends a day/date.
-  const requestedDay = normalizeRequestedDay(
+  let requestedDay = normalizeRequestedDay(
     req.query?.day || req.query?.targetDay || req.query?.date || 'today',
   );
+
+  // Upcoming is disabled in the mobile app while Today/Tomorrow are being
+  // locked down. If an older app bundle still sends upcoming, keep the route
+  // fast and predictable by treating it as Tomorrow instead of running the
+  // expensive deep future scrape.
+  if (requestedDay === 'upcoming') {
+    requestedDay = 'tomorrow';
+  }
   const requestedRadiusMiles = normalizeRequestedRadiusMiles(
     req.query?.radiusMiles,
   );
