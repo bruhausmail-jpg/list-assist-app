@@ -7,7 +7,7 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v33-detail-schedule-date-verify';
+const ESTATE_ROUTE_VERSION = 'source-assist-v34-full-address-today-allowed';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -2871,20 +2871,22 @@ function normalizeEstateSaleCalendarData(sale = {}, requestedDay = '') {
 
 
 function isConfirmedTodayPhysicalEstateSale(sale = {}) {
-  // Super-simple Today rule:
-  // 1) Search/list card must expose a real full address, not just city/state.
-  //    Detail-page full address can also pass this because some cards are sparse.
-  // 2) Detail page must show the exact badge text "Estate Sale".
+  // Today rule, locked down but not too tight:
+  // 1) The sale must have a real full address, not just city/state.
+  //    Search-card full address OR detail-page full street address can pass.
+  // 2) The detail-page schedule must include Today. This is the date source of truth.
   // 3) Online-only language always loses.
+  //
+  // Important: Some valid physical EstateSales.net listings use a small category
+  // label such as "Moved Offsite To Store" instead of the exact "Estate Sale"
+  // badge. If the listing has a full address and the detail schedule includes
+  // Today, let it through even when that small badge is not "Estate Sale".
   const hasFullAddress = Boolean(
     sale.searchHasFullAddress === true || streetHasHouseNumber(sale.street || ''),
   );
-  const exactBadgeText = String(sale.detailSaleBadge || '').trim().toLowerCase();
-  const hasExactEstateSaleBadge = exactBadgeText === 'estate sale';
 
   return (
     hasFullAddress &&
-    hasExactEstateSaleBadge &&
     saleMatchesRequestedDetailDate(sale, 'today') &&
     shouldExcludeOnlineOnlySale(sale) === false
   );
