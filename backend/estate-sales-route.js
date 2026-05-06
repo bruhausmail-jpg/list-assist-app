@@ -7,7 +7,7 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v36-today-full-address-date-only';
+const ESTATE_ROUTE_VERSION = 'source-assist-v37-fix-estatesales-url-state';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1984,16 +1984,23 @@ function getEstateSalesSearchTargets(
 }
 
 async function fetchEstateSalesForTarget(target, radiusMiles = 50, requestedDay = '') {
-  const safeZip = encodeURIComponent(String(target?.zip || '60565').trim());
+  const rawZip = String(target?.zip || '60565').trim();
+  const safeZip = encodeURIComponent(rawZip);
   const safeRadius = encodeURIComponent(String(radiusMiles || 50));
   const citySlug = encodeURIComponent(normalizeCitySlug(target?.city || 'Naperville'));
+
+  // v37 fix: do not put a regex-looking string in the live URL.
+  // v36 was requesting /(?:IL|IN)/City/ZIP, which EstateSales.net does not serve,
+  // so every target parsed as zero. Build a real state path instead.
+  const inferredState = String(target?.state || (rawZip === '46373' ? 'IN' : 'IL')).toUpperCase();
+  const safeState = inferredState === 'IN' ? 'IN' : 'IL';
 
   const urlsToTry = [
     // Real live listing page format. This is the page that currently shows the
     // actual EstateSales.net rows for the user's selected origin.
-    `https://www.estatesales.net/(?:IL|IN)/${citySlug}/${safeZip}?radius=${safeRadius}`,
-    `https://www.estatesales.net/(?:IL|IN)/${citySlug}/${safeZip}`,
-    // Last-resort same-origin fallback. Do not use the malformed /(?:IL|IN)/60565 URL.
+    `https://www.estatesales.net/${safeState}/${citySlug}/${safeZip}?radius=${safeRadius}`,
+    `https://www.estatesales.net/${safeState}/${citySlug}/${safeZip}`,
+    // Last-resort same-origin fallback.
     `https://www.estatesales.net/sales/advancedSearch?zip=${safeZip}&radius=${safeRadius}`,
   ];
 
