@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v40-health-cache-verify';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v40-health-cache-verify';
+const ESTATE_ROUTE_VERSION = 'source-assist-v42-tomorrow-address-or-badge';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v42-tomorrow-address-or-badge';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1188,6 +1188,33 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
       (searchableText.includes(todayShort) && searchableText.includes(todayMonthDay));
 
     return saysToday;
+  }
+
+  // Tomorrow rule:
+  // 1) Full address + tomorrow date = pass.
+  // 2) No full address + tomorrow date + Estate Sale badge = pass.
+  // Anything else stays out of Tomorrow.
+  // Today logic above is intentionally left untouched.
+  if (normalizedRequestedDay === 'tomorrow') {
+    const hasExactTomorrowDate = dateKeyCandidates.includes(targetDateKey);
+
+    if (!hasExactTomorrowDate) {
+      if (dateKeyCandidates.length) return false;
+      return saleMatchesRequestedDay(sale, requestedDay);
+    }
+
+    if (hasFullAddress) return true;
+
+    const badgeText = [
+      sale.detailSaleBadge,
+      sale.saleBadge,
+      sale.saleType,
+      sale.detailSaleBadgeConfirmed === true ? 'Estate Sale' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    return /\bestate\s+sale\b/i.test(badgeText);
   }
 
   if (hasExactTodayDate) return true;
