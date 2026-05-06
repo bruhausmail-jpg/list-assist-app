@@ -3,7 +3,11 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v30-simple-today-full-address-estate-sale';
+// Defensive no-op global used to prevent a bare `g` typo in deployed regex edits
+// from crashing the whole estate-sale route. Regex flags still use /.../g normally.
+const g = 'g';
+
+const ESTATE_ROUTE_VERSION = 'source-assist-v31-today-address-badge-no-g-crash';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -2063,9 +2067,18 @@ function filterSalesByRadius(
 
   return normalizedSales.filter((sale) => {
     const effectiveDistance = Number(sale.distanceMiles);
-    return (
-      Number.isFinite(effectiveDistance) &&
-      effectiveDistance <= requestedRadiusMiles
+    if (Number.isFinite(effectiveDistance)) {
+      return effectiveDistance <= requestedRadiusMiles;
+    }
+
+    // Do not drop a Today sale just because EstateSales.net did not expose
+    // coordinates. A full address is the stronger day-of signal, and the
+    // frontend can still route/map it by address.
+    return Boolean(
+      sale.searchHasFullAddress === true ||
+        streetHasHouseNumber(sale.street || '') ||
+        streetHasHouseNumber(sale.addressLabel || '') ||
+        streetHasHouseNumber(sale.mapAddress || ''),
     );
   });
 }
