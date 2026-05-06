@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v43-tomorrow-multiday-include';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v43-tomorrow-multiday-include';
+const ESTATE_ROUTE_VERSION = 'source-assist-v44-upcoming-estate-sales';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v44-upcoming-estate-sales';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -58,6 +58,7 @@ router.get('/health', (req, res) => {
       health: '/api/estate-sales/health?_t=' + Date.now(),
       today: '/api/estate-sales?day=today&_t=' + Date.now(),
       tomorrow: '/api/estate-sales?day=tomorrow&_t=' + Date.now(),
+      upcoming: '/api/estate-sales?day=upcoming&_t=' + Date.now(),
     },
   });
 });
@@ -1034,6 +1035,7 @@ function getTargetDateKeyForRequestedDay(requestedDay = '') {
   const todayKey = getChicagoDateKey(new Date());
   const normalizedRequestedDay = normalizeRequestedDay(requestedDay || 'today');
   if (normalizedRequestedDay === 'tomorrow') return addDaysToDateKey(todayKey, 1);
+  if (normalizedRequestedDay === 'upcoming') return addDaysToDateKey(todayKey, 2);
   if (normalizedRequestedDay === 'today') return todayKey;
   return '';
 }
@@ -1102,10 +1104,9 @@ function extractDetailScheduleDateKeys(detailHtmlOrText = '', fallbackYear = nul
 }
 
 function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
-  const targetDateKey = getTargetDateKeyForRequestedDay(requestedDay);
-  if (!targetDateKey) return true;
-
   const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  const targetDateKey = getTargetDateKeyForRequestedDay(requestedDay);
+  if (!targetDateKey && normalizedRequestedDay !== 'upcoming') return true;
 
   const hasFullAddress =
     sale.searchHasFullAddress === true ||
@@ -1142,6 +1143,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
       pushDateKey(entry?.startDateTime);
       pushDateKey(entry?.saleDate);
       pushDateKey(entry?.saleDateTime);
+      pushDateKey(entry?.date);
     }
   }
 
@@ -1151,7 +1153,8 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   pushDateKey(sale.saleDateTime);
   pushDateKey(sale.date);
 
-  const hasExactTodayDate = dateKeyCandidates.includes(targetDateKey);
+  const uniqueDateKeyCandidates = Array.from(new Set(dateKeyCandidates.filter(Boolean)));
+  const hasExactTodayDate = uniqueDateKeyCandidates.includes(targetDateKey);
 
   // Today rule, locked down:
   // A sale gets into Today only when it has a full address AND the sale's own
@@ -1164,7 +1167,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
 
     // If we have explicit date keys but none match today, trust those keys and reject it.
     // This blocks tomorrow sales with full addresses from sneaking into Today.
-    if (dateKeyCandidates.length) return false;
+    if (uniqueDateKeyCandidates.length) return false;
 
     const todayWeekday = getChicagoDateParts(new Date()).weekday.toLowerCase();
     const todayShort = todayWeekday.slice(0, 3);
@@ -1201,7 +1204,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   // date text for tomorrow evidence.
   // Today logic above is intentionally left untouched.
   if (normalizedRequestedDay === 'tomorrow') {
-    const hasExactTomorrowDate = dateKeyCandidates.includes(targetDateKey);
+    const hasExactTomorrowDate = uniqueDateKeyCandidates.includes(targetDateKey);
 
     const tomorrowDate = new Date();
     tomorrowDate.setDate(tomorrowDate.getDate() + 1);
@@ -1239,6 +1242,30 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
       sale.detailSaleBadge,
       sale.saleBadge,
       sale.saleType,
+      sale.detailSaleBadgeConfirmed === true ? 'Estate Sale' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    return /\bestate\s+sale\b/i.test(badgeText);
+  }
+
+  // Upcoming rule:
+  // Day-after-tomorrow or later, and the detail/listing badge area must say
+  // Estate Sale. Today/Tomorrow behavior above is not changed.
+  if (normalizedRequestedDay === 'upcoming') {
+    const todayKey = getChicagoDateKey(new Date());
+    const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
+
+    const hasUpcomingDate = uniqueDateKeyCandidates.some(
+      (key) => /^20\d{2}-\d{2}-\d{2}$/.test(key) && key >= dayAfterTomorrowKey,
+    );
+
+    if (!hasUpcomingDate) return false;
+
+    const badgeText = [
+      sale.detailSaleBadge,
+      sale.saleBadge,
       sale.detailSaleBadgeConfirmed === true ? 'Estate Sale' : '',
     ]
       .filter(Boolean)
@@ -2411,6 +2438,7 @@ function normalizeRequestedDay(value = '') {
 
   if (normalized === 'today') return 'today';
   if (normalized === 'tomorrow') return 'tomorrow';
+  if (['upcoming', 'future', 'later'].includes(normalized)) return 'upcoming';
   if (
     [
       'nexttwoweeks',
@@ -2634,6 +2662,16 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
   const requestedWindow = getRequestedDateWindow(normalizedRequestedDay);
 
   const matchingEntries = entries.filter((entry) => {
+    if (normalizedRequestedDay === 'upcoming') {
+      const todayKey = getChicagoDateKey(new Date());
+      const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
+      const directKey = String(entry?.startDate || entry?.saleDate || entry?.date || '').slice(0, 10);
+      if (/^20\d{2}-\d{2}-\d{2}$/.test(directKey)) return directKey >= dayAfterTomorrowKey;
+
+      const entryDates = getSaleDatesForComparison(entry || {});
+      return entryDates.some((entryDate) => getChicagoDateKey(entryDate) >= dayAfterTomorrowKey);
+    }
+
     if (requestedWindow) {
       const requestedDateKey = getDateKeyForRequestedDay(normalizedRequestedDay);
       const directKey = String(entry?.startDate || entry?.saleDate || entry?.date || '').slice(0, 10);
