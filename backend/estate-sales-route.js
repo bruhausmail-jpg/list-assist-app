@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v42-tomorrow-address-or-badge';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v42-tomorrow-address-or-badge';
+const ESTATE_ROUTE_VERSION = 'source-assist-v43-tomorrow-multiday-include';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v43-tomorrow-multiday-include';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1191,17 +1191,47 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   }
 
   // Tomorrow rule:
-  // 1) Full address + tomorrow date = pass.
-  // 2) No full address + tomorrow date + Estate Sale badge = pass.
-  // Anything else stays out of Tomorrow.
+  // 1) Full address + sale is going on tomorrow = pass.
+  // 2) No full address + sale is going on tomorrow + Estate Sale badge = pass.
+  //
+  // Important: a sale that started today and also runs tomorrow must be shown
+  // in Tomorrow too. Some EstateSales.net pages only expose today's date in
+  // the primary structured field, while the visible text says "May 6, 7, 8".
+  // So for Tomorrow we check both exact parsed date keys AND the sale's visible
+  // date text for tomorrow evidence.
   // Today logic above is intentionally left untouched.
   if (normalizedRequestedDay === 'tomorrow') {
     const hasExactTomorrowDate = dateKeyCandidates.includes(targetDateKey);
 
-    if (!hasExactTomorrowDate) {
-      if (dateKeyCandidates.length) return false;
-      return saleMatchesRequestedDay(sale, requestedDay);
-    }
+    const tomorrowDate = new Date();
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowMonthDay = getChicagoMonthDayLabel(tomorrowDate).toLowerCase();
+    const tomorrowWeekday = getChicagoDateParts(tomorrowDate).weekday.toLowerCase();
+    const tomorrowShort = tomorrowWeekday.slice(0, 3);
+
+    const searchableTomorrowText = [
+      sale.statusText,
+      sale.dateText,
+      sale.dayLabel,
+      sale.dateLabel,
+      sale.timeLabel,
+      sale.rawSnippet,
+      sale.descriptionPreview,
+      sale.bodyPreview,
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+
+    const hasTomorrowTextEvidence =
+      /\b(tomorrow|starts tomorrow|resumes tomorrow)\b/i.test(searchableTomorrowText) ||
+      searchableTomorrowText.includes(tomorrowMonthDay) ||
+      (searchableTomorrowText.includes(tomorrowShort) &&
+        searchableTomorrowText.includes(tomorrowMonthDay));
+
+    const isGoingOnTomorrow = hasExactTomorrowDate || hasTomorrowTextEvidence;
+
+    if (!isGoingOnTomorrow) return false;
 
     if (hasFullAddress) return true;
 
