@@ -7,7 +7,7 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v34-full-address-today-allowed';
+const ESTATE_ROUTE_VERSION = 'source-assist-v36-today-full-address-date-only';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -163,7 +163,7 @@ function makeStableId(url = '') {
 }
 
 function extractLocationFromUrl(url = '') {
-  const match = url.match(/\/IL\/([^/]+)\/(\d{5})\/(\d+)/i);
+  const match = url.match(/\/(IL|IN)\/([^/]+)\/(\d{5})\/(\d+)/i);
 
   if (!match) {
     return {
@@ -174,9 +174,10 @@ function extractLocationFromUrl(url = '') {
     };
   }
 
-  const rawCity = match[1] || '';
-  const parsedZip = match[2] || '';
-  const sourceListingId = match[3] || '';
+  const parsedState = String(match[1] || 'IL').toUpperCase();
+  const rawCity = match[2] || '';
+  const parsedZip = match[3] || '';
+  const sourceListingId = match[4] || '';
 
   const city = rawCity
     .split('-')
@@ -185,7 +186,7 @@ function extractLocationFromUrl(url = '') {
 
   return {
     city,
-    state: 'IL',
+    state: parsedState,
     zip: parsedZip,
     sourceListingId,
   };
@@ -1055,24 +1056,68 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   const targetDateKey = getTargetDateKeyForRequestedDay(requestedDay);
   if (!targetDateKey) return true;
 
-  const detailDateKeys = Array.isArray(sale.detailDateKeys)
-    ? sale.detailDateKeys.map((key) => String(key || '').slice(0, 10)).filter(Boolean)
-    : [];
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  const dateKeyCandidates = [];
+  const pushDateKey = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return;
 
-  // Primary: use extracted detail date keys
-  if (detailDateKeys.length) {
-    return detailDateKeys.includes(targetDateKey);
+    const direct = raw.slice(0, 10);
+    if (/^20\d{2}-\d{2}-\d{2}$/.test(direct)) {
+      dateKeyCandidates.push(direct);
+      return;
+    }
+
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) {
+      dateKeyCandidates.push(getChicagoDateKey(parsed));
+    }
+  };
+
+  if (Array.isArray(sale.detailDateKeys)) {
+    sale.detailDateKeys.forEach(pushDateKey);
   }
 
-  // NEW: fallback for edge cases where schedule parser misses single-day cards
-  if (sale.searchHasFullAddress === true && sale.detailFetched === true) {
+  if (Array.isArray(sale.scheduleEntries)) {
+    for (const entry of sale.scheduleEntries) {
+      pushDateKey(entry?.startDate);
+      pushDateKey(entry?.startDateTime);
+      pushDateKey(entry?.saleDate);
+      pushDateKey(entry?.saleDateTime);
+    }
+  }
+
+  pushDateKey(sale.startDate);
+  pushDateKey(sale.startDateTime);
+  pushDateKey(sale.saleDate);
+  pushDateKey(sale.saleDateTime);
+  pushDateKey(sale.date);
+
+  if (dateKeyCandidates.includes(targetDateKey)) return true;
+
+  // User-approved Today rule: if a physical sale has a full address and the
+  // listing/detail text says it is Today, it passes. Do not require the small
+  // badge area to say "Estate Sale".
+  if (normalizedRequestedDay === 'today') {
     const todayWeekday = getChicagoDateParts(new Date()).weekday.toLowerCase();
-    const dayLabel = String(sale.dayLabel || '').toLowerCase();
-    const dateText = String(sale.dateText || '').toLowerCase();
+    const todayShort = todayWeekday.slice(0, 3);
+    const todayMonthDay = getChicagoMonthDayLabel(new Date()).toLowerCase();
+    const searchableText = [
+      sale.statusText,
+      sale.dateText,
+      sale.dayLabel,
+      sale.dateLabel,
+      sale.timeLabel,
+      sale.rawSnippet,
+      sale.descriptionPreview,
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
 
     if (
-      dayLabel.includes(todayWeekday.slice(0, 3)) ||
-      dateText.includes('today')
+      /\b(today|starts today|ends today|going on now)\b/i.test(searchableText) ||
+      (searchableText.includes(todayShort) && searchableText.includes(todayMonthDay))
     ) {
       return true;
     }
@@ -1575,7 +1620,7 @@ function extractEstateSaleLinksFromHtml(html = '') {
       .replace(/^https?:\/\/www\.estatesales\.net/i, '')
       .replace(/^https?:\/\/estatesales\.net/i, '');
 
-    const pathMatch = href.match(/\/IL\/[^\s"'<>?#]+\/\d{5}\/\d+/i);
+    const pathMatch = href.match(/\/(?:IL|IN)\/[^\s"'<>?#]+\/\d{5}\/\d+/i);
     if (!pathMatch?.[0]) return;
 
     href = decodeUrlPath(pathMatch[0]);
@@ -1586,9 +1631,9 @@ function extractEstateSaleLinksFromHtml(html = '') {
   };
 
   const patterns = [
-    /href=["']([^"']*\/IL\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
-    /["'](https?:\\?\/\\?\/www\.estatesales\.net\/IL\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
-    /["'](\/IL\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /href=["']([^"']*\/(?:IL|IN)\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /["'](https?:\\?\/\\?\/www\.estatesales\.net\/(?:IL|IN)\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /["'](\/(?:IL|IN)\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
     /((?:https?:)?\\?\/\\?\/www\.estatesales\.net\\?\/IL\\?\/[^\s"'<>?#]+\\?\/\d{5}\\?\/\d+)/gi,
     /(\\?\/IL\\?\/[^\s"'<>?#]+\\?\/\d{5}\\?\/\d+)/gi,
   ];
@@ -1612,11 +1657,11 @@ function extractSearchResultFullAddress(snippet = '', fallbackLocation = {}) {
 
   const fullAddressPatterns = [
     new RegExp(
-      `\\b(\\d{2,6}[A-Za-z0-9-]*\\s+[A-Za-z0-9.'#&\\-\\s]{2,80}\\s+${streetTypes}\\.?)\\s*,\\s*([A-Za-z][A-Za-z.'\\-\\s]{2,40})\\s*,?\\s*(IL|Illinois)?\\s*(\\d{5})?\\b`,
+      `\\b(\\d{2,6}[A-Za-z0-9-]*\\s+[A-Za-z0-9.'#&\\-\\s]{2,80}\\s+${streetTypes}\\.?)\\s*,\\s*([A-Za-z][A-Za-z.'\\-\\s]{2,40})\\s*,?\\s*(IL|Illinois|IN|Indiana)?\\s*(\\d{5})?\\b`,
       'i',
     ),
     new RegExp(
-      `\\b(\\d{2,6}[A-Za-z0-9-]*\\s+[A-Za-z0-9.'#&\\-\\s]{2,80}\\s+${streetTypes}\\.?)\\s+([A-Za-z][A-Za-z.'\\-\\s]{2,40})\\s+(IL|Illinois)\\s*(\\d{5})?\\b`,
+      `\\b(\\d{2,6}[A-Za-z0-9-]*\\s+[A-Za-z0-9.'#&\\-\\s]{2,80}\\s+${streetTypes}\\.?)\\s+([A-Za-z][A-Za-z.'\\-\\s]{2,40})\\s+(IL|Illinois|IN|Indiana)\\s*(\\d{5})?\\b`,
       'i',
     ),
   ];
@@ -1930,6 +1975,8 @@ function getEstateSalesSearchTargets(
       ['Schaumburg', '60193'],
       ['Elmhurst', '60126'],
       ['Downers Grove', '60515'],
+      ['St John', '46373'],
+      ['Saint John', '46373'],
     ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
   }
 
@@ -1944,9 +1991,9 @@ async function fetchEstateSalesForTarget(target, radiusMiles = 50, requestedDay 
   const urlsToTry = [
     // Real live listing page format. This is the page that currently shows the
     // actual EstateSales.net rows for the user's selected origin.
-    `https://www.estatesales.net/IL/${citySlug}/${safeZip}?radius=${safeRadius}`,
-    `https://www.estatesales.net/IL/${citySlug}/${safeZip}`,
-    // Last-resort same-origin fallback. Do not use the malformed /IL/60565 URL.
+    `https://www.estatesales.net/(?:IL|IN)/${citySlug}/${safeZip}?radius=${safeRadius}`,
+    `https://www.estatesales.net/(?:IL|IN)/${citySlug}/${safeZip}`,
+    // Last-resort same-origin fallback. Do not use the malformed /(?:IL|IN)/60565 URL.
     `https://www.estatesales.net/sales/advancedSearch?zip=${safeZip}&radius=${safeRadius}`,
   ];
 
@@ -2883,18 +2930,16 @@ function normalizeEstateSaleCalendarData(sale = {}, requestedDay = '') {
 
 
 function isConfirmedTodayPhysicalEstateSale(sale = {}) {
-  // Today rule, locked down but not too tight:
-  // 1) The sale must have a real full address, not just city/state.
-  //    Search-card full address OR detail-page full street address can pass.
-  // 2) The detail-page schedule must include Today. This is the date source of truth.
+  // Final Today rule:
+  // 1) Full physical address required. City/state alone is not enough.
+  // 2) Sale must show it is Today.
   // 3) Online-only language always loses.
-  //
-  // Important: Some valid physical EstateSales.net listings use a small category
-  // label such as "Moved Offsite To Store" instead of the exact "Estate Sale"
-  // badge. If the listing has a full address and the detail schedule includes
-  // Today, let it through even when that small badge is not "Estate Sale".
+  // No badge requirement here. If full address + Today is true, it gets through.
   const hasFullAddress = Boolean(
-    sale.searchHasFullAddress === true || streetHasHouseNumber(sale.street || ''),
+    sale.searchHasFullAddress === true ||
+      streetHasHouseNumber(sale.street || '') ||
+      streetHasHouseNumber(sale.addressLabel || '') ||
+      streetHasHouseNumber(sale.mapAddress || '')
   );
 
   return (
