@@ -7,7 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v38-strict-today-full-address-date';
+const ESTATE_ROUTE_VERSION = 'source-assist-v40-health-cache-verify';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v40-health-cache-verify';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -23,6 +24,54 @@ const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 const detailPageCache = new Map();
 const estateSalesSearchCache = new Map();
 const ESTATE_SALES_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function setNoCacheHeaders(res) {
+  if (!res || typeof res.set !== 'function') return;
+
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'Surrogate-Control': 'no-store',
+    'X-Estate-Route-Version': ESTATE_ROUTE_VERSION,
+    'X-Estate-Route-Deploy-Stamp': ESTATE_ROUTE_DEPLOY_STAMP,
+  });
+}
+
+
+
+router.get('/health', (req, res) => {
+  setNoCacheHeaders(res);
+  res.json({
+    success: true,
+    route: 'estate-sales',
+    routeVersion: ESTATE_ROUTE_VERSION,
+    deployStamp: ESTATE_ROUTE_DEPLOY_STAMP,
+    serverTime: new Date().toISOString(),
+    cacheBust: req.query?._t || req.query?.cacheBust || null,
+    cache: {
+      detailPageCacheSize: detailPageCache.size,
+      estateSalesSearchCacheSize: estateSalesSearchCache.size,
+      estateSalesCacheTtlMs: ESTATE_SALES_CACHE_TTL_MS,
+    },
+    verifyUrls: {
+      health: '/api/estate-sales/health?_t=' + Date.now(),
+      today: '/api/estate-sales?day=today&_t=' + Date.now(),
+      tomorrow: '/api/estate-sales?day=tomorrow&_t=' + Date.now(),
+    },
+  });
+});
+
+router.get('/version', (req, res) => {
+  setNoCacheHeaders(res);
+  res.json({
+    success: true,
+    routeVersion: ESTATE_ROUTE_VERSION,
+    deployStamp: ESTATE_ROUTE_DEPLOY_STAMP,
+    serverTime: new Date().toISOString(),
+    cacheBust: req.query?._t || req.query?.cacheBust || null,
+  });
+});
 
 function normalizeRequestedOriginCoordinate(value) {
   const parsed = Number(value);
@@ -3135,6 +3184,7 @@ async function fetchAllEstateSales(
 }
 
 router.get('/', async (req, res) => {
+  setNoCacheHeaders(res);
   console.log(`[estate-sales-route] ${ESTATE_ROUTE_VERSION} NO_ZIP_SWEEP route start`);
   const requestStartedAt = Date.now();
   // The mobile Source Assist screen labels this view as Today, but current
