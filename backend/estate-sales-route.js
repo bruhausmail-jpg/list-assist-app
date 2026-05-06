@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v52-upcoming-deeper-14-day-discovery';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v52-upcoming-deeper-14-day-discovery';
+const ESTATE_ROUTE_VERSION = 'source-assist-v53-upcoming-include-lower-future-section';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v53-upcoming-include-lower-future-section';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1960,18 +1960,20 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
   const lowerHtml = String(html || '').toLowerCase();
   const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
 
-  const cutoffCandidates = [
-    lowerHtml.indexOf("below are the sales that didn't quite match"),
-    lowerHtml.indexOf('below are the sales that didn&#39;t quite match'),
-    lowerHtml.indexOf('sales more than 50 miles away'),
-  ];
+  const cutoffCandidates = [];
 
-  // Important: only cut off the "not happening today" section when the user
-  // actually asked for Today. EstateSales.net can place legitimate Tomorrow
-  // sales in that lower section, which can hide valid Tomorrow listings
-  // from Source Assist when Tomorrow is selected.
+  // Important: only cut off EstateSales.net's lower "didn't match" sections for
+  // Today. For Upcoming, those lower sections often contain legitimate future
+  // rows inside the 14-day window, such as May 14-16 Aurora/Tinley Park sales.
+  // If we trim the HTML before parsing links, those rows are never discovered
+  // and the backend filter never gets a chance to approve them.
   if (normalizedRequestedDay === 'today') {
-    cutoffCandidates.push(lowerHtml.indexOf('sales that are not happening today'));
+    cutoffCandidates.push(
+      lowerHtml.indexOf("below are the sales that didn't quite match"),
+      lowerHtml.indexOf('below are the sales that didn&#39;t quite match'),
+      lowerHtml.indexOf('sales more than 50 miles away'),
+      lowerHtml.indexOf('sales that are not happening today'),
+    );
   }
 
   const validCutoffs = cutoffCandidates.filter((index) => index > 0);
