@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v26-general-estatesales-discovery';
+const ESTATE_ROUTE_VERSION = 'source-assist-v27-today-physical-estatesale-confirmed';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1291,6 +1291,8 @@ function mergeDetailIntoSale(sale, detail = {}) {
     isOnlineOnly: detail.isOnlineOnly === true || sale.isOnlineOnly === true,
     detailFetched: detail.detailFetched === true || sale.detailFetched === true,
     saleFormat: detail.saleFormat || sale.saleFormat || '',
+    searchHasFullAddress:
+      sale.searchHasFullAddress === true || streetHasHouseNumber(street),
     saleType: detail.saleType || sale.saleType || 'estate-sale',
     saleBadge: detail.saleBadge || sale.saleBadge || 'Estate Sale',
     detailSaleBadge: detail.detailSaleBadge || sale.detailSaleBadge || '',
@@ -1509,6 +1511,11 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
     // page first, then filter using detail-page evidence in shouldExcludeOnlineOnlySale().
 
     const location = extractLocationFromUrl(absoluteUrl);
+    const searchAddress = extractSearchResultFullAddress(snippet, {
+      city: searchAddress?.city || location.city || '',
+      state: searchAddress?.state || location.state || 'IL',
+      zip: searchAddress?.zip || location.zip || requestedZip || '',
+    });
     const title = extractTitle(snippet, absoluteUrl);
     const statusText = extractStatusText(snippet);
     const dateText = extractDateText(snippet);
@@ -1554,28 +1561,35 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
       isProbableSale: true,
       hasExactCoordinates: false,
       isApproximateLocation: Boolean(fallbackCoordinates),
-      street: '',
-      mapAddress: [
-        location.city,
-        location.state || 'IL',
-        location.zip || requestedZip || '',
-      ]
-        .filter(Boolean)
-        .join(', '),
-      mapsQuery: [
-        location.city,
-        location.state || 'IL',
-        location.zip || requestedZip || '',
-      ]
-        .filter(Boolean)
-        .join(', '),
-      addressLabel: [
-        location.city,
-        location.state || 'IL',
-        location.zip || requestedZip || '',
-      ]
-        .filter(Boolean)
-        .join(', '),
+      street: searchAddress?.street || '',
+      searchHasFullAddress: searchAddress?.searchHasFullAddress === true,
+      mapAddress:
+        searchAddress?.addressLabel ||
+        [
+          searchAddress?.city || location.city,
+          searchAddress?.state || location.state || 'IL',
+          searchAddress?.zip || location.zip || requestedZip || '',
+        ]
+          .filter(Boolean)
+          .join(', '),
+      mapsQuery:
+        searchAddress?.addressLabel ||
+        [
+          searchAddress?.city || location.city,
+          searchAddress?.state || location.state || 'IL',
+          searchAddress?.zip || location.zip || requestedZip || '',
+        ]
+          .filter(Boolean)
+          .join(', '),
+      addressLabel:
+        searchAddress?.addressLabel ||
+        [
+          searchAddress?.city || location.city,
+          searchAddress?.state || location.state || 'IL',
+          searchAddress?.zip || location.zip || requestedZip || '',
+        ]
+          .filter(Boolean)
+          .join(', '),
       confidence: statusText || dateText ? 'high' : 'medium',
       dayLabel: '',
       dateLabel: '',
@@ -2652,6 +2666,22 @@ function normalizeEstateSaleCalendarData(sale = {}, requestedDay = '') {
 }
 
 
+function isConfirmedTodayPhysicalEstateSale(sale = {}) {
+  // Day-of EstateSales.net listings are safest when they pass all three checks:
+  // 1) a real full street address was present on the search card or detail page,
+  // 2) the detail page confirms the sale badge as "Estate Sale",
+  // 3) the detail page did not identify it as online-only.
+  const hasFullAddress = Boolean(
+    sale.searchHasFullAddress === true || streetHasHouseNumber(sale.street || ''),
+  );
+  const hasEstateSaleBadge = Boolean(
+    sale.detailSaleBadgeConfirmed === true || /\bestate\s+sale\b/i.test(sale.detailSaleBadge || sale.saleBadge || ''),
+  );
+
+  return hasFullAddress && hasEstateSaleBadge && shouldExcludeOnlineOnlySale(sale) === false;
+}
+
+
 async function fetchAllEstateSales(
   requestedDay = '',
   requestedRadiusMiles = null,
@@ -2734,7 +2764,12 @@ async function fetchAllEstateSales(
       (sale) => !shouldExcludeOnlineOnlySale(sale),
     );
 
-    const calendarNormalized = inPersonSales.map((sale) =>
+    const physicalConfirmedSales =
+      normalizedRequestedDay === 'today'
+        ? inPersonSales.filter((sale) => isConfirmedTodayPhysicalEstateSale(sale))
+        : inPersonSales;
+
+    const calendarNormalized = physicalConfirmedSales.map((sale) =>
       normalizeEstateSaleCalendarData(sale, requestedDay),
     );
 
@@ -2768,6 +2803,7 @@ async function fetchAllEstateSales(
           enriched: enriched.length,
           addressFiltered: addressFiltered.length,
           onlineOnlyFiltered: addressFiltered.length - inPersonSales.length,
+          physicalConfirmed: physicalConfirmedSales.length,
           dayFiltered: dayFiltered.length,
           cacheHit: false,
           requestedDay: normalizedRequestedDay || null,
