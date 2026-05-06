@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v50-true-50-mile-radius-sweep';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v50-true-50-mile-radius-sweep';
+const ESTATE_ROUTE_VERSION = 'source-assist-v51-upcoming-14-day-window';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v51-upcoming-14-day-window';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -19,6 +19,7 @@ const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
 const ZIP_FETCH_CONCURRENCY = 5;
 const DETAIL_FETCH_CONCURRENCY = 8;
 const DETAIL_ENRICH_TARGET_COUNT = 140;
+const UPCOMING_MAX_DAYS_OUT = 14;
 const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
@@ -1324,14 +1325,15 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   }
 
   // Upcoming rule, locked down:
-  // Upcoming means any confirmed sale date that is day-after-tomorrow or later.
-  // It must be confirmed from the sale detail page as exactly "Estate Sale".
+  // Upcoming means any confirmed sale date from day-after-tomorrow through
+  // 14 days out. It must be confirmed from the sale detail page as exactly "Estate Sale".
   // This intentionally allows multi-day sales when one of their shown dates is
   // in the Upcoming window, but it still blocks sales that only show Today or
   // Tomorrow dates. Today/Tomorrow behavior above is untouched.
   if (normalizedRequestedDay === 'upcoming') {
     const todayKey = getChicagoDateKey(new Date());
     const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
+    const maxUpcomingDateKey = addDaysToDateKey(todayKey, UPCOMING_MAX_DAYS_OUT);
 
     if (sale.detailFetched !== true) return false;
     if (sale.detailSaleBadgeConfirmed !== true) return false;
@@ -1361,7 +1363,9 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
 
     if (!allDateKeys.length) return false;
 
-    return allDateKeys.some((dateKey) => dateKey >= dayAfterTomorrowKey);
+    return allDateKeys.some(
+      (dateKey) => dateKey >= dayAfterTomorrowKey && dateKey <= maxUpcomingDateKey,
+    );
   }
 
   if (hasExactTodayDate) return true;
@@ -2838,11 +2842,13 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
   // Upcoming needs special handling because EstateSales.net often exposes the
   // first day of a multi-day sale in structured detail data, while the visible
   // sale card shows the full run like "May 6, 7, 8". For Upcoming, the backend
-  // response should be projected to the first date that is two days out or later
-  // so the app never renders it as a Today/Tomorrow result.
+  // response should be projected to the first date that is two days out or later,
+  // capped at 14 days out, so the app never renders it as a Today/Tomorrow
+  // result or floods with far-future listings.
   if (normalizedRequestedDay === 'upcoming') {
     const todayKey = getChicagoDateKey(new Date());
     const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
+    const maxUpcomingDateKey = addDaysToDateKey(todayKey, UPCOMING_MAX_DAYS_OUT);
     const dateKeys = [];
     const seenDateKeys = new Set();
     const pushDateKey = (value) => {
@@ -2900,7 +2906,12 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
     ).forEach(pushDateKey);
 
     const futureDateKeys = dateKeys
-      .filter((key) => /^20\d{2}-\d{2}-\d{2}$/.test(key) && key >= dayAfterTomorrowKey)
+      .filter(
+        (key) =>
+          /^20\d{2}-\d{2}-\d{2}$/.test(key) &&
+          key >= dayAfterTomorrowKey &&
+          key <= maxUpcomingDateKey,
+      )
       .sort();
 
     if (!futureDateKeys.length) return sale;
@@ -2910,7 +2921,9 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
         const entryKey = String(
           entry?.startDate || entry?.saleDate || entry?.date || entry?.startDateTime || entry?.saleDateTime || '',
         ).slice(0, 10);
-        return /^20\d{2}-\d{2}-\d{2}$/.test(entryKey) && entryKey >= dayAfterTomorrowKey
+        return /^20\d{2}-\d{2}-\d{2}$/.test(entryKey) &&
+          entryKey >= dayAfterTomorrowKey &&
+          entryKey <= maxUpcomingDateKey
           ? { ...entry, startDate: entryKey }
           : null;
       })
