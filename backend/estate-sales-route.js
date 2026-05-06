@@ -7,7 +7,7 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v32-detail-date-lockdown';
+const ESTATE_ROUTE_VERSION = 'source-assist-v33-detail-schedule-date-verify';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1461,10 +1461,28 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
       {};
     const schedule =
       extractScheduleFromJsonLd(html) || extractDetailSchedule(html) || {};
-    const detailDateKeys = extractDetailScheduleDateKeys(
-      html,
-      getChicagoDateParts(new Date()).year,
-    );
+
+    // Second verification: when a listing has a full address, the detail-page
+    // schedule must include the requested date. Do NOT use the wide search-card
+    // snippet for this proof because EstateSales.net can bleed nearby listing
+    // dates into that snippet. Prefer the parsed detail schedule entries first;
+    // only fall back to raw detail-card date extraction when the schedule parser
+    // found no structured entries.
+    const scheduleDateKeys = Array.isArray(schedule.scheduleEntries)
+      ? Array.from(
+          new Set(
+            schedule.scheduleEntries
+              .map((entry) => String(entry?.startDate || entry?.startDateTime || '').slice(0, 10))
+              .filter((key) => /^20\d{2}-\d{2}-\d{2}$/.test(key)),
+          ),
+        ).sort()
+      : [];
+    const detailDateKeys = scheduleDateKeys.length
+      ? scheduleDateKeys
+      : extractDetailScheduleDateKeys(
+          html,
+          getChicagoDateParts(new Date()).year,
+        );
 
     const detail = {
       title: detailTitle || '',
@@ -2867,6 +2885,7 @@ function isConfirmedTodayPhysicalEstateSale(sale = {}) {
   return (
     hasFullAddress &&
     hasExactEstateSaleBadge &&
+    saleMatchesRequestedDetailDate(sale, 'today') &&
     shouldExcludeOnlineOnlySale(sale) === false
   );
 }
