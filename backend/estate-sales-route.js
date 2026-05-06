@@ -7,7 +7,7 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v31-today-address-badge-no-g-crash';
+const ESTATE_ROUTE_VERSION = 'source-assist-v32-detail-date-lockdown';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -351,6 +351,13 @@ function shouldExcludeOnlineOnlySale(sale = {}) {
   // so a real in-person sale can inherit text from an adjacent online-only
   // auction in rawSnippet. Once the detail page has confirmed this is an
   // in-person sale, do not let the contaminated listing snippet remove it.
+  const strongOwnOnlineOnlyText = [sale.title, sale.saleFormat, sale.detailSaleBadge]
+    .filter(Boolean)
+    .join(' ');
+  if (/\bonline\b/i.test(String(sale.title || '')) || isOnlineOnlyEstateSaleText(strongOwnOnlineOnlyText)) {
+    return true;
+  }
+
   if (sale.detailFetched === true && sale.saleFormat === 'in-person-estate-sale') {
     return false;
   }
@@ -966,6 +973,102 @@ function getChicagoDateKey(date = new Date()) {
   return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
 }
 
+function addDaysToDateKey(dateKey = '', days = 0) {
+  const match = String(dateKey || '').match(/^(20\d{2})-(\d{2})-(\d{2})$/);
+  if (!match) return '';
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + Number(days || 0), 12, 0, 0));
+  return date.toISOString().slice(0, 10);
+}
+
+function getTargetDateKeyForRequestedDay(requestedDay = '') {
+  const todayKey = getChicagoDateKey(new Date());
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay || 'today');
+  if (normalizedRequestedDay === 'tomorrow') return addDaysToDateKey(todayKey, 1);
+  if (normalizedRequestedDay === 'today') return todayKey;
+  return '';
+}
+
+function dateKeyFromDetailMonthDay(monthText = '', dayText = '', fallbackYear = null) {
+  const monthNumber = monthNameToNumber(monthText);
+  const dayNumber = Number(String(dayText || '').replace(/\D+/g, ''));
+  const year = Number(fallbackYear) || getChicagoDateParts(new Date()).year;
+  if (!monthNumber || !dayNumber || !year) return '';
+  const date = new Date(Date.UTC(year, monthNumber - 1, dayNumber, 12, 0, 0));
+  return date.toISOString().slice(0, 10);
+}
+
+function extractDetailScheduleDateKeys(detailHtmlOrText = '', fallbackYear = null) {
+  const text = stripHtml(detailHtmlOrText)
+    .replace(/\s+/g, ' ')
+    .trim();
+  const keys = [];
+  const seen = new Set();
+  const pushKey = (key) => {
+    if (!/^20\d{2}-\d{2}-\d{2}$/.test(String(key || ''))) return;
+    if (seen.has(key)) return;
+    seen.add(key);
+    keys.push(key);
+  };
+
+  const year = Number(fallbackYear) || getChicagoDateParts(new Date()).year;
+  const monthWord = '(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
+
+  // Detail-page cards render like: Thu May 7 9am to 3:30pm.
+  const dayCardPattern = new RegExp(
+    `\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\b\s+${monthWord}\s+(\d{1,2})(?:st|nd|rd|th)?\b`,
+    'gi',
+  );
+  for (const match of text.matchAll(dayCardPattern)) {
+    pushKey(dateKeyFromDetailMonthDay(match[1], match[2], year));
+  }
+
+  // Detail/list text can also render like: May 6, 7, 8.
+  const compactListPattern = new RegExp(
+    `\b${monthWord}\s+(\d{1,2}(?:st|nd|rd|th)?(?:\s*,\s*\d{1,2}(?:st|nd|rd|th)?){1,10})`,
+    'gi',
+  );
+  for (const match of text.matchAll(compactListPattern)) {
+    const monthName = match[1];
+    const dayNumbers = String(match[2] || '')
+      .split(/\s*,\s*/)
+      .map((part) => Number(String(part).replace(/\D+/g, '')))
+      .filter((day) => Number.isFinite(day) && day >= 1 && day <= 31);
+    for (const day of dayNumbers) {
+      pushKey(dateKeyFromDetailMonthDay(monthName, String(day), year));
+    }
+  }
+
+  // Use single detail-card dates only when they are near a weekday/schedule card.
+  // Avoid using random SEO text like “address released May 6” as sale proof.
+  const scheduleLikePattern = new RegExp(
+    `\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\b[\s\S]{0,40}?${monthWord}\s+(\d{1,2})(?:st|nd|rd|th)?[\s\S]{0,40}?\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b`,
+    'gi',
+  );
+  for (const match of text.matchAll(scheduleLikePattern)) {
+    pushKey(dateKeyFromDetailMonthDay(match[1], match[2], year));
+  }
+
+  return keys.sort();
+}
+
+function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
+  const targetDateKey = getTargetDateKeyForRequestedDay(requestedDay);
+  if (!targetDateKey) return true;
+
+  const detailDateKeys = Array.isArray(sale.detailDateKeys)
+    ? sale.detailDateKeys.map((key) => String(key || '').slice(0, 10)).filter(Boolean)
+    : [];
+
+  // Once detail-page date cards are available, they are the source of truth.
+  // This blocks search-result bleed-through such as a nearby “May 5 to May 8”
+  // snippet making a Thu/Fri/Sat sale appear under Today.
+  if (detailDateKeys.length) {
+    return detailDateKeys.includes(targetDateKey);
+  }
+
+  return saleMatchesRequestedDay(sale, requestedDay);
+}
+
 function getChicagoMonthDayLabel(date = new Date()) {
   const parts = getChicagoDateParts(date);
   if (!parts.month || !parts.day) return '';
@@ -1318,6 +1421,11 @@ function mergeDetailIntoSale(sale, detail = {}) {
       : Array.isArray(sale.scheduleEntries)
         ? sale.scheduleEntries
         : [],
+    detailDateKeys: Array.isArray(detail.detailDateKeys)
+      ? detail.detailDateKeys
+      : Array.isArray(sale.detailDateKeys)
+        ? sale.detailDateKeys
+        : [],
   };
 }
 
@@ -1353,6 +1461,10 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
       {};
     const schedule =
       extractScheduleFromJsonLd(html) || extractDetailSchedule(html) || {};
+    const detailDateKeys = extractDetailScheduleDateKeys(
+      html,
+      getChicagoDateParts(new Date()).year,
+    );
 
     const detail = {
       title: detailTitle || '',
@@ -1406,6 +1518,7 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
       scheduleEntries: Array.isArray(schedule.scheduleEntries)
         ? schedule.scheduleEntries
         : [],
+      detailDateKeys,
     };
 
     detailPageCache.set(url, detail);
@@ -2656,17 +2769,25 @@ function normalizeEstateSaleCalendarData(sale = {}, requestedDay = '') {
     ? sale.scheduleEntries.map((entry) => normalizeScheduleEntryDate(entry, sale.timeLabel || sale.openingHours || ''))
     : [];
 
-  const visibleDateKeys = extractVisibleEstateSalesDateKeys(
-    [sale.dateText, sale.rawSnippet, sale.descriptionPreview, sale.dateLabel]
-      .filter(Boolean)
-      .join(' '),
-  );
+  const detailDateKeys = Array.isArray(sale.detailDateKeys)
+    ? sale.detailDateKeys.map((key) => String(key || '').slice(0, 10)).filter((key) => /^20\d{2}-\d{2}-\d{2}$/.test(key))
+    : [];
+
+  const visibleDateKeys = detailDateKeys.length
+    ? []
+    : extractVisibleEstateSalesDateKeys(
+        [sale.dateText, sale.rawSnippet, sale.descriptionPreview, sale.dateLabel]
+          .filter(Boolean)
+          .join(' '),
+      );
 
   const existingDateKeys = existingEntries
     .map((entry) => String(entry.startDate || '').slice(0, 10))
     .filter((key) => /^20\d{2}-\d{2}-\d{2}$/.test(key));
 
-  const allDateKeys = Array.from(new Set([...visibleDateKeys, ...existingDateKeys])).sort();
+  const allDateKeys = detailDateKeys.length
+    ? Array.from(new Set(detailDateKeys)).sort()
+    : Array.from(new Set([...visibleDateKeys, ...existingDateKeys])).sort();
   const timeLabel = stripLeadingWeekdayFromTime(
     sale.timeLabel || sale.openingHours || existingEntries.find((entry) => entry.timeLabel)?.timeLabel || '',
   );
@@ -2674,7 +2795,7 @@ function normalizeEstateSaleCalendarData(sale = {}, requestedDay = '') {
   const entriesByDate = new Map();
   for (const entry of existingEntries) {
     const key = String(entry.startDate || '').slice(0, 10);
-    if (/^20\d{2}-\d{2}-\d{2}$/.test(key)) {
+    if (/^20\d{2}-\d{2}-\d{2}$/.test(key) && (!detailDateKeys.length || detailDateKeys.includes(key))) {
       entriesByDate.set(key, normalizeScheduleEntryDate(entry, timeLabel));
     }
   }
@@ -2846,7 +2967,7 @@ async function fetchAllEstateSales(
       const strictDayMatches = calendarNormalized
         .map((sale) => projectSaleToRequestedDay(sale, requestedDay))
         .map((sale) => normalizeEstateSaleCalendarData(sale, requestedDay))
-        .filter((sale) => saleMatchesRequestedDay(sale, requestedDay));
+        .filter((sale) => saleMatchesRequestedDetailDate(sale, requestedDay));
 
       // Do not fall back to all days when the user selected Today/Tomorrow.
       // That fallback is what made Saturday/Friday cards appear under Today.
