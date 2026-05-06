@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v45-upcoming-2days-estate-badge-only';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v45-upcoming-2days-estate-badge-only';
+const ESTATE_ROUTE_VERSION = 'source-assist-v46-upcoming-date-text-badge-only';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v46-upcoming-date-text-badge-only';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1110,6 +1110,72 @@ function extractDetailScheduleDateKeys(detailHtmlOrText = '', fallbackYear = nul
   return keys.sort();
 }
 
+function collectSaleDateKeysFromText(value = '', fallbackYear = null) {
+  const text = stripHtml(value)
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!text) return [];
+
+  const keys = [];
+  const seen = new Set();
+  const year = Number(fallbackYear) || getChicagoDateParts(new Date()).year;
+  const monthWord = '(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
+
+  const pushKey = (key) => {
+    if (!/^20\d{2}-\d{2}-\d{2}$/.test(String(key || ''))) return;
+    if (seen.has(key)) return;
+    seen.add(key);
+    keys.push(key);
+  };
+
+  // May 8, 9, 10
+  const compactListPattern = new RegExp(
+    `\\b${monthWord}\\s+(\\d{1,2}(?:st|nd|rd|th)?(?:\\s*,\\s*\\d{1,2}(?:st|nd|rd|th)?){0,12})`,
+    'gi',
+  );
+  for (const match of text.matchAll(compactListPattern)) {
+    const monthName = match[1];
+    const dayNumbers = String(match[2] || '')
+      .split(/\s*,\s*/)
+      .map((part) => Number(String(part).replace(/\D+/g, '')))
+      .filter((day) => Number.isFinite(day) && day >= 1 && day <= 31);
+
+    for (const day of dayNumbers) {
+      pushKey(dateKeyFromDetailMonthDay(monthName, String(day), year));
+    }
+  }
+
+  // May 8 to May 10 / May 8 - 10 / May 8 thru May 10
+  const rangePattern = new RegExp(
+    `\\b${monthWord}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s*20\\d{2})?\\s*(?:-|–|to|through|thru)\\s*(?:(${monthWord})\\s+)?(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s*20\\d{2})?`,
+    'gi',
+  );
+  for (const match of text.matchAll(rangePattern)) {
+    const startMonth = match[1];
+    const startDay = Number(match[2]);
+    const endMonth = match[3] || startMonth;
+    const endDay = Number(match[4]);
+    const startMonthNumber = monthNameToNumber(startMonth);
+    const endMonthNumber = monthNameToNumber(endMonth);
+    if (!startMonthNumber || !endMonthNumber || !startDay || !endDay) continue;
+
+    const startDate = new Date(Date.UTC(year, startMonthNumber - 1, startDay, 12, 0, 0));
+    const endDate = new Date(Date.UTC(year, endMonthNumber - 1, endDay, 12, 0, 0));
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) continue;
+
+    const stepDate = new Date(startDate);
+    let guard = 0;
+    while (stepDate <= endDate && guard < 45) {
+      pushKey(stepDate.toISOString().slice(0, 10));
+      stepDate.setUTCDate(stepDate.getUTCDate() + 1);
+      guard += 1;
+    }
+  }
+
+  return keys.sort();
+}
+
 function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
   const targetDateKey = getTargetDateKeyForRequestedDay(requestedDay);
@@ -1249,7 +1315,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
       sale.detailSaleBadge,
       sale.saleBadge,
       sale.saleType,
-      sale.detailSaleBadgeConfirmed === true && isExactEstateSaleBadge(detailSaleBadge) ? 'Estate Sale' : '',
+      sale.detailSaleBadgeConfirmed === true && isExactEstateSaleBadge(sale.detailSaleBadge) ? 'Estate Sale' : '',
     ]
       .filter(Boolean)
       .join(' ');
@@ -1260,20 +1326,37 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
   // Upcoming rule:
   // Any sale that is going on 2 days from now or later gets through ONLY when
   // the detail-page little badge section is exactly "Estate Sale".
-  // Do not use full-address logic here, and do not allow online / auction /
-  // moving / tag sale wording to satisfy this rule.
-  // Today/Tomorrow behavior above is intentionally untouched.
+  // It can prove the upcoming date from structured detail keys OR visible date
+  // text like "May 8, 9, 10". Today/Tomorrow behavior above is untouched.
   if (normalizedRequestedDay === 'upcoming') {
     const todayKey = getChicagoDateKey(new Date());
     const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
 
-    const hasUpcomingDate = uniqueDateKeyCandidates.some(
-      (key) => /^20\d{2}-\d{2}-\d{2}$/.test(key) && key >= dayAfterTomorrowKey,
+    if (!isExactEstateSaleBadge(sale.detailSaleBadge)) return false;
+
+    const textDateKeys = collectSaleDateKeysFromText(
+      [
+        sale.dateText,
+        sale.dateLabel,
+        sale.dayLabel,
+        sale.timeLabel,
+        sale.rawSnippet,
+        sale.descriptionPreview,
+        sale.bodyPreview,
+        sale.title,
+      ]
+        .filter(Boolean)
+        .join(' '),
+      getChicagoDateParts(new Date()).year,
     );
 
-    if (!hasUpcomingDate) return false;
+    const allDateKeys = Array.from(
+      new Set([...uniqueDateKeyCandidates, ...textDateKeys].filter(Boolean)),
+    );
 
-    return isExactEstateSaleBadge(sale.detailSaleBadge);
+    return allDateKeys.some(
+      (key) => /^20\d{2}-\d{2}-\d{2}$/.test(key) && key >= dayAfterTomorrowKey,
+    );
   }
 
   if (hasExactTodayDate) return true;
