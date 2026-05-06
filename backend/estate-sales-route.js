@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v48-upcoming-2day-exact-badge-dedupe';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v48-upcoming-2day-exact-badge-dedupe';
+const ESTATE_ROUTE_VERSION = 'source-assist-v49-upcoming-project-future-dates';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v49-upcoming-project-future-dates';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -2783,17 +2783,152 @@ function projectSaleToRequestedDay(sale = {}, requestedDay = '') {
     : [];
   const requestedWindow = getRequestedDateWindow(normalizedRequestedDay);
 
+  // Upcoming needs special handling because EstateSales.net often exposes the
+  // first day of a multi-day sale in structured detail data, while the visible
+  // sale card shows the full run like "May 6, 7, 8". For Upcoming, the backend
+  // response should be projected to the first date that is two days out or later
+  // so the app never renders it as a Today/Tomorrow result.
+  if (normalizedRequestedDay === 'upcoming') {
+    const todayKey = getChicagoDateKey(new Date());
+    const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
+    const dateKeys = [];
+    const seenDateKeys = new Set();
+    const pushDateKey = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return;
+
+      const direct = raw.slice(0, 10);
+      if (/^20\d{2}-\d{2}-\d{2}$/.test(direct)) {
+        if (!seenDateKeys.has(direct)) {
+          seenDateKeys.add(direct);
+          dateKeys.push(direct);
+        }
+        return;
+      }
+
+      const parsed = new Date(raw);
+      if (!Number.isNaN(parsed.getTime())) {
+        const key = getChicagoDateKey(parsed);
+        if (!seenDateKeys.has(key)) {
+          seenDateKeys.add(key);
+          dateKeys.push(key);
+        }
+      }
+    };
+
+    if (Array.isArray(sale.detailDateKeys)) sale.detailDateKeys.forEach(pushDateKey);
+    if (Array.isArray(sale.saleDateKeys)) sale.saleDateKeys.forEach(pushDateKey);
+    entries.forEach((entry) => {
+      pushDateKey(entry?.startDate);
+      pushDateKey(entry?.startDateTime);
+      pushDateKey(entry?.saleDate);
+      pushDateKey(entry?.saleDateTime);
+      pushDateKey(entry?.date);
+    });
+    pushDateKey(sale.startDate);
+    pushDateKey(sale.startDateTime);
+    pushDateKey(sale.saleDate);
+    pushDateKey(sale.saleDateTime);
+    pushDateKey(sale.date);
+
+    collectSaleDateKeysFromText(
+      [
+        sale.dateText,
+        sale.dateLabel,
+        sale.dayLabel,
+        sale.timeLabel,
+        sale.rawSnippet,
+        sale.descriptionPreview,
+        sale.bodyPreview,
+        sale.title,
+      ]
+        .filter(Boolean)
+        .join(' '),
+      getChicagoDateParts(new Date()).year,
+    ).forEach(pushDateKey);
+
+    const futureDateKeys = dateKeys
+      .filter((key) => /^20\d{2}-\d{2}-\d{2}$/.test(key) && key >= dayAfterTomorrowKey)
+      .sort();
+
+    if (!futureDateKeys.length) return sale;
+
+    const futureEntries = entries
+      .map((entry) => {
+        const entryKey = String(
+          entry?.startDate || entry?.saleDate || entry?.date || entry?.startDateTime || entry?.saleDateTime || '',
+        ).slice(0, 10);
+        return /^20\d{2}-\d{2}-\d{2}$/.test(entryKey) && entryKey >= dayAfterTomorrowKey
+          ? { ...entry, startDate: entryKey }
+          : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => String(a.startDate).localeCompare(String(b.startDate)));
+
+    const firstFutureKey = futureDateKeys[0];
+    const matchedEntry =
+      futureEntries.find((entry) => String(entry.startDate).slice(0, 10) === firstFutureKey) ||
+      {
+        dayLabel: weekdayLabelFromDateKey(firstFutureKey),
+        dateLabel: monthDayLabelFromDateKey(firstFutureKey),
+        timeLabel: stripLeadingWeekdayFromTime(sale.timeLabel || sale.openingHours || ''),
+        startTime: sale.startTime || '',
+        endTime: sale.endTime || '',
+        startDate: firstFutureKey,
+        startDateTime: buildChicagoIsoDateTime(
+          firstFutureKey,
+          sale.startTime || sale.timeLabel || sale.openingHours || '',
+        ),
+        sortTimestamp: parseDateKeyToLocalDate(firstFutureKey)?.getTime() || 0,
+      };
+
+    const projectedScheduleEntries = futureDateKeys.map((key) => {
+      const existingEntry = futureEntries.find(
+        (entry) => String(entry.startDate || '').slice(0, 10) === key,
+      );
+      if (existingEntry) {
+        return {
+          ...existingEntry,
+          dayLabel: existingEntry.dayLabel || weekdayLabelFromDateKey(key),
+          dateLabel: existingEntry.dateLabel || monthDayLabelFromDateKey(key),
+          startDate: key,
+          startDateTime:
+            existingEntry.startDateTime ||
+            buildChicagoIsoDateTime(key, existingEntry.startTime || existingEntry.timeLabel || sale.timeLabel || ''),
+        };
+      }
+
+      return {
+        dayLabel: weekdayLabelFromDateKey(key),
+        dateLabel: monthDayLabelFromDateKey(key),
+        timeLabel: stripLeadingWeekdayFromTime(sale.timeLabel || sale.openingHours || ''),
+        startTime: sale.startTime || '',
+        endTime: sale.endTime || '',
+        startDate: key,
+        startDateTime: buildChicagoIsoDateTime(key, sale.startTime || sale.timeLabel || sale.openingHours || ''),
+        sortTimestamp: parseDateKeyToLocalDate(key)?.getTime() || 0,
+      };
+    });
+
+    return {
+      ...sale,
+      dayLabel: matchedEntry.dayLabel || weekdayLabelFromDateKey(firstFutureKey) || '',
+      dateLabel: matchedEntry.dateLabel || monthDayLabelFromDateKey(firstFutureKey) || '',
+      timeLabel: stripLeadingWeekdayFromTime(matchedEntry.timeLabel || sale.timeLabel || ''),
+      startTime: matchedEntry.startTime || sale.startTime || '',
+      endTime: matchedEntry.endTime || sale.endTime || '',
+      startDate: firstFutureKey,
+      startDateTime: matchedEntry.startDateTime || buildChicagoIsoDateTime(firstFutureKey, matchedEntry.startTime || matchedEntry.timeLabel || ''),
+      saleDate: firstFutureKey,
+      saleDateTime: matchedEntry.startDateTime || buildChicagoIsoDateTime(firstFutureKey, matchedEntry.startTime || matchedEntry.timeLabel || ''),
+      date: firstFutureKey,
+      detailDateKeys: futureDateKeys,
+      saleDateKeys: futureDateKeys,
+      scheduleEntries: projectedScheduleEntries,
+    };
+  }
+
   const matchingEntries = entries.filter((entry) => {
-    if (normalizedRequestedDay === 'upcoming') {
-      const todayKey = getChicagoDateKey(new Date());
-      const dayAfterTomorrowKey = addDaysToDateKey(todayKey, 2);
-      const directKey = String(entry?.startDate || entry?.saleDate || entry?.date || '').slice(0, 10);
-      if (/^20\d{2}-\d{2}-\d{2}$/.test(directKey)) return directKey >= dayAfterTomorrowKey;
-
-      const entryDates = getSaleDatesForComparison(entry || {});
-      return entryDates.some((entryDate) => getChicagoDateKey(entryDate) >= dayAfterTomorrowKey);
-    }
-
     if (requestedWindow) {
       const requestedDateKey = getDateKeyForRequestedDay(normalizedRequestedDay);
       const directKey = String(entry?.startDate || entry?.saleDate || entry?.date || '').slice(0, 10);
