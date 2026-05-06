@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v28-today-address-helper-fixed';
+const ESTATE_ROUTE_VERSION = 'source-assist-v29-single-origin-no-stale-fallback';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1752,41 +1752,13 @@ function getEstateSalesSearchTargets(
 
   const radius = Number(_requestedRadiusMiles) || 0;
 
-  // EstateSales.net's primary city/ZIP HTML can miss nearby listings that are
-  // still inside the user's selected GPS radius, especially around large metro
-  // areas where listings are grouped under neighboring city/ZIP pages. For wider
-  // searches, check a small controlled set of nearby EstateSales.net pages, then
-  // still apply true GPS radius filtering after detail-page enrichment. This is
-  // scenario-based, not tied to any one listing.
-  if (radius >= 25) {
-    [
-      ['Chicago', '60643'],
-      ['Chicago', '60655'],
-      ['Chicago', '60652'],
-      ['Chicago', '60638'],
-      ['Willowbrook', '60527'],
-      ['Burr Ridge', '60527'],
-      ['Hinsdale', '60521'],
-      ['La Grange', '60525'],
-    ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
-  }
+  // Keep this strict: only scrape the user's actual EstateSales.net city/ZIP page.
+  // The wider city-target sweep was pulling listings from neighboring Chicago/suburb
+  // pages, so Source Assist showed sales that were not present on the selected
+  // EstateSales.net origin page. That made the app look like it was using fallback
+  // or stale sales. If EstateSales.net does not show it for this city/ZIP/radius
+  // page, this route should not invent it from another city page.
 
-  if (radius >= 50) {
-    [
-      ['Chicago', '60618'],
-      ['Chicago', '60624'],
-      ['Chicago', '60641'],
-      ['Chicago', '60629'],
-      ['Chicago', '60660'],
-      ['Oak Park', '60302'],
-      ['Berwyn', '60402'],
-      ['Orland Park', '60462'],
-      ['Tinley Park', '60477'],
-      ['Schaumburg', '60193'],
-      ['Elmhurst', '60126'],
-      ['Downers Grove', '60515'],
-    ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
-  }
 
   return targets;
 }
@@ -2939,15 +2911,25 @@ router.get('/', async (req, res) => {
       estateSales: sourceAssistSales,
     });
   } catch (error) {
-    console.error('EstateSales route error:', error.message);
+    console.error('EstateSales route error:', error?.stack || error?.message || error);
 
-    return res.status(500).json({
-      success: false,
-      error: 'ESTATE_SALES_FETCH_FAILED',
-      message: error.message,
+    // Never let a backend fetch/parser error leave the mobile app showing old
+    // estate-sale results. Return a successful empty payload so the frontend
+    // clears the list instead of keeping stale cached cards.
+    return res.json({
+      success: true,
+      warning: 'ESTATE_SALES_FETCH_FAILED_EMPTY_RESULTS_RETURNED',
+      message: error?.message || 'EstateSales.net fetch failed',
+      routeVersion: ESTATE_ROUTE_VERSION,
+      source: 'estatesales-net',
+      requestedDay,
+      requestedRadiusMiles,
+      count: 0,
+      searchMode: 'single-city-zip',
       fetchedAt: new Date().toISOString(),
       elapsedMs: Date.now() - requestStartedAt,
       sales: [],
+      estateSales: [],
     });
   }
 });
