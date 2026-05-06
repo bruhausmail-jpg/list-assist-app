@@ -7,21 +7,21 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v54-render-upcoming-2-14-no-cache';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v54-render-upcoming-2-14-no-cache';
+const ESTATE_ROUTE_VERSION = 'source-assist-v55-upcoming-full-app-request-deeper-discovery';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v55-upcoming-full-app-request-deeper-discovery';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RESULTS = 150;
 const DETAIL_FETCH_DELAY_MS = 700;
-const MAX_DETAIL_FETCHES = 220;
+const MAX_DETAIL_FETCHES = 360;
 const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
-const ZIP_FETCH_CONCURRENCY = 5;
-const DETAIL_FETCH_CONCURRENCY = 8;
-const DETAIL_ENRICH_TARGET_COUNT = 220;
+const ZIP_FETCH_CONCURRENCY = 3;
+const DETAIL_FETCH_CONCURRENCY = 6;
+const DETAIL_ENRICH_TARGET_COUNT = 360;
 const UPCOMING_MAX_DAYS_OUT = 14;
 const ESTATE_SALES_DEFAULT_PAGE_LIMIT = 1;
-const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 4;
+const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 8;
 const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
@@ -3593,11 +3593,8 @@ function getUpcomingWindowDateKeys() {
   };
 }
 
-function saleHasUpcomingWindowDateEvidence(sale = {}) {
-  const { startKey, endKey } = getUpcomingWindowDateKeys();
-  if (!startKey || !endKey) return false;
-
-  const candidateKeys = collectSaleDateKeysFromText(
+function getUpcomingWindowCandidateKeys(sale = {}) {
+  return collectSaleDateKeysFromText(
     [
       sale.dateText,
       sale.dateLabel,
@@ -3612,8 +3609,29 @@ function saleHasUpcomingWindowDateEvidence(sale = {}) {
       .join(' '),
     getChicagoDateParts(new Date()).year,
   );
+}
 
-  return candidateKeys.some((key) => key >= startKey && key <= endKey);
+function saleHasUpcomingWindowDateEvidence(sale = {}) {
+  const { startKey, endKey } = getUpcomingWindowDateKeys();
+  if (!startKey || !endKey) return false;
+
+  return getUpcomingWindowCandidateKeys(sale).some(
+    (key) => key >= startKey && key <= endKey,
+  );
+}
+
+function saleHasLaterUpcomingWindowDateEvidence(sale = {}) {
+  const { startKey, endKey } = getUpcomingWindowDateKeys();
+  if (!startKey || !endKey) return false;
+
+  // Prioritize true future rows such as May 14-16 so they get detail-enriched
+  // before the detail fetch cap is hit. Without this, the 50-mile sweep can
+  // spend most detail fetches on May 8/9 rows and never verify the later
+  // 8-14 day sales the app should include.
+  const laterStartKey = addDaysToDateKey(getChicagoDateKey(new Date()), 7);
+  return getUpcomingWindowCandidateKeys(sale).some(
+    (key) => key >= laterStartKey && key <= endKey,
+  );
 }
 
 function sortSalesForDetailEnrichment(sales = [], requestedDay = '') {
@@ -3621,6 +3639,10 @@ function sortSalesForDetailEnrichment(sales = [], requestedDay = '') {
   if (normalizedRequestedDay !== 'upcoming') return sortSales(sales);
 
   return [...sales].sort((a, b) => {
+    const aLaterUpcoming = saleHasLaterUpcomingWindowDateEvidence(a) ? 1 : 0;
+    const bLaterUpcoming = saleHasLaterUpcomingWindowDateEvidence(b) ? 1 : 0;
+    if (aLaterUpcoming !== bLaterUpcoming) return bLaterUpcoming - aLaterUpcoming;
+
     const aUpcoming = saleHasUpcomingWindowDateEvidence(a) ? 1 : 0;
     const bUpcoming = saleHasUpcomingWindowDateEvidence(b) ? 1 : 0;
     if (aUpcoming !== bUpcoming) return bUpcoming - aUpcoming;
