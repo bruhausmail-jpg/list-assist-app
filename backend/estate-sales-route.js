@@ -3,7 +3,7 @@ const axios = require('axios');
 
 const router = express.Router();
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v29-single-origin-no-stale-fallback';
+const ESTATE_ROUTE_VERSION = 'source-assist-v30-simple-today-full-address-estate-sale';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1752,13 +1752,39 @@ function getEstateSalesSearchTargets(
 
   const radius = Number(_requestedRadiusMiles) || 0;
 
-  // Keep this strict: only scrape the user's actual EstateSales.net city/ZIP page.
-  // The wider city-target sweep was pulling listings from neighboring Chicago/suburb
-  // pages, so Source Assist showed sales that were not present on the selected
-  // EstateSales.net origin page. That made the app look like it was using fallback
-  // or stale sales. If EstateSales.net does not show it for this city/ZIP/radius
-  // page, this route should not invent it from another city page.
+  // EstateSales.net can surface day-of physical sales from nearby city pages,
+  // especially around Chicago. For Today, keep discovery broad enough to find
+  // those real physical sales, then filter them hard: full address on the search
+  // card + exact "Estate Sale" badge on the detail page + requested-day match.
+  if (radius >= 25) {
+    [
+      ['Chicago', '60643'],
+      ['Chicago', '60655'],
+      ['Chicago', '60652'],
+      ['Chicago', '60638'],
+      ['Willowbrook', '60527'],
+      ['Burr Ridge', '60527'],
+      ['Hinsdale', '60521'],
+      ['La Grange', '60525'],
+    ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
+  }
 
+  if (radius >= 50) {
+    [
+      ['Chicago', '60618'],
+      ['Chicago', '60624'],
+      ['Chicago', '60641'],
+      ['Chicago', '60629'],
+      ['Chicago', '60660'],
+      ['Oak Park', '60302'],
+      ['Berwyn', '60402'],
+      ['Orland Park', '60462'],
+      ['Tinley Park', '60477'],
+      ['Schaumburg', '60193'],
+      ['Elmhurst', '60126'],
+      ['Downers Grove', '60515'],
+    ].forEach(([targetCity, targetZip]) => addTarget(targetCity, targetZip));
+  }
 
   return targets;
 }
@@ -2693,18 +2719,22 @@ function normalizeEstateSaleCalendarData(sale = {}, requestedDay = '') {
 
 
 function isConfirmedTodayPhysicalEstateSale(sale = {}) {
-  // Day-of EstateSales.net listings are safest when they pass all three checks:
-  // 1) a real full street address was present on the search card or detail page,
-  // 2) the detail page confirms the sale badge as "Estate Sale",
-  // 3) the detail page did not identify it as online-only.
+  // Super-simple Today rule:
+  // 1) Search/list card must expose a real full address, not just city/state.
+  //    Detail-page full address can also pass this because some cards are sparse.
+  // 2) Detail page must show the exact badge text "Estate Sale".
+  // 3) Online-only language always loses.
   const hasFullAddress = Boolean(
     sale.searchHasFullAddress === true || streetHasHouseNumber(sale.street || ''),
   );
-  const hasEstateSaleBadge = Boolean(
-    sale.detailSaleBadgeConfirmed === true || /\bestate\s+sale\b/i.test(sale.detailSaleBadge || sale.saleBadge || ''),
-  );
+  const exactBadgeText = String(sale.detailSaleBadge || '').trim().toLowerCase();
+  const hasExactEstateSaleBadge = exactBadgeText === 'estate sale';
 
-  return hasFullAddress && hasEstateSaleBadge && shouldExcludeOnlineOnlySale(sale) === false;
+  return (
+    hasFullAddress &&
+    hasExactEstateSaleBadge &&
+    shouldExcludeOnlineOnlySale(sale) === false
+  );
 }
 
 
