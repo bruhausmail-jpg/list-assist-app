@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v57-today-tomorrow-radius-sweep-no-upcoming';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-06-v57-today-tomorrow-radius-sweep-no-upcoming';
+const ESTATE_ROUTE_VERSION = 'source-assist-v58-today-estate-moving-full-html-sweep';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-07-v58-today-estate-moving-full-html-sweep';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -468,11 +468,30 @@ function extractDetailSaleBadge(html = '') {
   return '';
 }
 
-function isExactEstateSaleBadge(value = '') {
+function normalizeSaleBadgeLabel(value = '') {
   return String(value || '')
     .replace(/\s+/g, ' ')
     .trim()
-    .toLowerCase() === 'estate sale';
+    .toLowerCase();
+}
+
+function isExactEstateSaleBadge(value = '') {
+  return normalizeSaleBadgeLabel(value) === 'estate sale';
+}
+
+function isExactMovingSaleBadge(value = '') {
+  return normalizeSaleBadgeLabel(value) === 'moving sale';
+}
+
+function isAllowedInPersonSaleBadge(value = '') {
+  const normalized = normalizeSaleBadgeLabel(value);
+  return normalized === 'estate sale' || normalized === 'moving sale';
+}
+
+function getNormalizedInPersonSaleBadge(value = '') {
+  if (isExactMovingSaleBadge(value)) return 'Moving Sale';
+  if (isExactEstateSaleBadge(value)) return 'Estate Sale';
+  return '';
 }
 
 function cleanDetailTitle(value = '') {
@@ -1333,12 +1352,12 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
       sale.detailSaleBadge,
       sale.saleBadge,
       sale.saleType,
-      sale.detailSaleBadgeConfirmed === true && isExactEstateSaleBadge(sale.detailSaleBadge) ? 'Estate Sale' : '',
+      sale.detailSaleBadgeConfirmed === true && isAllowedInPersonSaleBadge(sale.detailSaleBadge) ? getNormalizedInPersonSaleBadge(sale.detailSaleBadge) : '',
     ]
       .filter(Boolean)
       .join(' ');
 
-    return /\bestate\s+sale\b/i.test(badgeText);
+    return /\b(?:estate|moving)\s+sale\b/i.test(badgeText);
   }
 
   // Upcoming rule, locked down:
@@ -1352,7 +1371,7 @@ function saleMatchesRequestedDetailDate(sale = {}, requestedDay = '') {
 
     if (sale.detailFetched !== true) return false;
     if (sale.detailSaleBadgeConfirmed !== true) return false;
-    if (!isExactEstateSaleBadge(sale.detailSaleBadge)) return false;
+    if (!isAllowedInPersonSaleBadge(sale.detailSaleBadge)) return false;
 
     const textDateKeys = collectSaleDateKeysFromText(
       [
@@ -1824,9 +1843,9 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
       isOnlineOnly,
       saleFormat: isOnlineOnly ? 'online-only-auction' : 'in-person-estate-sale',
       saleType: 'estate-sale',
-      saleBadge: detailSaleBadge || 'Estate Sale',
+      saleBadge: getNormalizedInPersonSaleBadge(detailSaleBadge) || detailSaleBadge || 'Estate Sale',
       detailSaleBadge: detailSaleBadge || '',
-      detailSaleBadgeConfirmed: isExactEstateSaleBadge(detailSaleBadge),
+      detailSaleBadgeConfirmed: isAllowedInPersonSaleBadge(detailSaleBadge),
       mapAddress:
         address.addressLabel ||
         buildAddressLabel({
@@ -1980,7 +1999,7 @@ function parseEstateSalesFromHtml(html, requestedZip, requestedDay = '') {
   // rows inside the 14-day window, such as May 14-16 Aurora/Tinley Park sales.
   // If we trim the HTML before parsing links, those rows are never discovered
   // and the backend filter never gets a chance to approve them.
-  if (normalizedRequestedDay === 'today') {
+  if (false && normalizedRequestedDay === 'today') {
     cutoffCandidates.push(
       lowerHtml.indexOf("below are the sales that didn't quite match"),
       lowerHtml.indexOf('below are the sales that didn&#39;t quite match'),
@@ -2565,7 +2584,7 @@ function getSaleQualityScore(sale = {}) {
   return (
     (sale.detailFetched === true ? 80 : 0) +
     (sale.detailSaleBadgeConfirmed === true ? 60 : 0) +
-    (isExactEstateSaleBadge(sale.detailSaleBadge) ? 50 : 0) +
+    (isAllowedInPersonSaleBadge(sale.detailSaleBadge) ? 50 : 0) +
     (sale.saleFormat === 'in-person-estate-sale' ? 35 : 0) +
     (sale.coordinateSource === 'detail-page' ? 25 : 0) +
     (sale.street ? 25 : 0) +
