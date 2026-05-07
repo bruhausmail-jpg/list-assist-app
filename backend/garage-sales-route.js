@@ -221,9 +221,18 @@ function extractStreetAddressFromText(value) {
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      return String(match[1])
+      const candidate = String(match[1])
         .replace(/[,:;.-]+$/g, '')
         .trim();
+      const hasRoadSuffix = /\b(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)\b/i.test(candidate);
+
+      // Avoid treating listing years like "2026 The Tall Grass" as a street
+      // address when Craigslist/body text puts the year near the title.
+      if (hasYearLikeHouseNumberPrefix(candidate) && !hasRoadSuffix) {
+        continue;
+      }
+
+      return candidate;
     }
   }
 
@@ -244,9 +253,9 @@ function extractExactAddressFromText(value) {
     '(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)';
 
   const exactPattern = new RegExp(
-    "\b((?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,7}\s" +
+    "\\b((?:\\d+[A-Za-z]\\d+|\\d+[A-Za-z]?|\\d+-\\d+)\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z0-9.#'\\-]+(?:\\s+[A-Za-z0-9.#'\\-]+){0,7}\\s" +
       streetSuffix +
-      "\.?)(?:,)?\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:,)?\s+([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?\b",
+      "\\.?)(?:,)?\\s+([A-Za-z][A-Za-z .'\\-]{1,40}?)(?:,)?\\s+([A-Z]{2})\\s*(\\d{5}(?:-\\d{4})?)?\\b",
     'i',
   );
 
@@ -376,6 +385,12 @@ function hasHouseNumberPrefix(value) {
   const text = cleanAddressFragment(value);
   return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\b/i.test(text);
 }
+function hasYearLikeHouseNumberPrefix(value) {
+  const text = cleanAddressFragment(value);
+  const match = text.match(/^(19\d{2}|20\d{2})\b/);
+  return Boolean(match);
+}
+
 
 function isLikelyStreetName(value) {
   const text = normalizeRoadAbbreviation(value);
@@ -542,12 +557,16 @@ function getDefaultCityFromContext({
   title,
   mapAddress,
   approximateAddress,
+  bodyText,
+  locationDetail,
 }) {
   const combined = [
     cleanAddressFragment(hood),
     cleanAddressFragment(title),
     cleanAddressFragment(mapAddress),
     cleanAddressFragment(approximateAddress),
+    cleanAddressFragment(bodyText),
+    cleanAddressFragment(locationDetail),
   ]
     .filter(Boolean)
     .join(' ')
@@ -564,6 +583,11 @@ function getDefaultCityFromContext({
   if (combined.includes('plainfield')) return 'Plainfield';
   if (combined.includes('darien')) return 'Darien';
   if (combined.includes('lisle')) return 'Lisle';
+  if (combined.includes('aurora')) return 'Aurora';
+  if (combined.includes('oswego')) return 'Oswego';
+  if (combined.includes('wheaton')) return 'Wheaton';
+  if (combined.includes('lockport')) return 'Lockport';
+  if (combined.includes('yorkville')) return 'Yorkville';
 
   return '';
 }
@@ -780,6 +804,8 @@ function buildFinalAddressData({
     title,
     mapAddress: cleanMapAddress,
     approximateAddress: cleanApproximateAddress,
+    bodyText: cleanBodyText,
+    locationDetail: cleanLocationDetail,
   });
 
   const inferredCity =
@@ -800,7 +826,6 @@ function buildFinalAddressData({
   const zip = exactBodyAddress.zip || hoodParts.zip || '';
 
   const displayAddress =
-    exactBodyAddress.addressLabel ||
     buildMapsQuery([
       street,
       crossStreet ? `near ${crossStreet}` : '',
@@ -808,6 +833,7 @@ function buildFinalAddressData({
       state,
       zip,
     ]) ||
+    exactBodyAddress.addressLabel ||
     cleanMapAddress ||
     cleanApproximateAddress ||
     cleanHood ||
@@ -815,7 +841,6 @@ function buildFinalAddressData({
     'Approximate location';
 
   const mapsQuery =
-    exactBodyAddress.addressLabel ||
     buildPreferredMapsQuery({
       street,
       crossStreet,
@@ -825,7 +850,8 @@ function buildFinalAddressData({
       mapAddress: cleanMapAddress,
       approximateAddress: cleanApproximateAddress,
       fallbackAddressLabel: cleanFallback,
-    });
+    }) ||
+    exactBodyAddress.addressLabel;
 
   return {
     street,
@@ -837,6 +863,7 @@ function buildFinalAddressData({
     addressLabel: displayAddress,
     displayAddress,
     mapAddress:
+      buildMapsQuery([street, city, state, zip]) ||
       exactBodyAddress.addressLabel ||
       cleanMapAddress ||
       cleanApproximateAddress ||
