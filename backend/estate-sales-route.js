@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v59-today-tomorrow-deep-discovery-moving';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-07-v59-today-tomorrow-deep-discovery-moving';
+const ESTATE_ROUTE_VERSION = 'source-assist-v60-multiday-detail-date-keys';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-07-v60-multiday-detail-date-keys';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -1094,54 +1094,96 @@ function dateKeyFromDetailMonthDay(monthText = '', dayText = '', fallbackYear = 
 }
 
 function extractDetailScheduleDateKeys(detailHtmlOrText = '', fallbackYear = null) {
-  const text = stripHtml(detailHtmlOrText)
+  const rawText = String(detailHtmlOrText || '');
+  const text = stripHtml(rawText)
+    .replace(/\\u0026/g, '&')
+    .replace(/\\u003c/gi, '<')
+    .replace(/\\u003e/gi, '>')
     .replace(/\s+/g, ' ')
     .trim();
+
   const keys = [];
   const seen = new Set();
-  const pushKey = (key) => {
-    if (!/^20\d{2}-\d{2}-\d{2}$/.test(String(key || ''))) return;
-    if (seen.has(key)) return;
-    seen.add(key);
-    keys.push(key);
-  };
-
   const year = Number(fallbackYear) || getChicagoDateParts(new Date()).year;
   const monthWord = '(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
 
-  // Detail-page cards render like: Thu May 7 9am to 3:30pm.
+  const pushKey = (key) => {
+    const cleanKey = String(key || '').slice(0, 10);
+    if (!/^20\d{2}-\d{2}-\d{2}$/.test(cleanKey)) return;
+    if (seen.has(cleanKey)) return;
+    seen.add(cleanKey);
+    keys.push(cleanKey);
+  };
+
+  const pushMonthDay = (monthName, dayValue, explicitYear = null) => {
+    const day = Number(String(dayValue || '').replace(/\D+/g, ''));
+    if (!day || day < 1 || day > 31) return;
+    pushKey(dateKeyFromDetailMonthDay(monthName, String(day), explicitYear || year));
+  };
+
+  // Detail page cards can render as "Thu May 7 9am to 4pm" or
+  // "Thursday, May 7 9:00am to 4:00pm".
   const dayCardPattern = new RegExp(
-    `\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\b\s+${monthWord}\s+(\d{1,2})(?:st|nd|rd|th)?\b`,
+    `\\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\\b[\\s,•-]{0,8}${monthWord}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,\\s*(20\\d{2}))?\\b`,
     'gi',
   );
   for (const match of text.matchAll(dayCardPattern)) {
-    pushKey(dateKeyFromDetailMonthDay(match[1], match[2], year));
+    pushMonthDay(match[1], match[2], match[3] ? Number(match[3]) : null);
   }
 
-  // Detail/list text can also render like: May 6, 7, 8.
+  // List cards and fallback text render the important cases like:
+  // "May 6, 7, 8", "May 7, 8", "May 7, 8, 9, 10".
   const compactListPattern = new RegExp(
-    `\b${monthWord}\s+(\d{1,2}(?:st|nd|rd|th)?(?:\s*,\s*\d{1,2}(?:st|nd|rd|th)?){1,10})`,
+    `\\b${monthWord}\\s+(\\d{1,2}(?:st|nd|rd|th)?(?:\\s*,\\s*\\d{1,2}(?:st|nd|rd|th)?){1,12})(?:,?\\s*(20\\d{2}))?`,
     'gi',
   );
   for (const match of text.matchAll(compactListPattern)) {
     const monthName = match[1];
-    const dayNumbers = String(match[2] || '')
+    const explicitYear = match[3] ? Number(match[3]) : year;
+    String(match[2] || '')
       .split(/\s*,\s*/)
       .map((part) => Number(String(part).replace(/\D+/g, '')))
-      .filter((day) => Number.isFinite(day) && day >= 1 && day <= 31);
-    for (const day of dayNumbers) {
-      pushKey(dateKeyFromDetailMonthDay(monthName, String(day), year));
+      .filter((day) => Number.isFinite(day) && day >= 1 && day <= 31)
+      .forEach((day) => pushMonthDay(monthName, day, explicitYear));
+  }
+
+  // Range text: "May 6 to May 8", "May 7 - 10", "May 7 thru May 10".
+  const rangePattern = new RegExp(
+    `\\b${monthWord}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s*(20\\d{2}))?\\s*(?:-|–|to|through|thru)\\s*(?:(${monthWord})\\s+)?(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s*(20\\d{2}))?`,
+    'gi',
+  );
+  for (const match of text.matchAll(rangePattern)) {
+    const startMonth = match[1];
+    const startDay = Number(match[2]);
+    const explicitStartYear = match[3] ? Number(match[3]) : year;
+    const endMonth = match[4] || startMonth;
+    const endDay = Number(match[5]);
+    const explicitEndYear = match[6] ? Number(match[6]) : explicitStartYear;
+    const startMonthNumber = monthNameToNumber(startMonth);
+    const endMonthNumber = monthNameToNumber(endMonth);
+    if (!startMonthNumber || !endMonthNumber || !startDay || !endDay) continue;
+
+    const startDate = new Date(Date.UTC(explicitStartYear, startMonthNumber - 1, startDay, 12, 0, 0));
+    const endDate = new Date(Date.UTC(explicitEndYear, endMonthNumber - 1, endDay, 12, 0, 0));
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) continue;
+
+    const stepDate = new Date(startDate);
+    let guard = 0;
+    while (stepDate <= endDate && guard < 45) {
+      pushKey(stepDate.toISOString().slice(0, 10));
+      stepDate.setUTCDate(stepDate.getUTCDate() + 1);
+      guard += 1;
     }
   }
 
-  // Use single detail-card dates only when they are near a weekday/schedule card.
-  // Avoid using random SEO text like “address released May 6” as sale proof.
+  // Single schedule dates only when close to a weekday/time, to avoid SEO text
+  // such as "Address released May 6" becoming sale-date proof.
   const scheduleLikePattern = new RegExp(
-    `\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\b[\s\S]{0,40}?${monthWord}\s+(\d{1,2})(?:st|nd|rd|th)?[\s\S]{0,40}?\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b`,
+    `\\b(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day)?\\b[\\s\\S]{0,60}?${monthWord}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,\\s*(20\\d{2}))?[\\s\\S]{0,80}?\\b\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)\\b`,
     'gi',
   );
   for (const match of text.matchAll(scheduleLikePattern)) {
-    pushKey(dateKeyFromDetailMonthDay(match[1], match[2], year));
+    pushMonthDay(match[1], match[2], match[3] ? Number(match[3]) : null);
   }
 
   return keys.sort();
@@ -1815,12 +1857,13 @@ async function fetchDetailEnhancements(url, fallbackLocation = {}) {
           ),
         ).sort()
       : [];
-    const detailDateKeys = scheduleDateKeys.length
-      ? scheduleDateKeys
-      : extractDetailScheduleDateKeys(
-          html,
-          getChicagoDateParts(new Date()).year,
-        );
+    const rawDetailDateKeys = extractDetailScheduleDateKeys(
+      html,
+      getChicagoDateParts(new Date()).year,
+    );
+    const detailDateKeys = Array.from(
+      new Set([...scheduleDateKeys, ...rawDetailDateKeys].filter((key) => /^20\d{2}-\d{2}-\d{2}$/.test(String(key || '')))),
+    ).sort();
 
     const detail = {
       title: detailTitle || '',
