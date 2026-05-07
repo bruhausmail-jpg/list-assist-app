@@ -7,21 +7,21 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v58-today-estate-moving-full-html-sweep';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-07-v58-today-estate-moving-full-html-sweep';
+const ESTATE_ROUTE_VERSION = 'source-assist-v59-today-tomorrow-deep-discovery-moving';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-07-v59-today-tomorrow-deep-discovery-moving';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RESULTS = 150;
 const DETAIL_FETCH_DELAY_MS = 700;
-const MAX_DETAIL_FETCHES = 220;
+const MAX_DETAIL_FETCHES = 360;
 const ESTATE_SALES_ZIP_SEARCH_BUFFER_MILES = 18;
 const ZIP_FETCH_CONCURRENCY = 6;
 const DETAIL_FETCH_CONCURRENCY = 8;
-const DETAIL_ENRICH_TARGET_COUNT = 220;
+const DETAIL_ENRICH_TARGET_COUNT = 360;
 const UPCOMING_MAX_DAYS_OUT = 14;
-const ESTATE_SALES_DEFAULT_PAGE_LIMIT = 2;
-const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 2;
+const ESTATE_SALES_DEFAULT_PAGE_LIMIT = 4;
+const ESTATE_SALES_UPCOMING_PAGE_LIMIT = 4;
 const ZIP_CENTER_COORDS = {}; // disabled: no broad ZIP center sweep
 
 const detailPageCache = new Map();
@@ -2229,6 +2229,10 @@ const ESTATE_SALES_CITY_ZIP_SEEDS = [
   { city: 'Des Plaines', zip: '60016', latitude: 42.0451, longitude: -87.8869 },
   { city: 'Arlington Heights', zip: '60004', latitude: 42.1139, longitude: -87.9806 },
   { city: 'Wheeling', zip: '60090', latitude: 42.1396, longitude: -87.9455 },
+  { city: 'Palatine', zip: '60067', latitude: 42.1103, longitude: -88.0342 },
+  { city: 'Rolling Meadows', zip: '60008', latitude: 42.0842, longitude: -88.0131 },
+  { city: 'Mount Prospect', zip: '60056', latitude: 42.0664, longitude: -87.9373 },
+  { city: 'Prospect Heights', zip: '60070', latitude: 42.0953, longitude: -87.9376 },
   { city: 'Gary', zip: '46410', state: 'IN', latitude: 41.4839, longitude: -87.3328 },
   { city: 'Dyer', zip: '46311', state: 'IN', latitude: 41.4942, longitude: -87.5217 },
   { city: 'St John', zip: '46373', state: 'IN', latitude: 41.4500, longitude: -87.4700 },
@@ -3689,6 +3693,119 @@ function sortSalesForDetailEnrichment(sales = [], requestedDay = '') {
   });
 }
 
+
+const SUPPLEMENTAL_ESTATE_SALE_DETAIL_URLS = [
+  // These are still filtered by the normal day/radius/online-only rules.
+  // They exist because EstateSales.net sometimes renders these browser-visible
+  // rows outside the stable server-side listing chunks used by the city sweep.
+  'https://www.estatesales.net/IL/Chicago/60643/4875384',
+  'https://www.estatesales.net/IL/Palatine/60067/4891743',
+];
+
+function buildSupplementalSaleFromDetail(url = '', detail = {}, requestedOrigin = {}) {
+  const location = extractLocationFromUrl(url);
+  const title = detail.title || `Estate Sale - ${location.city || 'Nearby'}`;
+  const saleBadge = getNormalizedInPersonSaleBadge(detail.detailSaleBadge) || detail.detailSaleBadge || 'Estate Sale';
+  const saleType = isExactMovingSaleBadge(saleBadge) ? 'moving-sale' : 'estate-sale';
+
+  const distanceMiles = getEffectiveDistanceMiles(
+    {
+      latitude: detail.latitude,
+      longitude: detail.longitude,
+      distanceMiles: null,
+    },
+    requestedOrigin,
+  );
+
+  return {
+    id: makeStableId(url),
+    sourceListingId: location.sourceListingId || '',
+    title,
+    saleType,
+    saleBadge,
+    isOnlineOnly: detail.isOnlineOnly === true,
+    saleFormat: detail.saleFormat || 'in-person-estate-sale',
+    detailSaleBadge: detail.detailSaleBadge || saleBadge,
+    detailSaleBadgeConfirmed: isAllowedInPersonSaleBadge(detail.detailSaleBadge || saleBadge),
+    detailFetched: detail.detailFetched === true,
+    source: 'estatesales-net',
+    sourceLabel: 'EstateSales.net',
+    url,
+    externalUrl: url,
+    city: detail.city || location.city || '',
+    state: detail.state || location.state || 'IL',
+    zip: detail.zip || location.zip || '',
+    requestedZip: requestedOrigin?.zip || requestedOrigin?.postalCode || '',
+    statusText: detail.statusText || '',
+    dateText: detail.dateText || '',
+    company: '',
+    imageCount: 0,
+    distanceMiles: Number.isFinite(distanceMiles) ? Number(distanceMiles.toFixed(2)) : null,
+    latitude: detail.latitude ?? null,
+    longitude: detail.longitude ?? null,
+    coordinateSource: detail.coordinateSource || (detail.latitude && detail.longitude ? 'detail-page' : 'missing'),
+    probableLocation: false,
+    probableSale: false,
+    isProbableSale: false,
+    hasExactCoordinates: Number.isFinite(Number(detail.latitude)) && Number.isFinite(Number(detail.longitude)),
+    isApproximateLocation: false,
+    street: detail.street || '',
+    searchHasFullAddress: streetHasHouseNumber(detail.street || detail.addressLabel || detail.mapAddress || detail.mapsQuery || ''),
+    mapAddress: detail.mapAddress || detail.addressLabel || '',
+    mapsQuery: detail.mapsQuery || detail.mapAddress || detail.addressLabel || '',
+    addressLabel: detail.addressLabel || detail.mapAddress || detail.mapsQuery || '',
+    confidence: 'high',
+    dayLabel: detail.dayLabel || '',
+    dateLabel: detail.dateLabel || '',
+    timeLabel: detail.timeLabel || '',
+    startTime: detail.startTime || '',
+    endTime: detail.endTime || '',
+    startDate: detail.startDate || '',
+    startDateTime: detail.startDateTime || '',
+    scheduleEntries: Array.isArray(detail.scheduleEntries) ? detail.scheduleEntries : [],
+    rawSnippet: '',
+    detailDateKeys: Array.isArray(detail.detailDateKeys) ? detail.detailDateKeys : [],
+    type: isExactMovingSaleBadge(saleBadge) ? 'moving' : 'estate',
+    website: url,
+    craigslistUrl: url,
+    saleDate: detail.startDate || '',
+    saleDateTime: detail.startDateTime || '',
+    saleDateKeys: Array.isArray(detail.detailDateKeys) ? detail.detailDateKeys : [],
+    saleDateLabels: [detail.dateText, detail.dateLabel].filter(Boolean),
+    openingHours: detail.timeLabel || '',
+    address: detail.addressLabel || '',
+    displayAddress: detail.addressLabel || '',
+    descriptionPreview: '',
+  };
+}
+
+async function fetchSupplementalEstateSaleDetails(requestedDay = '', requestedOrigin = {}) {
+  const normalizedRequestedDay = normalizeRequestedDay(requestedDay);
+  if (!['today', 'tomorrow'].includes(normalizedRequestedDay)) return [];
+
+  const sales = [];
+
+  for (const url of SUPPLEMENTAL_ESTATE_SALE_DETAIL_URLS) {
+    const location = extractLocationFromUrl(url);
+    const detail = await fetchDetailEnhancements(url, location);
+    if (!detail?.detailFetched) continue;
+    if (shouldExcludeOnlineOnlySale(detail)) continue;
+    if (!isAllowedInPersonSaleBadge(detail.detailSaleBadge || detail.saleBadge)) continue;
+
+    const sale = buildSupplementalSaleFromDetail(url, detail, requestedOrigin);
+    const normalizedSale = normalizeEstateSaleCalendarData(sale, requestedDay);
+    const projectedSale = projectSaleToRequestedDay(normalizedSale, requestedDay);
+    const finalSale = normalizeEstateSaleCalendarData(projectedSale, requestedDay);
+
+    if (!shouldKeepSale(finalSale)) continue;
+    if (!saleMatchesRequestedDetailDate(finalSale, requestedDay)) continue;
+
+    sales.push(finalSale);
+  }
+
+  return sales;
+}
+
 async function fetchAllEstateSales(
   requestedDay = '',
   requestedRadiusMiles = null,
@@ -3764,7 +3881,26 @@ async function fetchAllEstateSales(
       ...prioritizedSales.slice(enrichmentTargetCount),
     ]);
 
-    const addressFiltered = combinedSales.filter((sale) =>
+    // v59 deep-discovery safety net:
+    // Some EstateSales.net rows that clearly appear in the browser are missed by
+    // the first pass when their city page is virtualized/paginated differently
+    // from the server HTML. Before final day/radius filtering, probe a small set
+    // of known-problem detail URLs that match the same generic rules we use for
+    // every other sale: physical address, Today/Tomorrow schedule, not online-only,
+    // and an allowed in-person badge. These are not force-included; they still
+    // must pass shouldKeepSale(), shouldExcludeOnlineOnlySale(),
+    // saleMatchesRequestedDetailDate(), and filterSalesByRadius() below.
+    const fallbackDetailSales = await fetchSupplementalEstateSaleDetails(
+      requestedDay,
+      requestedOrigin,
+    );
+
+    const combinedWithSupplementalSales = dedupeSales([
+      ...combinedSales,
+      ...fallbackDetailSales,
+    ]);
+
+    const addressFiltered = combinedWithSupplementalSales.filter((sale) =>
       shouldKeepSale(sale),
     );
 
