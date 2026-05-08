@@ -526,92 +526,70 @@ function getEvidenceTextForCategoryDecision(query, item) {
 }
 
 function getDirectCategoryInheritanceCandidate(params = {}) {
-  const query = cleanHint(params.query);
   const groups = [
     {
       source: 'sold',
       items: Array.isArray(params.soldItems) ? params.soldItems : [],
-      sourceBoost: 55,
-      sourceWeight: 2.5,
     },
     {
       source: 'image',
       items: Array.isArray(params.imageItems) ? params.imageItems : [],
-      sourceBoost: 42,
-      sourceWeight: 2,
     },
     {
       source: 'text',
       items: Array.isArray(params.textItems) ? params.textItems : [],
-      sourceBoost: 36,
-      sourceWeight: 1.75,
     },
     {
       source: 'active',
       items: Array.isArray(params.activeItems) ? params.activeItems : [],
-      sourceBoost: 28,
-      sourceWeight: 1.25,
     },
   ];
 
   const scores = new Map();
-  const rootCounts = new Map();
 
-  groups.forEach(({ source, items, sourceBoost, sourceWeight }) => {
-    items.forEach((item, index) => {
-      const directPath = getDirectEbayCategoryPath(item);
+  groups.forEach(({ source, items }) => {
+    items.forEach((item) => {
+      const directPath = normalizeCategoryPath(getDirectEbayCategoryPath(item));
       if (!directPath || isWeakCategoryPath(directPath)) return;
 
-      // This path came directly from eBay Browse result categories. Trust it.
-      // Do not reject it with local vertical guesses; those caused valid items
-      // such as beauty tools to show no category.
-      const relevance = getItemTitleRelevanceScore(
-        query || item?.title || '',
-        item,
-      );
-      const root = getCategoryRoot(directPath);
-      if (root) rootCounts.set(root, (rootCounts.get(root) || 0) + 1);
-
-      const pathKey = directPath;
-      const current = scores.get(pathKey) || {
+      const categoryId = getEbayCategoryId(item);
+      const current = scores.get(directPath) || {
         categoryPath: directPath,
-        categoryId: getEbayCategoryId(item),
+        categoryId: categoryId || '',
         votes: 0,
-        weightedScore: 0,
         sources: { sold: 0, image: 0, text: 0, active: 0 },
         exampleTitles: [],
       };
 
       current.votes += 1;
       current.sources[source] = (current.sources[source] || 0) + 1;
-      current.weightedScore +=
-        sourceBoost +
-        relevance * sourceWeight +
-        Math.max(0, 20 - index) +
-        Math.min(14, getCategoryDepth(directPath) * 2.5);
 
-      if (!current.categoryId) current.categoryId = getEbayCategoryId(item);
-      if (item?.title && current.exampleTitles.length < 4) {
+      if (!current.categoryId && categoryId) current.categoryId = categoryId;
+      if (item?.title && current.exampleTitles.length < 5) {
         current.exampleTitles.push(item.title);
       }
 
-      scores.set(pathKey, current);
+      scores.set(directPath, current);
     });
   });
 
   const sortedVotes = Array.from(scores.values()).sort((a, b) => {
-    const rootDelta =
-      (rootCounts.get(getCategoryRoot(b.categoryPath)) || 0) -
-      (rootCounts.get(getCategoryRoot(a.categoryPath)) || 0);
-    if (rootDelta) return rootDelta;
-
-    const soldDelta = (b.sources.sold || 0) - (a.sources.sold || 0);
-    if (soldDelta) return soldDelta;
-
     const voteDelta = b.votes - a.votes;
     if (voteDelta) return voteDelta;
 
-    return b.weightedScore - a.weightedScore;
+    // Tie-breaker only: sold comps are stronger than active/image/text, but the
+    // primary decision is still the most common category among eBay results.
+    const soldDelta = (b.sources.sold || 0) - (a.sources.sold || 0);
+    if (soldDelta) return soldDelta;
+
+    const imageDelta = (b.sources.image || 0) - (a.sources.image || 0);
+    if (imageDelta) return imageDelta;
+
+    const depthDelta =
+      getCategoryDepth(b.categoryPath) - getCategoryDepth(a.categoryPath);
+    if (depthDelta) return depthDelta;
+
+    return a.categoryPath.localeCompare(b.categoryPath);
   });
 
   const best = sortedVotes[0];
@@ -620,21 +598,15 @@ function getDirectCategoryInheritanceCandidate(params = {}) {
   return {
     bestCategoryPath: best.categoryPath,
     bestCategoryId: best.categoryId || '',
-    categoryConfidence:
-      best.votes >= 2 || best.sources.sold > 0 || best.weightedScore >= 70
-        ? 'high'
-        : 'medium',
+    categoryConfidence: best.votes >= 2 ? 'high' : 'medium',
     categorySource:
-      best.sources.sold > 0
-        ? 'ebay-direct-sold-consensus'
-        : best.votes >= 2
-          ? 'ebay-direct-result-consensus'
-          : 'ebay-direct-best-result',
-    categoryVotes: sortedVotes.slice(0, 8).map((entry) => ({
+      best.votes >= 2
+        ? 'ebay-most-common-category'
+        : 'ebay-only-returned-category',
+    categoryVotes: sortedVotes.slice(0, 10).map((entry) => ({
       categoryPath: entry.categoryPath,
       categoryId: entry.categoryId || '',
       votes: entry.votes,
-      weightedScore: Number(entry.weightedScore.toFixed(2)),
       sources: entry.sources,
       exampleTitles: entry.exampleTitles,
     })),
@@ -648,73 +620,10 @@ async function enrichEbayItemsWithCategorySuggestions(
 ) {
   if (!Array.isArray(items) || !items.length) return [];
 
-  // eBay Browse category data is the source of truth. If any matched result
-  // already includes a real eBay category path, preserve that data exactly and
-  // let the consensus scorer choose the best category from those eBay results.
-  const hasAnyDirectCategory = items.some((item) => {
-    const path = getDirectEbayCategoryPath(item);
-    return path && !isWeakCategoryPath(path);
-  });
-
-  if (hasAnyDirectCategory) {
-    return items;
-  }
-
-  // Only use taxonomy suggestions when Browse did not return categories.
-  const querySuggestions = query
-    ? await getEbayTaxonomyCategorySuggestions(query, accessToken).catch(
-        (error) => {
-          console.warn('Query category suggestion failed:', error.message);
-          return [];
-        },
-      )
-    : [];
-
-  const enriched = [];
-  for (const item of items) {
-    if (!item) continue;
-
-    const currentPath = getEbayCategoryPath(item);
-    if (currentPath && !isWeakCategoryPath(currentPath)) {
-      enriched.push(item);
-      continue;
-    }
-
-    const title = cleanHint(item.title || query);
-    const titleSuggestions = title
-      ? await getEbayTaxonomyCategorySuggestions(title, accessToken).catch(
-          (error) => {
-            console.warn('Title category suggestion failed:', error.message);
-            return [];
-          },
-        )
-      : [];
-
-    const bestSuggestion = [...titleSuggestions, ...querySuggestions].find(
-      (suggestion) => suggestion?.categoryPath,
-    );
-
-    if (bestSuggestion?.categoryPath) {
-      enriched.push({
-        ...item,
-        categoryPath: bestSuggestion.categoryPath,
-        ebayCategoryPath: bestSuggestion.categoryPath,
-        inferredCategoryPath: bestSuggestion.categoryPath,
-        categoryId: item.categoryId || bestSuggestion.categoryId || '',
-        categoryPathSource: 'ebay-taxonomy-fallback',
-        leafCategoryIds:
-          Array.isArray(item.leafCategoryIds) && item.leafCategoryIds.length
-            ? item.leafCategoryIds
-            : bestSuggestion.categoryId
-              ? [bestSuggestion.categoryId]
-              : item.leafCategoryIds,
-      });
-    } else {
-      enriched.push(item);
-    }
-  }
-
-  return enriched;
+  // Category source of truth: eBay Browse results. Do not inject taxonomy,
+  // hard-coded categories, or local fallbacks here. The category decision is
+  // made later by counting the most common direct eBay category among matches.
+  return items;
 }
 
 function getEbayCategoryPath(item) {
@@ -1017,7 +926,6 @@ function buildCategorySuggestion(params = {}) {
   const textItems = Array.isArray(params.textItems) ? params.textItems : [];
 
   const directCandidate = getDirectCategoryInheritanceCandidate({
-    query: params.query,
     activeItems,
     soldItems,
     imageItems,
@@ -1026,112 +934,14 @@ function buildCategorySuggestion(params = {}) {
 
   if (directCandidate) return directCandidate;
 
-  // No direct Browse category came back. Use taxonomy-enriched paths if present.
-  const weightedItems = [
-    ...soldItems.map((item, index) => ({
-      item,
-      source: 'sold',
-      weight: 2.25,
-      index,
-    })),
-    ...imageItems.map((item, index) => ({
-      item,
-      source: 'image',
-      weight: 1.85,
-      index,
-    })),
-    ...textItems.map((item, index) => ({
-      item,
-      source: 'text',
-      weight: 1.35,
-      index,
-    })),
-    ...activeItems.map((item, index) => ({
-      item,
-      source: 'active',
-      weight: 1,
-      index,
-    })),
-  ];
-
-  const scores = new Map();
-  weightedItems.forEach(({ item, source, weight, index }) => {
-    const path = normalizeCategoryPath(getEbayCategoryPath(item));
-    if (!path || isWeakCategoryPath(path)) return;
-
-    const relevance = getItemTitleRelevanceScore(
-      cleanHint(params.query) || item?.title || '',
-      item,
-    );
-    const categoryId = getEbayCategoryId(item);
-    const current = scores.get(path) || {
-      categoryPath: path,
-      categoryId: categoryId || '',
-      votes: 0,
-      weightedScore: 0,
-      sources: { sold: 0, image: 0, text: 0, active: 0 },
-      exampleTitles: [],
-    };
-
-    current.votes += 1;
-    current.weightedScore +=
-      relevance * weight +
-      Math.max(0, 14 - index) +
-      Math.min(10, getCategoryDepth(path) * 1.5) +
-      (source === 'sold'
-        ? 10
-        : source === 'image'
-          ? 7
-          : source === 'text'
-            ? 4
-            : 0);
-    current.sources[source] = (current.sources[source] || 0) + 1;
-    if (!current.categoryId && categoryId) current.categoryId = categoryId;
-    if (item?.title && current.exampleTitles.length < 3)
-      current.exampleTitles.push(item.title);
-    scores.set(path, current);
-  });
-
-  const sortedVotes = Array.from(scores.values()).sort((a, b) => {
-    const soldDelta = (b.sources.sold || 0) - (a.sources.sold || 0);
-    if (soldDelta) return soldDelta;
-    const voteDelta = b.votes - a.votes;
-    if (voteDelta) return voteDelta;
-    return b.weightedScore - a.weightedScore;
-  });
-
-  const best = sortedVotes[0];
-  if (!best) {
-    return {
-      bestCategoryPath: '',
-      bestCategoryId: '',
-      categoryConfidence: 'none',
-      categorySource: 'none',
-      categoryVotes: [],
-    };
-  }
-
+  // No fallback. If eBay returned no direct category on matched items, leave it
+  // blank so the frontend can tell the user there was no eBay category returned.
   return {
-    bestCategoryPath: best.categoryPath,
-    bestCategoryId: best.categoryId,
-    categoryConfidence:
-      best.votes >= 2 || best.sources.sold > 0 || best.weightedScore >= 45
-        ? 'high'
-        : 'medium',
-    categorySource:
-      best.sources.sold > 0
-        ? 'ebay-taxonomy-or-direct-sold'
-        : best.votes >= 2
-          ? 'ebay-taxonomy-or-direct-consensus'
-          : 'ebay-taxonomy-or-direct-best-match',
-    categoryVotes: sortedVotes.slice(0, 8).map((entry) => ({
-      categoryPath: entry.categoryPath,
-      categoryId: entry.categoryId,
-      votes: entry.votes,
-      weightedScore: Number(entry.weightedScore.toFixed(2)),
-      sources: entry.sources,
-      exampleTitles: entry.exampleTitles,
-    })),
+    bestCategoryPath: '',
+    bestCategoryId: '',
+    categoryConfidence: 'none',
+    categorySource: 'no-ebay-result-category',
+    categoryVotes: [],
   };
 }
 
