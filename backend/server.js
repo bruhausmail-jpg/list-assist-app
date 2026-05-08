@@ -58,6 +58,12 @@ const EBAY_BROWSE_IMAGE_SEARCH_URL =
     ? 'https://api.sandbox.ebay.com/buy/browse/v1/item_summary/search_by_image'
     : 'https://api.ebay.com/buy/browse/v1/item_summary/search_by_image';
 
+const EBAY_TAXONOMY_BASE_URL =
+  EBAY_ENVIRONMENT === 'sandbox'
+    ? 'https://api.sandbox.ebay.com/commerce/taxonomy/v1'
+    : 'https://api.ebay.com/commerce/taxonomy/v1';
+const EBAY_MARKETPLACE_ID = 'EBAY_US';
+
 // Cache token in memory
 let tokenCache = {
   accessToken: null,
@@ -168,6 +174,203 @@ function tokenizeSearchText(value) {
     .filter((word) => !stopWords.has(word));
 }
 
+let categoryTreeCache = {
+  marketplaceId: '',
+  treeId: '',
+  expiresAt: 0,
+};
+
+const ebayCategorySuggestionCache = new Map();
+
+function getCategorySuggestionCacheKey(query) {
+  return normalizeSearchText(query).slice(0, 120);
+}
+
+async function getEbayCategoryTreeId(accessToken) {
+  const now = Date.now();
+  if (
+    categoryTreeCache.treeId &&
+    categoryTreeCache.marketplaceId === EBAY_MARKETPLACE_ID &&
+    now < categoryTreeCache.expiresAt
+  ) {
+    return categoryTreeCache.treeId;
+  }
+
+  const url = new URL(`${EBAY_TAXONOMY_BASE_URL}/get_default_category_tree_id`);
+  url.searchParams.set('marketplace_id', EBAY_MARKETPLACE_ID);
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(
+      `eBay taxonomy tree lookup failed: ${response.status} ${text}`,
+    );
+  }
+
+  const data = await response.json();
+  const treeId = String(data?.categoryTreeId || '').trim();
+  if (!treeId) throw new Error('eBay taxonomy response missing categoryTreeId');
+
+  categoryTreeCache = {
+    marketplaceId: EBAY_MARKETPLACE_ID,
+    treeId,
+    expiresAt: now + 24 * 60 * 60 * 1000,
+  };
+
+  return treeId;
+}
+
+function buildCategoryPathFromTaxonomySuggestion(suggestion) {
+  const names = [];
+  const ancestors = Array.isArray(suggestion?.categoryTreeNodeAncestors)
+    ? suggestion.categoryTreeNodeAncestors
+    : [];
+
+  ancestors
+    .slice()
+    .sort(
+      (a, b) =>
+        Number(a?.categoryTreeNodeLevel || 0) -
+        Number(b?.categoryTreeNodeLevel || 0),
+    )
+    .forEach((ancestor) => {
+      const name = String(
+        ancestor?.categoryName || ancestor?.category?.categoryName || '',
+      ).trim();
+      if (name) names.push(name);
+    });
+
+  const leafName = String(suggestion?.category?.categoryName || '').trim();
+  if (leafName) names.push(leafName);
+
+  return normalizeCategoryPath(names.join(' > '));
+}
+
+async function getEbayTaxonomyCategorySuggestions(query, accessToken) {
+  const cleaned = cleanHint(query);
+  const cacheKey = getCategorySuggestionCacheKey(cleaned);
+  if (!cacheKey) return [];
+
+  const cached = ebayCategorySuggestionCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) return cached.suggestions;
+
+  const treeId = await getEbayCategoryTreeId(accessToken);
+  const url = new URL(
+    `${EBAY_TAXONOMY_BASE_URL}/category_tree/${encodeURIComponent(treeId)}/get_category_suggestions`,
+  );
+  url.searchParams.set('q', cleaned.slice(0, 350));
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    console.warn(
+      'eBay taxonomy category suggestions failed:',
+      response.status,
+      text,
+    );
+    return [];
+  }
+
+  const data = await response.json();
+  const suggestions = Array.isArray(data?.categorySuggestions)
+    ? data.categorySuggestions
+        .map((suggestion) => {
+          const categoryPath =
+            buildCategoryPathFromTaxonomySuggestion(suggestion);
+          const categoryId = String(
+            suggestion?.category?.categoryId || '',
+          ).trim();
+          return {
+            categoryPath,
+            categoryId,
+          };
+        })
+        .filter(
+          (suggestion) =>
+            suggestion.categoryPath &&
+            !isWeakCategoryPath(suggestion.categoryPath),
+        )
+    : [];
+
+  ebayCategorySuggestionCache.set(cacheKey, {
+    suggestions,
+    expiresAt: Date.now() + 12 * 60 * 60 * 1000,
+  });
+
+  return suggestions;
+}
+
+async function enrichEbayItemsWithCategorySuggestions(
+  items,
+  accessToken,
+  query = '',
+) {
+  if (!Array.isArray(items) || !items.length) return [];
+
+  const querySuggestions = query
+    ? await getEbayTaxonomyCategorySuggestions(query, accessToken).catch(
+        (error) => {
+          console.warn('Query category suggestion failed:', error.message);
+          return [];
+        },
+      )
+    : [];
+
+  const enriched = [];
+  for (const item of items) {
+    if (!item) continue;
+
+    const currentPath = getEbayCategoryPath(item);
+    if (currentPath && !isWeakCategoryPath(currentPath)) {
+      enriched.push(item);
+      continue;
+    }
+
+    const title = cleanHint(item.title || query);
+    const titleSuggestions = title
+      ? await getEbayTaxonomyCategorySuggestions(title, accessToken).catch(
+          (error) => {
+            console.warn('Title category suggestion failed:', error.message);
+            return [];
+          },
+        )
+      : [];
+
+    const bestSuggestion = titleSuggestions[0] || querySuggestions[0] || null;
+    if (bestSuggestion?.categoryPath) {
+      enriched.push({
+        ...item,
+        categoryPath: bestSuggestion.categoryPath,
+        ebayCategoryPath: bestSuggestion.categoryPath,
+        inferredCategoryPath: bestSuggestion.categoryPath,
+        categoryId: item.categoryId || bestSuggestion.categoryId || '',
+        leafCategoryIds:
+          Array.isArray(item.leafCategoryIds) && item.leafCategoryIds.length
+            ? item.leafCategoryIds
+            : bestSuggestion.categoryId
+              ? [bestSuggestion.categoryId]
+              : item.leafCategoryIds,
+      });
+    } else {
+      enriched.push(item);
+    }
+  }
+
+  return enriched;
+}
+
 function getEbayCategoryPath(item) {
   if (!item) return '';
 
@@ -175,6 +378,7 @@ function getEbayCategoryPath(item) {
     item.categoryPath,
     item.ebayCategoryPath,
     item.inferredCategoryPath,
+    item.ebaySuggestedCategoryPath,
     item.primaryCategory?.categoryPath,
     item.itemCategory?.categoryPath,
   ];
@@ -233,6 +437,8 @@ function normalizeCategoryPath(value) {
 
   if (!cleaned) return '';
   if (/everything else/i.test(cleaned)) return '';
+  if (/specialty category based on item type/i.test(cleaned)) return '';
+  if (/^other| > other/i.test(cleaned)) return '';
   return cleaned;
 }
 
@@ -442,7 +648,7 @@ function isWeakCategoryPath(path) {
   const normalized = normalizeSearchText(path);
   return (
     !normalized ||
-    /everything else|misc|unknown|not specified|specialty category based on item type/.test(
+    /everything else|\bother\b|misc|unknown|not specified|specialty category based on item type|verify exact ebay category/.test(
       normalized,
     )
   );
@@ -682,7 +888,7 @@ app.get('/api/ebay-search', async (req, res) => {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+        'X-EBAY-C-MARKETPLACE-ID': EBAY_MARKETPLACE_ID,
       },
     });
 
@@ -705,9 +911,14 @@ app.get('/api/ebay-search', async (req, res) => {
       });
     }
 
-    const itemSummaries = Array.isArray(data?.itemSummaries)
+    const rawItemSummaries = Array.isArray(data?.itemSummaries)
       ? data.itemSummaries
       : [];
+    const itemSummaries = await enrichEbayItemsWithCategorySuggestions(
+      rawItemSummaries,
+      accessToken,
+      query,
+    );
 
     const categorySuggestion = buildCategorySuggestion({
       query,
@@ -752,7 +963,7 @@ app.get('/api/ebay-sold', async (req, res) => {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+        'X-EBAY-C-MARKETPLACE-ID': EBAY_MARKETPLACE_ID,
       },
     });
 
@@ -775,9 +986,14 @@ app.get('/api/ebay-sold', async (req, res) => {
       });
     }
 
-    const itemSummaries = Array.isArray(data?.itemSummaries)
+    const rawItemSummaries = Array.isArray(data?.itemSummaries)
       ? data.itemSummaries
       : [];
+    const itemSummaries = await enrichEbayItemsWithCategorySuggestions(
+      rawItemSummaries,
+      accessToken,
+      query,
+    );
 
     const categorySuggestion = buildCategorySuggestion({
       query,
@@ -839,7 +1055,7 @@ app.post(
             headers: {
               Authorization: `Bearer ${accessToken}`,
               'Content-Type': 'application/json',
-              'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+              'X-EBAY-C-MARKETPLACE-ID': EBAY_MARKETPLACE_ID,
             },
             body: JSON.stringify({
               image: imageBase64,
@@ -902,7 +1118,7 @@ app.post(
             headers: {
               Authorization: `Bearer ${accessToken}`,
               'Content-Type': 'application/json',
-              'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+              'X-EBAY-C-MARKETPLACE-ID': EBAY_MARKETPLACE_ID,
             },
           });
 
@@ -932,13 +1148,26 @@ app.post(
         .sort((a, b) => b.score - a.score)
         .map((entry) => entry.item);
 
-      const limitedMerged = merged.slice(0, limit);
-      const limitedImageMatches = imageMatches.slice(0, limit);
-      const limitedTextMatches = textMatches.slice(0, limit);
+      const categoryQuery = exactQuery || hint;
+      const limitedMerged = await enrichEbayItemsWithCategorySuggestions(
+        merged.slice(0, limit),
+        accessToken,
+        categoryQuery,
+      );
+      const limitedImageMatches = await enrichEbayItemsWithCategorySuggestions(
+        imageMatches.slice(0, limit),
+        accessToken,
+        categoryQuery,
+      );
+      const limitedTextMatches = await enrichEbayItemsWithCategorySuggestions(
+        textMatches.slice(0, limit),
+        accessToken,
+        categoryQuery,
+      );
       const photoCount = uploadedFiles.length;
 
       const categorySuggestion = buildCategorySuggestion({
-        query: exactQuery || hint,
+        query: categoryQuery,
         activeItems: limitedMerged,
         imageItems: limitedImageMatches,
         textItems: limitedTextMatches,
