@@ -463,11 +463,7 @@ function getDirectEbayCategoryPath(item) {
 
   for (const candidate of directCandidates) {
     const cleaned = normalizeCategoryPath(candidate);
-    if (
-      cleaned &&
-      cleaned.includes(' > ') &&
-      isTrustedDirectCategoryPath(item, cleaned)
-    ) {
+    if (cleaned && isTrustedDirectCategoryPath(item, cleaned)) {
       return cleaned;
     }
   }
@@ -479,17 +475,27 @@ function getDirectEbayCategoryPath(item) {
       .filter(Boolean);
 
     if (names.length) {
-      // eBay Browse usually returns categories leaf -> parent -> root.
-      // Display and score them in the normal eBay path order: root -> parent -> leaf.
-      const rootToLeaf = names.slice().reverse();
-      const path = normalizeCategoryPath(rootToLeaf.join(' > '));
-      if (
-        path &&
-        path.includes(' > ') &&
-        isTrustedDirectCategoryPath(item, path)
-      )
-        return path;
+      // eBay Browse commonly returns category arrays leaf -> parent -> root.
+      // If only one category is returned, use that eBay-returned leaf category.
+      // If multiple are returned, display them root -> parent -> leaf.
+      const pathParts = names.length > 1 ? names.slice().reverse() : names;
+      const path = normalizeCategoryPath(pathParts.join(' > '));
+      if (path && isTrustedDirectCategoryPath(item, path)) return path;
     }
+  }
+
+  const leafCandidates = [
+    item.categoryName,
+    item.primaryCategoryName,
+    item.leafCategoryName,
+    item.category,
+    item.primaryCategory?.categoryName,
+    item.itemCategory?.categoryName,
+  ];
+
+  for (const candidate of leafCandidates) {
+    const cleaned = normalizeCategoryPath(candidate);
+    if (cleaned && !isWeakCategoryPath(cleaned)) return cleaned;
   }
 
   return '';
