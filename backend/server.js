@@ -121,14 +121,508 @@ function buildLooseItemHintQuery(hint) {
   return cleaned;
 }
 
+function normalizeSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenizeSearchText(value) {
+  const stopWords = new Set([
+    'the',
+    'and',
+    'for',
+    'with',
+    'from',
+    'new',
+    'used',
+    'open',
+    'box',
+    'lot',
+    'pack',
+    'set',
+    'item',
+    'items',
+    'sale',
+    'free',
+    'shipping',
+    'rare',
+    'nice',
+    'look',
+    'see',
+    'photo',
+    'photos',
+    'picture',
+    'pictured',
+    'excellent',
+    'condition',
+  ]);
+
+  return normalizeSearchText(value)
+    .split(' ')
+    .map((word) => word.trim())
+    .filter((word) => word.length > 2)
+    .filter((word) => !stopWords.has(word));
+}
+
+function getEbayCategoryPath(item) {
+  if (!item) return '';
+
+  const directCandidates = [
+    item.categoryPath,
+    item.ebayCategoryPath,
+    item.inferredCategoryPath,
+    item.primaryCategory?.categoryPath,
+    item.itemCategory?.categoryPath,
+  ];
+
+  for (const candidate of directCandidates) {
+    const cleaned = normalizeCategoryPath(candidate);
+    if (cleaned && cleaned.includes(' > ')) return cleaned;
+  }
+
+  if (Array.isArray(item.categories) && item.categories.length) {
+    const names = item.categories
+      .map((category) => category?.categoryName || category?.name || '')
+      .map((name) => String(name).trim())
+      .filter(Boolean);
+
+    if (names.length) {
+      return normalizeCategoryPath(names.join(' > '));
+    }
+  }
+
+  const leafCandidates = [
+    item.categoryName,
+    item.primaryCategoryName,
+    item.leafCategoryName,
+    item.category,
+    item.primaryCategory?.categoryName,
+    item.itemCategory?.categoryName,
+  ];
+
+  const leaf = leafCandidates
+    .map((candidate) => String(candidate || '').trim())
+    .find(Boolean);
+
+  return leaf ? mapLeafCategoryToPath(leaf) : '';
+}
+
+function getEbayCategoryId(item) {
+  if (!item) return '';
+
+  return String(
+    item.leafCategoryIds?.[0] ||
+      item.categoryId ||
+      item.categoryIds?.[0] ||
+      item.primaryCategory?.categoryId ||
+      item.itemCategory?.categoryId ||
+      item.categories?.[item.categories.length - 1]?.categoryId ||
+      '',
+  ).trim();
+}
+
+function normalizeCategoryPath(value) {
+  const cleaned = String(value || '')
+    .replace(/\s*>\s*/g, ' > ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned) return '';
+  if (/everything else/i.test(cleaned)) return '';
+  return cleaned;
+}
+
+function mapLeafCategoryToPath(value) {
+  const normalized = normalizeSearchText(value);
+
+  if (/(^art$|paintings|painting|watercolor|original art)/.test(normalized)) {
+    return 'Art > Paintings';
+  }
+
+  if (
+    /(cable testers|wiremapper|network tester|testers calibrators|test measurement)/.test(
+      normalized,
+    )
+  ) {
+    return 'Business & Industrial > Test, Measurement & Inspection > Testers & Calibrators > Cable Testers & Trackers';
+  }
+
+  if (/(stockpot|stockpots|saucepans|cookware)/.test(normalized)) {
+    return 'Home & Garden > Kitchen, Dining & Bar > Cookware > Saucepans & Stockpots';
+  }
+
+  if (/(coca cola|coca-cola|coke|advertising|soda|glasses)/.test(normalized)) {
+    return 'Collectibles > Advertising > Soda > Coca-Cola > Glasses';
+  }
+
+  if (/(hot sauce|bbq|condiments|sauces|hot honey)/.test(normalized)) {
+    return 'Home & Garden > Food & Beverages > Pantry > Condiments & Sauces > BBQ & Hot Sauces';
+  }
+
+  if (
+    /(cleaning products|household cleaning|disinfectant|disinfecting|cleaner)/.test(
+      normalized,
+    )
+  ) {
+    return 'Home & Garden > Household Supplies & Cleaning > Cleaning Products';
+  }
+
+  if (
+    /(deodorant|deodorants|antiperspirant|antiperspirants)/.test(normalized)
+  ) {
+    return 'Health & Beauty > Bath & Body > Deodorants & Antiperspirants';
+  }
+
+  if (/(lip balm|lip treatments|chapstick)/.test(normalized)) {
+    return 'Health & Beauty > Skin Care > Lip Balm & Treatments';
+  }
+
+  if (/(vitamin|vitamins|minerals|supplements)/.test(normalized)) {
+    return 'Health & Beauty > Vitamins & Lifestyle Supplements > Vitamins & Minerals';
+  }
+
+  if (/dry shampoo/.test(normalized)) {
+    return 'Health & Beauty > Hair Care & Styling > Dry Shampoos';
+  }
+
+  return String(value || '').trim();
+}
+
+function inferCategoryPathFromItemEvidence(item) {
+  const evidenceParts = [
+    item?.title,
+    item?.categoryName,
+    item?.primaryCategoryName,
+    item?.leafCategoryName,
+    item?.condition,
+  ];
+
+  if (Array.isArray(item?.localizedAspects)) {
+    item.localizedAspects.forEach((aspect) => {
+      evidenceParts.push(aspect?.name);
+      if (Array.isArray(aspect?.values)) {
+        evidenceParts.push(...aspect.values);
+      } else {
+        evidenceParts.push(aspect?.value);
+      }
+    });
+  }
+
+  [item?.aspects, item?.itemSpecifics].forEach((source) => {
+    if (!source) return;
+    Object.entries(source).forEach(([key, value]) => {
+      evidenceParts.push(key);
+      if (Array.isArray(value)) {
+        evidenceParts.push(...value);
+      } else {
+        evidenceParts.push(value);
+      }
+    });
+  });
+
+  const normalized = normalizeSearchText(
+    evidenceParts.filter(Boolean).join(' '),
+  );
+
+  if (
+    /(artist|painting|watercolor|production technique|original licensed reproduction|illustration art|framed matted|framing framed|subject humor|laurie beth)/.test(
+      normalized,
+    ) &&
+    /(painting|watercolor|artist|laurie beth|original by)/.test(normalized)
+  ) {
+    return 'Art > Paintings';
+  }
+
+  if (
+    /(cable tester|wiremapper|wire mapper|linkmaster|rj45|cat5|cat5e|cat6|ethernet tester|network tester|toner|tone generator|62 200|62-200)/.test(
+      normalized,
+    )
+  ) {
+    return 'Business & Industrial > Test, Measurement & Inspection > Testers & Calibrators > Cable Testers & Trackers';
+  }
+
+  if (
+    /(le creuset|stockpot|stock pot|saucepan|cookware|enamel on steel|enameled steel|8 qt|8qt|marseille)/.test(
+      normalized,
+    )
+  ) {
+    return 'Home & Garden > Kitchen, Dining & Bar > Cookware > Saucepans & Stockpots';
+  }
+
+  if (
+    /(coca cola|coca-cola|coke).*(glass|glasses|ceramic|advertising|soda)|type of advertising|theme soda/.test(
+      normalized,
+    )
+  ) {
+    return 'Collectibles > Advertising > Soda > Coca-Cola > Glasses';
+  }
+
+  if (
+    /(hot honey|mike s hot honey|mikes hot honey|honey infused|chili peppers|hot sauce|bbq sauce)/.test(
+      normalized,
+    )
+  ) {
+    return 'Home & Garden > Food & Beverages > Pantry > Condiments & Sauces > BBQ & Hot Sauces';
+  }
+
+  if (
+    /(lysol|clorox|disinfecting|disinfectant|sanitizing|all purpose cleaner|cleaning spray|household cleaner)/.test(
+      normalized,
+    )
+  ) {
+    return 'Home & Garden > Household Supplies & Cleaning > Cleaning Products';
+  }
+
+  if (
+    /(deodorant|antiperspirant|old spice|invisible solid|solid stick|odor protection)/.test(
+      normalized,
+    )
+  ) {
+    return 'Health & Beauty > Bath & Body > Deodorants & Antiperspirants';
+  }
+
+  if (
+    /(lip balm|chapstick|lip treatment|dry lips|shea butter|coconut oil|vitamin e)/.test(
+      normalized,
+    )
+  ) {
+    return 'Health & Beauty > Skin Care > Lip Balm & Treatments';
+  }
+
+  if (
+    /(vitamin|mineral|supplement|superbeets|beet|gummy|gummies|capsule|tablet|softgel|heart health)/.test(
+      normalized,
+    )
+  ) {
+    return 'Health & Beauty > Vitamins & Lifestyle Supplements > Vitamins & Minerals';
+  }
+
+  if (
+    /(dry shampoo|hair care|hair styling|beach texture|texturizing)/.test(
+      normalized,
+    )
+  ) {
+    return 'Health & Beauty > Hair Care & Styling > Dry Shampoos';
+  }
+
+  return '';
+}
+
+function getItemTitleRelevanceScore(query, item) {
+  const queryTokens = new Set(tokenizeSearchText(query));
+  const titleTokens = tokenizeSearchText(item?.title || '');
+
+  if (!queryTokens.size || !titleTokens.length) return 0;
+
+  let score = 0;
+  titleTokens.forEach((token) => {
+    if (queryTokens.has(token)) score += 7;
+  });
+
+  const normalizedQuery = normalizeSearchText(query);
+  const normalizedTitle = normalizeSearchText(item?.title || '');
+
+  if (normalizedQuery && normalizedTitle.includes(normalizedQuery)) score += 28;
+  if (normalizedTitle && normalizedQuery.includes(normalizedTitle)) score += 28;
+
+  Array.from(queryTokens)
+    .filter((token) => token.length >= 5)
+    .forEach((token) => {
+      if (normalizedTitle.includes(token)) score += 4;
+    });
+
+  return score;
+}
+
+function isWeakCategoryPath(path) {
+  const normalized = normalizeSearchText(path);
+  return (
+    !normalized ||
+    /everything else|misc|unknown|not specified|specialty category based on item type/.test(
+      normalized,
+    )
+  );
+}
+
+function getCategoryRoot(path) {
+  return normalizeCategoryPath(path).split(' > ')[0] || '';
+}
+
+function getCategoryDepth(path) {
+  return normalizeCategoryPath(path).split(' > ').filter(Boolean).length;
+}
+
+function buildCategorySuggestion(params = {}) {
+  const query = cleanHint(params.query);
+  const activeItems = Array.isArray(params.activeItems)
+    ? params.activeItems
+    : [];
+  const soldItems = Array.isArray(params.soldItems) ? params.soldItems : [];
+  const imageItems = Array.isArray(params.imageItems) ? params.imageItems : [];
+  const textItems = Array.isArray(params.textItems) ? params.textItems : [];
+
+  const weightedItems = [
+    ...soldItems.map((item, index) => ({
+      item,
+      source: 'sold',
+      weight: 2.25,
+      index,
+    })),
+    ...imageItems.map((item, index) => ({
+      item,
+      source: 'image',
+      weight: 1.85,
+      index,
+    })),
+    ...textItems.map((item, index) => ({
+      item,
+      source: 'text',
+      weight: 1.35,
+      index,
+    })),
+    ...activeItems.map((item, index) => ({
+      item,
+      source: 'active',
+      weight: 1,
+      index,
+    })),
+  ];
+
+  const scores = new Map();
+  const rootCounts = new Map();
+
+  weightedItems.forEach(({ item, source, weight, index }) => {
+    const directPath = getEbayCategoryPath(item);
+    const inferredPath = directPath || inferCategoryPathFromItemEvidence(item);
+    const path = normalizeCategoryPath(inferredPath);
+
+    if (!path || isWeakCategoryPath(path)) return;
+
+    const relevance = getItemTitleRelevanceScore(
+      query || item?.title || '',
+      item,
+    );
+    const inferredBoost = !directPath && inferredPath ? 10 : 0;
+
+    if (query && relevance < 6 && !inferredBoost) return;
+
+    const root = getCategoryRoot(path);
+    const categoryId = getEbayCategoryId(item);
+    const positionBoost = Math.max(0, 14 - index) * 0.25;
+    const depthBoost = Math.min(10, getCategoryDepth(path) * 1.5);
+    const sourceBoost =
+      source === 'sold'
+        ? 10
+        : source === 'image'
+          ? 7
+          : source === 'text'
+            ? 4
+            : 0;
+
+    const score =
+      relevance * weight +
+      positionBoost +
+      depthBoost +
+      sourceBoost +
+      inferredBoost;
+
+    const current = scores.get(path) || {
+      categoryPath: path,
+      categoryId: categoryId || '',
+      votes: 0,
+      weightedScore: 0,
+      sources: { sold: 0, image: 0, text: 0, active: 0 },
+      exampleTitles: [],
+    };
+
+    current.votes += 1;
+    current.weightedScore += score;
+    current.sources[source] = (current.sources[source] || 0) + 1;
+
+    if (!current.categoryId && categoryId) {
+      current.categoryId = categoryId;
+    }
+
+    if (item?.title && current.exampleTitles.length < 3) {
+      current.exampleTitles.push(item.title);
+    }
+
+    scores.set(path, current);
+    if (root) rootCounts.set(root, (rootCounts.get(root) || 0) + 1);
+  });
+
+  const sortedVotes = Array.from(scores.values()).sort((a, b) => {
+    const rootDelta =
+      (rootCounts.get(getCategoryRoot(b.categoryPath)) || 0) -
+      (rootCounts.get(getCategoryRoot(a.categoryPath)) || 0);
+    if (rootDelta) return rootDelta;
+
+    const voteDelta = b.votes - a.votes;
+    if (voteDelta) return voteDelta;
+
+    return b.weightedScore - a.weightedScore;
+  });
+
+  const best = sortedVotes[0] || null;
+
+  if (!best) {
+    return {
+      bestCategoryPath: '',
+      bestCategoryId: '',
+      categoryConfidence: 'none',
+      categorySource: 'none',
+      categoryVotes: [],
+    };
+  }
+
+  const bestRootCount = rootCounts.get(getCategoryRoot(best.categoryPath)) || 0;
+  const hasSoldSupport = best.sources.sold > 0;
+  const hasMultiSupport = best.votes >= 2 || bestRootCount >= 2;
+  const hasStrongScore = best.weightedScore >= 36;
+
+  const categoryConfidence =
+    (hasSoldSupport && hasMultiSupport) || best.weightedScore >= 60
+      ? 'high'
+      : hasMultiSupport || hasStrongScore
+        ? 'medium'
+        : 'low';
+
+  return {
+    bestCategoryPath: best.categoryPath,
+    bestCategoryId: best.categoryId,
+    categoryConfidence,
+    categorySource: hasSoldSupport
+      ? 'ebay-sold-majority'
+      : hasMultiSupport
+        ? 'ebay-result-majority'
+        : 'ebay-best-match',
+    categoryVotes: sortedVotes.slice(0, 8).map((entry) => ({
+      categoryPath: entry.categoryPath,
+      categoryId: entry.categoryId,
+      votes: entry.votes,
+      weightedScore: Number(entry.weightedScore.toFixed(2)),
+      sources: entry.sources,
+      exampleTitles: entry.exampleTitles,
+    })),
+  };
+}
+
 function normalizeEbayItem(item) {
   if (!item) return null;
 
   const priceValue = item.price?.value ?? null;
   const shippingValue = item.shippingOptions?.[0]?.shippingCost?.value ?? null;
+  const categoryPath =
+    getEbayCategoryPath(item) || inferCategoryPathFromItemEvidence(item);
+  const categoryId = getEbayCategoryId(item);
 
   return {
     id: item.itemId || '',
+    itemId: item.itemId || '',
     title: item.title || '',
     price: priceValue,
     priceCurrency: item.price?.currency || 'USD',
@@ -138,8 +632,23 @@ function normalizeEbayItem(item) {
     condition: item.condition || '',
     image: item.image?.imageUrl || '',
     link: item.itemWebUrl || '',
+    itemWebUrl: item.itemWebUrl || '',
     seller: item.seller?.username || '',
     marketplace: item.itemLocation?.country || 'US',
+    categoryId,
+    categoryPath,
+    categoryName:
+      item.categoryName ||
+      item.leafCategoryName ||
+      item.primaryCategoryName ||
+      '',
+    categories: Array.isArray(item.categories) ? item.categories : [],
+    primaryCategory: item.primaryCategory || null,
+    leafCategoryIds: Array.isArray(item.leafCategoryIds)
+      ? item.leafCategoryIds
+      : categoryId
+        ? [categoryId]
+        : [],
   };
 }
 
@@ -200,9 +709,16 @@ app.get('/api/ebay-search', async (req, res) => {
       ? data.itemSummaries
       : [];
 
+    const categorySuggestion = buildCategorySuggestion({
+      query,
+      activeItems: itemSummaries,
+    });
+
     res.json({
       ...data,
+      itemSummaries,
       items: normalizeEbayItems(itemSummaries),
+      ...categorySuggestion,
     });
   } catch (error) {
     console.error('Server error:', error.message);
@@ -263,12 +779,18 @@ app.get('/api/ebay-sold', async (req, res) => {
       ? data.itemSummaries
       : [];
 
+    const categorySuggestion = buildCategorySuggestion({
+      query,
+      soldItems: itemSummaries,
+    });
+
     res.json({
       ...data,
       itemSummaries,
       items: normalizeEbayItems(itemSummaries),
       searchType: 'sold',
       exactQuery: query,
+      ...categorySuggestion,
     });
   } catch (error) {
     console.error('Sold search server error:', error.message);
@@ -415,6 +937,13 @@ app.post(
       const limitedTextMatches = textMatches.slice(0, limit);
       const photoCount = uploadedFiles.length;
 
+      const categorySuggestion = buildCategorySuggestion({
+        query: exactQuery || hint,
+        activeItems: limitedMerged,
+        imageItems: limitedImageMatches,
+        textItems: limitedTextMatches,
+      });
+
       return res.json({
         note: hint
           ? `Image search used ${photoCount} photo${photoCount === 1 ? '' : 's'}, then helper words "${hint}" were blended in.`
@@ -427,6 +956,7 @@ app.post(
         textItems: normalizeEbayItems(limitedTextMatches),
         exactQuery: exactQuery || '',
         photoCount,
+        ...categorySuggestion,
       });
     } catch (error) {
       console.error('Image search server error:', error.message);
