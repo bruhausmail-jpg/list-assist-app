@@ -479,7 +479,10 @@ function getDirectEbayCategoryPath(item) {
       .filter(Boolean);
 
     if (names.length) {
-      const path = normalizeCategoryPath(names.join(' > '));
+      // eBay Browse usually returns categories leaf -> parent -> root.
+      // Display and score them in the normal eBay path order: root -> parent -> leaf.
+      const rootToLeaf = names.slice().reverse();
+      const path = normalizeCategoryPath(rootToLeaf.join(' > '));
       if (
         path &&
         path.includes(' > ') &&
@@ -528,77 +531,113 @@ function getDirectCategoryInheritanceCandidate(params = {}) {
     {
       source: 'sold',
       items: Array.isArray(params.soldItems) ? params.soldItems : [],
-      sourceBoost: 45,
+      sourceBoost: 55,
+      sourceWeight: 2.5,
     },
     {
       source: 'image',
       items: Array.isArray(params.imageItems) ? params.imageItems : [],
-      sourceBoost: 36,
+      sourceBoost: 42,
+      sourceWeight: 2,
     },
     {
       source: 'text',
       items: Array.isArray(params.textItems) ? params.textItems : [],
-      sourceBoost: 28,
+      sourceBoost: 36,
+      sourceWeight: 1.75,
     },
     {
       source: 'active',
       items: Array.isArray(params.activeItems) ? params.activeItems : [],
-      sourceBoost: 20,
+      sourceBoost: 28,
+      sourceWeight: 1.25,
     },
   ];
 
-  let best = null;
+  const scores = new Map();
+  const rootCounts = new Map();
 
-  groups.forEach(({ source, items, sourceBoost }) => {
+  groups.forEach(({ source, items, sourceBoost, sourceWeight }) => {
     items.forEach((item, index) => {
       const directPath = getDirectEbayCategoryPath(item);
       if (!directPath || isWeakCategoryPath(directPath)) return;
 
-      const evidenceText = getEvidenceTextForCategoryDecision(query, item);
-      if (isWrongVerticalForEvidence(directPath, evidenceText)) return;
-
+      // This path came directly from eBay Browse result categories. Trust it.
+      // Do not reject it with local vertical guesses; those caused valid items
+      // such as beauty tools to show no category.
       const relevance = getItemTitleRelevanceScore(
         query || item?.title || '',
         item,
       );
-      if (query && relevance < 6 && !hasComputerPeripheralSignal(evidenceText))
-        return;
+      const root = getCategoryRoot(directPath);
+      if (root) rootCounts.set(root, (rootCounts.get(root) || 0) + 1);
 
-      const score =
+      const pathKey = directPath;
+      const current = scores.get(pathKey) || {
+        categoryPath: directPath,
+        categoryId: getEbayCategoryId(item),
+        votes: 0,
+        weightedScore: 0,
+        sources: { sold: 0, image: 0, text: 0, active: 0 },
+        exampleTitles: [],
+      };
+
+      current.votes += 1;
+      current.sources[source] = (current.sources[source] || 0) + 1;
+      current.weightedScore +=
         sourceBoost +
-        relevance +
-        Math.max(0, 18 - index) +
-        Math.min(10, getCategoryDepth(directPath) * 2);
+        relevance * sourceWeight +
+        Math.max(0, 20 - index) +
+        Math.min(14, getCategoryDepth(directPath) * 2.5);
 
-      if (!best || score > best.weightedScore) {
-        best = {
-          categoryPath: directPath,
-          categoryId: getEbayCategoryId(item),
-          weightedScore: score,
-          source,
-          itemTitle: item?.title || '',
-        };
+      if (!current.categoryId) current.categoryId = getEbayCategoryId(item);
+      if (item?.title && current.exampleTitles.length < 4) {
+        current.exampleTitles.push(item.title);
       }
+
+      scores.set(pathKey, current);
     });
   });
 
+  const sortedVotes = Array.from(scores.values()).sort((a, b) => {
+    const rootDelta =
+      (rootCounts.get(getCategoryRoot(b.categoryPath)) || 0) -
+      (rootCounts.get(getCategoryRoot(a.categoryPath)) || 0);
+    if (rootDelta) return rootDelta;
+
+    const soldDelta = (b.sources.sold || 0) - (a.sources.sold || 0);
+    if (soldDelta) return soldDelta;
+
+    const voteDelta = b.votes - a.votes;
+    if (voteDelta) return voteDelta;
+
+    return b.weightedScore - a.weightedScore;
+  });
+
+  const best = sortedVotes[0];
   if (!best) return null;
 
   return {
     bestCategoryPath: best.categoryPath,
     bestCategoryId: best.categoryId || '',
-    categoryConfidence: best.weightedScore >= 55 ? 'high' : 'medium',
-    categorySource: `ebay-direct-${best.source}-best-match`,
-    categoryVotes: [
-      {
-        categoryPath: best.categoryPath,
-        categoryId: best.categoryId || '',
-        votes: 1,
-        weightedScore: Number(best.weightedScore.toFixed(2)),
-        sources: { sold: 0, image: 0, text: 0, active: 0, [best.source]: 1 },
-        exampleTitles: best.itemTitle ? [best.itemTitle] : [],
-      },
-    ],
+    categoryConfidence:
+      best.votes >= 2 || best.sources.sold > 0 || best.weightedScore >= 70
+        ? 'high'
+        : 'medium',
+    categorySource:
+      best.sources.sold > 0
+        ? 'ebay-direct-sold-consensus'
+        : best.votes >= 2
+          ? 'ebay-direct-result-consensus'
+          : 'ebay-direct-best-result',
+    categoryVotes: sortedVotes.slice(0, 8).map((entry) => ({
+      categoryPath: entry.categoryPath,
+      categoryId: entry.categoryId || '',
+      votes: entry.votes,
+      weightedScore: Number(entry.weightedScore.toFixed(2)),
+      sources: entry.sources,
+      exampleTitles: entry.exampleTitles,
+    })),
   };
 }
 
@@ -609,43 +648,19 @@ async function enrichEbayItemsWithCategorySuggestions(
 ) {
   if (!Array.isArray(items) || !items.length) return [];
 
-  // First pass: keep actual eBay item categories intact. Taxonomy is only a
-  // last-resort annotation for items that have no trustworthy category at all.
+  // eBay Browse category data is the source of truth. If any matched result
+  // already includes a real eBay category path, preserve that data exactly and
+  // let the consensus scorer choose the best category from those eBay results.
   const hasAnyDirectCategory = items.some((item) => {
     const path = getDirectEbayCategoryPath(item);
-    const evidenceText = getEvidenceTextForCategoryDecision(query, item);
-    return path && !isWrongVerticalForEvidence(path, evidenceText);
+    return path && !isWeakCategoryPath(path);
   });
 
   if (hasAnyDirectCategory) {
-    return items.map((item) => {
-      const path = getDirectEbayCategoryPath(item);
-      const evidenceText = getEvidenceTextForCategoryDecision(query, item);
-      if (path && isWrongVerticalForEvidence(path, evidenceText)) {
-        return {
-          ...item,
-          categoryPath: '',
-          ebayCategoryPath: '',
-          inferredCategoryPath: '',
-          categoryPathSource: 'rejected-wrong-vertical',
-        };
-      }
-      return item;
-    });
+    return items;
   }
 
-  const forcedCategory = getForcedCategoryForEvidence(query);
-  if (forcedCategory) {
-    return items.map((item) => ({
-      ...item,
-      categoryPath: forcedCategory.categoryPath,
-      ebayCategoryPath: forcedCategory.categoryPath,
-      inferredCategoryPath: forcedCategory.categoryPath,
-      categoryId: item.categoryId || forcedCategory.categoryId || '',
-      categoryPathSource: forcedCategory.categorySource,
-    }));
-  }
-
+  // Only use taxonomy suggestions when Browse did not return categories.
   const querySuggestions = query
     ? await getEbayTaxonomyCategorySuggestions(query, accessToken).catch(
         (error) => {
@@ -660,12 +675,7 @@ async function enrichEbayItemsWithCategorySuggestions(
     if (!item) continue;
 
     const currentPath = getEbayCategoryPath(item);
-    const evidenceText = getEvidenceTextForCategoryDecision(query, item);
-    if (
-      currentPath &&
-      !isWeakCategoryPath(currentPath) &&
-      !isWrongVerticalForEvidence(currentPath, evidenceText)
-    ) {
+    if (currentPath && !isWeakCategoryPath(currentPath)) {
       enriched.push(item);
       continue;
     }
@@ -681,9 +691,7 @@ async function enrichEbayItemsWithCategorySuggestions(
       : [];
 
     const bestSuggestion = [...titleSuggestions, ...querySuggestions].find(
-      (suggestion) =>
-        suggestion?.categoryPath &&
-        !isWrongVerticalForEvidence(suggestion.categoryPath, evidenceText),
+      (suggestion) => suggestion?.categoryPath,
     );
 
     if (bestSuggestion?.categoryPath) {
@@ -693,7 +701,7 @@ async function enrichEbayItemsWithCategorySuggestions(
         ebayCategoryPath: bestSuggestion.categoryPath,
         inferredCategoryPath: bestSuggestion.categoryPath,
         categoryId: item.categoryId || bestSuggestion.categoryId || '',
-        categoryPathSource: 'ebay-taxonomy-last-resort',
+        categoryPathSource: 'ebay-taxonomy-fallback',
         leafCategoryIds:
           Array.isArray(item.leafCategoryIds) && item.leafCategoryIds.length
             ? item.leafCategoryIds
@@ -733,7 +741,7 @@ function getEbayCategoryPath(item) {
       .filter(Boolean);
 
     if (names.length) {
-      return normalizeCategoryPath(names.join(' > '));
+      return normalizeCategoryPath(names.slice().reverse().join(' > '));
     }
   }
 
@@ -1001,7 +1009,6 @@ function getCategoryDepth(path) {
 }
 
 function buildCategorySuggestion(params = {}) {
-  const query = cleanHint(params.query);
   const activeItems = Array.isArray(params.activeItems)
     ? params.activeItems
     : [];
@@ -1009,36 +1016,17 @@ function buildCategorySuggestion(params = {}) {
   const imageItems = Array.isArray(params.imageItems) ? params.imageItems : [];
   const textItems = Array.isArray(params.textItems) ? params.textItems : [];
 
-  const allEvidenceText = [
-    query,
-    ...soldItems.map((item) => getEvidenceTextForCategoryDecision('', item)),
-    ...imageItems.map((item) => getEvidenceTextForCategoryDecision('', item)),
-    ...textItems.map((item) => getEvidenceTextForCategoryDecision('', item)),
-    ...activeItems.map((item) => getEvidenceTextForCategoryDecision('', item)),
-  ]
-    .filter(Boolean)
-    .join(' ');
-
-  const forcedCategory = getForcedCategoryForEvidence(allEvidenceText);
-  if (forcedCategory) {
-    return {
-      bestCategoryPath: forcedCategory.categoryPath,
-      bestCategoryId: forcedCategory.categoryId,
-      categoryConfidence: forcedCategory.categoryConfidence,
-      categorySource: forcedCategory.categorySource,
-      categoryVotes: [],
-    };
-  }
-
   const directCandidate = getDirectCategoryInheritanceCandidate({
-    query,
+    query: params.query,
     activeItems,
     soldItems,
     imageItems,
     textItems,
   });
+
   if (directCandidate) return directCandidate;
 
+  // No direct Browse category came back. Use taxonomy-enriched paths if present.
   const weightedItems = [
     ...soldItems.map((item, index) => ({
       item,
@@ -1067,46 +1055,15 @@ function buildCategorySuggestion(params = {}) {
   ];
 
   const scores = new Map();
-  const rootCounts = new Map();
-
   weightedItems.forEach(({ item, source, weight, index }) => {
-    const directPath = getEbayCategoryPath(item);
-    const inferredPath = directPath || inferCategoryPathFromItemEvidence(item);
-    const path = normalizeCategoryPath(inferredPath);
-
+    const path = normalizeCategoryPath(getEbayCategoryPath(item));
     if (!path || isWeakCategoryPath(path)) return;
 
-    const evidenceText = getEvidenceTextForCategoryDecision(query, item);
-    if (isWrongVerticalForEvidence(path, evidenceText)) return;
-
     const relevance = getItemTitleRelevanceScore(
-      query || item?.title || '',
+      cleanHint(params.query) || item?.title || '',
       item,
     );
-    const inferredBoost = !directPath && inferredPath ? 10 : 0;
-
-    if (query && relevance < 6 && !inferredBoost) return;
-
-    const root = getCategoryRoot(path);
     const categoryId = getEbayCategoryId(item);
-    const positionBoost = Math.max(0, 14 - index) * 0.25;
-    const depthBoost = Math.min(10, getCategoryDepth(path) * 1.5);
-    const sourceBoost =
-      source === 'sold'
-        ? 10
-        : source === 'image'
-          ? 7
-          : source === 'text'
-            ? 4
-            : 0;
-
-    const score =
-      relevance * weight +
-      positionBoost +
-      depthBoost +
-      sourceBoost +
-      inferredBoost;
-
     const current = scores.get(path) || {
       categoryPath: path,
       categoryId: categoryId || '',
@@ -1117,35 +1074,33 @@ function buildCategorySuggestion(params = {}) {
     };
 
     current.votes += 1;
-    current.weightedScore += score;
+    current.weightedScore +=
+      relevance * weight +
+      Math.max(0, 14 - index) +
+      Math.min(10, getCategoryDepth(path) * 1.5) +
+      (source === 'sold'
+        ? 10
+        : source === 'image'
+          ? 7
+          : source === 'text'
+            ? 4
+            : 0);
     current.sources[source] = (current.sources[source] || 0) + 1;
-
-    if (!current.categoryId && categoryId) {
-      current.categoryId = categoryId;
-    }
-
-    if (item?.title && current.exampleTitles.length < 3) {
+    if (!current.categoryId && categoryId) current.categoryId = categoryId;
+    if (item?.title && current.exampleTitles.length < 3)
       current.exampleTitles.push(item.title);
-    }
-
     scores.set(path, current);
-    if (root) rootCounts.set(root, (rootCounts.get(root) || 0) + 1);
   });
 
   const sortedVotes = Array.from(scores.values()).sort((a, b) => {
-    const rootDelta =
-      (rootCounts.get(getCategoryRoot(b.categoryPath)) || 0) -
-      (rootCounts.get(getCategoryRoot(a.categoryPath)) || 0);
-    if (rootDelta) return rootDelta;
-
+    const soldDelta = (b.sources.sold || 0) - (a.sources.sold || 0);
+    if (soldDelta) return soldDelta;
     const voteDelta = b.votes - a.votes;
     if (voteDelta) return voteDelta;
-
     return b.weightedScore - a.weightedScore;
   });
 
-  const best = sortedVotes[0] || null;
-
+  const best = sortedVotes[0];
   if (!best) {
     return {
       bestCategoryPath: '',
@@ -1156,37 +1111,19 @@ function buildCategorySuggestion(params = {}) {
     };
   }
 
-  if (isWrongVerticalForEvidence(best.categoryPath, allEvidenceText)) {
-    return {
-      bestCategoryPath: '',
-      bestCategoryId: '',
-      categoryConfidence: 'none',
-      categorySource: 'rejected-wrong-vertical',
-      categoryVotes: sortedVotes.slice(0, 8),
-    };
-  }
-
-  const bestRootCount = rootCounts.get(getCategoryRoot(best.categoryPath)) || 0;
-  const hasSoldSupport = best.sources.sold > 0;
-  const hasMultiSupport = best.votes >= 2 || bestRootCount >= 2;
-  const hasStrongScore = best.weightedScore >= 36;
-
-  const categoryConfidence =
-    (hasSoldSupport && hasMultiSupport) || best.weightedScore >= 60
-      ? 'high'
-      : hasMultiSupport || hasStrongScore
-        ? 'medium'
-        : 'low';
-
   return {
     bestCategoryPath: best.categoryPath,
     bestCategoryId: best.categoryId,
-    categoryConfidence,
-    categorySource: hasSoldSupport
-      ? 'ebay-sold-majority'
-      : hasMultiSupport
-        ? 'ebay-result-majority'
-        : 'ebay-best-match',
+    categoryConfidence:
+      best.votes >= 2 || best.sources.sold > 0 || best.weightedScore >= 45
+        ? 'high'
+        : 'medium',
+    categorySource:
+      best.sources.sold > 0
+        ? 'ebay-taxonomy-or-direct-sold'
+        : best.votes >= 2
+          ? 'ebay-taxonomy-or-direct-consensus'
+          : 'ebay-taxonomy-or-direct-best-match',
     categoryVotes: sortedVotes.slice(0, 8).map((entry) => ({
       categoryPath: entry.categoryPath,
       categoryId: entry.categoryId,
@@ -1205,10 +1142,7 @@ function normalizeEbayItem(item) {
   const shippingValue = item.shippingOptions?.[0]?.shippingCost?.value ?? null;
   const rawCategoryPath =
     getEbayCategoryPath(item) || inferCategoryPathFromItemEvidence(item);
-  const evidenceText = getEvidenceTextForCategoryDecision('', item);
-  const categoryPath = isWrongVerticalForEvidence(rawCategoryPath, evidenceText)
-    ? ''
-    : rawCategoryPath;
+  const categoryPath = normalizeCategoryPath(rawCategoryPath);
   const categoryId = getEbayCategoryId(item);
 
   return {
