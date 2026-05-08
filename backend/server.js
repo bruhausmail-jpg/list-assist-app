@@ -577,13 +577,16 @@ function getDirectCategoryInheritanceCandidate(params = {}) {
     const voteDelta = b.votes - a.votes;
     if (voteDelta) return voteDelta;
 
-    // Tie-breaker only: sold comps are stronger than active/image/text, but the
-    // primary decision is still the most common category among eBay results.
+    // Tie-breakers only. The main rule is the most common category among
+    // matched eBay-returned items.
     const soldDelta = (b.sources.sold || 0) - (a.sources.sold || 0);
     if (soldDelta) return soldDelta;
 
     const imageDelta = (b.sources.image || 0) - (a.sources.image || 0);
     if (imageDelta) return imageDelta;
+
+    const textDelta = (b.sources.text || 0) - (a.sources.text || 0);
+    if (textDelta) return textDelta;
 
     const depthDelta =
       getCategoryDepth(b.categoryPath) - getCategoryDepth(a.categoryPath);
@@ -620,10 +623,90 @@ async function enrichEbayItemsWithCategorySuggestions(
 ) {
   if (!Array.isArray(items) || !items.length) return [];
 
-  // Category source of truth: eBay Browse results. Do not inject taxonomy,
-  // hard-coded categories, or local fallbacks here. The category decision is
-  // made later by counting the most common direct eBay category among matches.
-  return items;
+  // Category source of truth: eBay Browse result categories. Do not inject
+  // taxonomy, hard-coded categories, or local title-based fallbacks here.
+  // If Browse search returns a lightweight item without category data, fetch
+  // the item detail by itemHref so we can still use eBay's own category.
+  return hydrateMissingEbayCategories(items, accessToken);
+}
+
+function hasDirectEbayCategoryData(item) {
+  if (!item) return false;
+  if (Array.isArray(item.categories) && item.categories.length) return true;
+  return Boolean(
+    item.categoryPath ||
+    item.ebayCategoryPath ||
+    item.primaryCategory?.categoryPath ||
+    item.itemCategory?.categoryPath ||
+    item.categoryName ||
+    item.primaryCategoryName ||
+    item.leafCategoryName,
+  );
+}
+
+async function hydrateMissingEbayCategories(items, accessToken) {
+  const list = Array.isArray(items) ? items : [];
+  const hydrated = [];
+
+  for (const item of list) {
+    if (hasDirectEbayCategoryData(item) || !item?.itemHref) {
+      hydrated.push(item);
+      continue;
+    }
+
+    try {
+      const response = await fetch(item.itemHref, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': EBAY_MARKETPLACE_ID,
+        },
+      });
+
+      if (!response.ok) {
+        hydrated.push(item);
+        continue;
+      }
+
+      const detail = await response.json();
+      hydrated.push({
+        ...item,
+        categoryPath: item.categoryPath || detail?.categoryPath,
+        ebayCategoryPath: item.ebayCategoryPath || detail?.categoryPath,
+        categoryId:
+          item.categoryId ||
+          detail?.categoryId ||
+          detail?.leafCategoryIds?.[0] ||
+          detail?.categories?.[0]?.categoryId,
+        categoryName:
+          item.categoryName ||
+          detail?.categoryName ||
+          detail?.categories?.[0]?.categoryName,
+        categories:
+          Array.isArray(item.categories) && item.categories.length
+            ? item.categories
+            : Array.isArray(detail?.categories)
+              ? detail.categories
+              : item.categories,
+        primaryCategory: item.primaryCategory || detail?.primaryCategory,
+        leafCategoryIds:
+          Array.isArray(item.leafCategoryIds) && item.leafCategoryIds.length
+            ? item.leafCategoryIds
+            : Array.isArray(detail?.leafCategoryIds)
+              ? detail.leafCategoryIds
+              : item.leafCategoryIds,
+      });
+    } catch (error) {
+      console.warn(
+        'Could not hydrate eBay item category:',
+        item?.itemId || item?.title || '',
+        error?.message || error,
+      );
+      hydrated.push(item);
+    }
+  }
+
+  return hydrated;
 }
 
 function getEbayCategoryPath(item) {
@@ -679,7 +762,7 @@ function getEbayCategoryId(item) {
       item.categoryIds?.[0] ||
       item.primaryCategory?.categoryId ||
       item.itemCategory?.categoryId ||
-      item.categories?.[item.categories.length - 1]?.categoryId ||
+      item.categories?.[0]?.categoryId ||
       '',
   ).trim();
 }
@@ -950,9 +1033,8 @@ function normalizeEbayItem(item) {
 
   const priceValue = item.price?.value ?? null;
   const shippingValue = item.shippingOptions?.[0]?.shippingCost?.value ?? null;
-  const rawCategoryPath =
-    getEbayCategoryPath(item) || inferCategoryPathFromItemEvidence(item);
-  const categoryPath = normalizeCategoryPath(rawCategoryPath);
+  // Use eBay-returned category data only. Do not infer or locally guess here.
+  const categoryPath = normalizeCategoryPath(getEbayCategoryPath(item));
   const categoryId = getEbayCategoryId(item);
 
   return {
@@ -985,6 +1067,38 @@ function normalizeEbayItem(item) {
         ? [categoryId]
         : [],
   };
+}
+
+function attachCategorySuggestionToItems(items, categorySuggestion) {
+  const bestCategoryPath = normalizeCategoryPath(
+    categorySuggestion?.bestCategoryPath || '',
+  );
+  const bestCategoryId = String(
+    categorySuggestion?.bestCategoryId || '',
+  ).trim();
+
+  if (!Array.isArray(items) || !items.length || !bestCategoryPath) {
+    return Array.isArray(items) ? items : [];
+  }
+
+  return items.map((item) => {
+    const directPath = normalizeCategoryPath(getDirectEbayCategoryPath(item));
+    const categoryPath = directPath || bestCategoryPath;
+    const categoryId = getEbayCategoryId(item) || bestCategoryId;
+
+    return {
+      ...item,
+      categoryPath,
+      ebayCategoryPath: categoryPath,
+      categoryId: categoryId || item.categoryId,
+      leafCategoryIds:
+        Array.isArray(item.leafCategoryIds) && item.leafCategoryIds.length
+          ? item.leafCategoryIds
+          : categoryId
+            ? [categoryId]
+            : item.leafCategoryIds,
+    };
+  });
 }
 
 function normalizeEbayItems(items) {
@@ -1054,11 +1168,15 @@ app.get('/api/ebay-search', async (req, res) => {
       query: ebayQuery,
       activeItems: itemSummaries,
     });
+    const categoryReadyItems = attachCategorySuggestionToItems(
+      itemSummaries,
+      categorySuggestion,
+    );
 
     res.json({
       ...data,
-      itemSummaries,
-      items: normalizeEbayItems(itemSummaries),
+      itemSummaries: categoryReadyItems,
+      items: normalizeEbayItems(categoryReadyItems),
       ...categorySuggestion,
     });
   } catch (error) {
@@ -1130,11 +1248,15 @@ app.get('/api/ebay-sold', async (req, res) => {
       query: ebayQuery,
       soldItems: itemSummaries,
     });
+    const categoryReadyItems = attachCategorySuggestionToItems(
+      itemSummaries,
+      categorySuggestion,
+    );
 
     res.json({
       ...data,
-      itemSummaries,
-      items: normalizeEbayItems(itemSummaries),
+      itemSummaries: categoryReadyItems,
+      items: normalizeEbayItems(categoryReadyItems),
       searchType: 'sold',
       exactQuery: ebayQuery,
       ...categorySuggestion,
@@ -1303,17 +1425,29 @@ app.post(
         imageItems: limitedImageMatches,
         textItems: limitedTextMatches,
       });
+      const categoryReadyMerged = attachCategorySuggestionToItems(
+        limitedMerged,
+        categorySuggestion,
+      );
+      const categoryReadyImageMatches = attachCategorySuggestionToItems(
+        limitedImageMatches,
+        categorySuggestion,
+      );
+      const categoryReadyTextMatches = attachCategorySuggestionToItems(
+        limitedTextMatches,
+        categorySuggestion,
+      );
 
       return res.json({
         note: hint
           ? `Image search used ${photoCount} photo${photoCount === 1 ? '' : 's'}, then helper words "${hint}" were blended in.`
           : `Image search used ${photoCount} photo${photoCount === 1 ? '' : 's'}.`,
-        itemSummaries: limitedMerged,
-        imageItemSummaries: limitedImageMatches,
-        textItemSummaries: limitedTextMatches,
-        items: normalizeEbayItems(limitedMerged),
-        imageItems: normalizeEbayItems(limitedImageMatches),
-        textItems: normalizeEbayItems(limitedTextMatches),
+        itemSummaries: categoryReadyMerged,
+        imageItemSummaries: categoryReadyImageMatches,
+        textItemSummaries: categoryReadyTextMatches,
+        items: normalizeEbayItems(categoryReadyMerged),
+        imageItems: normalizeEbayItems(categoryReadyImageMatches),
+        textItems: normalizeEbayItems(categoryReadyTextMatches),
         exactQuery: exactQuery || '',
         photoCount,
         ...categorySuggestion,
