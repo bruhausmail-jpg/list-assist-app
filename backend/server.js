@@ -121,6 +121,31 @@ function cleanHint(value) {
     .replace(/\s+/g, ' ');
 }
 
+function buildHardenedEbaySearchQuery(value) {
+  let query = cleanHint(value);
+
+  if (/mac\s*book|macbook/i.test(query)) {
+    query = query
+      .replace(/mac\s*book/gi, 'MacBook')
+      .replace(/\bmacbook air\b/gi, 'MacBook Air')
+      .replace(/\bmacbook pro\b/gi, 'MacBook Pro')
+      .replace(/\b13\s+in\b/gi, '13 inch')
+      .replace(/\b14\s+in\b/gi, '14 inch')
+      .replace(/\b15\s+in\b/gi, '15 inch')
+      .replace(/\b16\s+in\b/gi, '16 inch')
+      .replace(/\b4\s+05\s*ghz\b/gi, '')
+      .replace(/\b(128|256|512)\s*gb\b/gi, '$1GB SSD')
+      .replace(/\b(1|2|4|8)\s*tb\b/gi, '$1TB SSD')
+      .replace(/\b(m1|m2|m3|m4)\b/gi, (match) => match.toUpperCase())
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!/\blaptop\b/i.test(query)) query = `${query} Laptop`;
+  }
+
+  return query;
+}
+
 function buildLooseItemHintQuery(hint) {
   const cleaned = cleanHint(hint);
   if (!cleaned) return '';
@@ -312,12 +337,314 @@ async function getEbayTaxonomyCategorySuggestions(query, accessToken) {
   return suggestions;
 }
 
+function hasAppleLaptopSignal(value) {
+  const normalized = normalizeSearchText(value);
+  return (
+    /\b(macbook|mac book|macbook air|macbook pro|apple laptop|apple notebook)\b/.test(
+      normalized,
+    ) ||
+    (/\bapple\b/.test(normalized) &&
+      /\b(laptop|notebook|m1|m2|m3|m4|ssd|retina|macos)\b/.test(normalized))
+  );
+}
+
+function hasComputerLaptopSignal(value) {
+  const normalized = normalizeSearchText(value);
+  return (
+    hasAppleLaptopSignal(value) ||
+    /\b(laptop|notebook|ultrabook|chromebook|thinkpad|latitude|elitebook|surface pro|surface laptop|ipad|tablet|computer|ssd|ram|intel|ryzen|core i[3579]|m1|m2|m3|m4)\b/.test(
+      normalized,
+    )
+  );
+}
+
+function hasComputerPeripheralSignal(value) {
+  const normalized = normalizeSearchText(value);
+
+  return (
+    /\b(mouse|mice|trackball|trackballs|keyboard|keyboards|logitech|usb|bluetooth|wireless mouse|gaming mouse|ergonomic mouse|computer mouse|pc mouse|mac mouse|pointer|pointers|input device|input devices)\b/.test(
+      normalized,
+    ) || hasComputerLaptopSignal(value)
+  );
+}
+
+function hasMouseOrTrackballSignal(value) {
+  const normalized = normalizeSearchText(value);
+
+  return /\b(mouse|mice|trackball|trackballs|logitech|m575|ergo m575|wireless mouse|ergonomic mouse|computer mouse|pc mouse|mac mouse)\b/.test(
+    normalized,
+  );
+}
+
+function getForcedCategoryForEvidence(value) {
+  if (hasAppleLaptopSignal(value)) {
+    return {
+      categoryPath:
+        'Computers/Tablets & Networking > Laptops & Netbooks > Apple Laptops',
+      categoryId: '',
+      categoryConfidence: 'high',
+      categorySource: 'hard-rule-apple-laptop-safety',
+    };
+  }
+
+  if (hasMouseOrTrackballSignal(value)) {
+    return {
+      categoryPath:
+        'Computers/Tablets & Networking > Keyboards, Mice & Pointers > Mice, Trackballs & Touchpads',
+      categoryId: '',
+      categoryConfidence: 'high',
+      categorySource: 'hard-rule-computer-peripheral-safety',
+    };
+  }
+
+  return null;
+}
+
+function isWrongVerticalForEvidence(categoryPath, evidenceText) {
+  const category = normalizeSearchText(categoryPath);
+  const evidence = normalizeSearchText(evidenceText);
+  if (!category) return true;
+
+  if (hasComputerPeripheralSignal(evidence)) {
+    if (
+      /\b(books magazines|books|magazines|crafts|pottery|dolls|stamps|coins paper money|art|collectibles)\b/.test(
+        category,
+      )
+    ) {
+      return true;
+    }
+
+    const isKnownGoodComputerRoot =
+      /\b(computers tablets networking|consumer electronics|keyboards mice pointers)\b/.test(
+        category,
+      );
+    const isSpecificLaptopPath =
+      /\b(laptops netbooks|apple laptops|pc laptops netbooks|macbook|notebook|trackballs|mice|keyboards|input devices|mice trackballs touchpads)\b/.test(
+        category,
+      );
+
+    if (!isKnownGoodComputerRoot && !isSpecificLaptopPath) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isTrustedDirectCategoryPath(item, path) {
+  const categorySource = normalizeSearchText(
+    item?.categoryPathSource ||
+      item?.categorySource ||
+      item?.categorySuggestionSource ||
+      '',
+  );
+
+  if (/taxonomy|inferred|local|fallback/.test(categorySource)) return false;
+  if (!path || isWeakCategoryPath(path)) return false;
+
+  return Boolean(
+    item?.categoryPath ||
+    item?.ebayCategoryPath ||
+    item?.primaryCategory?.categoryPath ||
+    item?.itemCategory?.categoryPath ||
+    (Array.isArray(item?.categories) && item.categories.length),
+  );
+}
+
+function getDirectEbayCategoryPath(item) {
+  if (!item) return '';
+
+  const directCandidates = [
+    item.categoryPath,
+    item.ebayCategoryPath,
+    item.primaryCategory?.categoryPath,
+    item.itemCategory?.categoryPath,
+  ];
+
+  for (const candidate of directCandidates) {
+    const cleaned = normalizeCategoryPath(candidate);
+    if (
+      cleaned &&
+      cleaned.includes(' > ') &&
+      isTrustedDirectCategoryPath(item, cleaned)
+    ) {
+      return cleaned;
+    }
+  }
+
+  if (Array.isArray(item.categories) && item.categories.length) {
+    const names = item.categories
+      .map((category) => category?.categoryName || category?.name || '')
+      .map((name) => String(name).trim())
+      .filter(Boolean);
+
+    if (names.length) {
+      const path = normalizeCategoryPath(names.join(' > '));
+      if (
+        path &&
+        path.includes(' > ') &&
+        isTrustedDirectCategoryPath(item, path)
+      )
+        return path;
+    }
+  }
+
+  return '';
+}
+
+function getEvidenceTextForCategoryDecision(query, item) {
+  const parts = [
+    query,
+    item?.title,
+    item?.categoryName,
+    item?.primaryCategoryName,
+    item?.leafCategoryName,
+    item?.condition,
+  ];
+
+  if (Array.isArray(item?.localizedAspects)) {
+    item.localizedAspects.forEach((aspect) => {
+      parts.push(aspect?.name);
+      if (Array.isArray(aspect?.values)) parts.push(...aspect.values);
+      else parts.push(aspect?.value);
+    });
+  }
+
+  [item?.aspects, item?.itemSpecifics].forEach((source) => {
+    if (!source) return;
+    Object.entries(source).forEach(([key, value]) => {
+      parts.push(key);
+      if (Array.isArray(value)) parts.push(...value);
+      else parts.push(value);
+    });
+  });
+
+  return parts.filter(Boolean).join(' ');
+}
+
+function getDirectCategoryInheritanceCandidate(params = {}) {
+  const query = cleanHint(params.query);
+  const groups = [
+    {
+      source: 'sold',
+      items: Array.isArray(params.soldItems) ? params.soldItems : [],
+      sourceBoost: 45,
+    },
+    {
+      source: 'image',
+      items: Array.isArray(params.imageItems) ? params.imageItems : [],
+      sourceBoost: 36,
+    },
+    {
+      source: 'text',
+      items: Array.isArray(params.textItems) ? params.textItems : [],
+      sourceBoost: 28,
+    },
+    {
+      source: 'active',
+      items: Array.isArray(params.activeItems) ? params.activeItems : [],
+      sourceBoost: 20,
+    },
+  ];
+
+  let best = null;
+
+  groups.forEach(({ source, items, sourceBoost }) => {
+    items.forEach((item, index) => {
+      const directPath = getDirectEbayCategoryPath(item);
+      if (!directPath || isWeakCategoryPath(directPath)) return;
+
+      const evidenceText = getEvidenceTextForCategoryDecision(query, item);
+      if (isWrongVerticalForEvidence(directPath, evidenceText)) return;
+
+      const relevance = getItemTitleRelevanceScore(
+        query || item?.title || '',
+        item,
+      );
+      if (query && relevance < 6 && !hasComputerPeripheralSignal(evidenceText))
+        return;
+
+      const score =
+        sourceBoost +
+        relevance +
+        Math.max(0, 18 - index) +
+        Math.min(10, getCategoryDepth(directPath) * 2);
+
+      if (!best || score > best.weightedScore) {
+        best = {
+          categoryPath: directPath,
+          categoryId: getEbayCategoryId(item),
+          weightedScore: score,
+          source,
+          itemTitle: item?.title || '',
+        };
+      }
+    });
+  });
+
+  if (!best) return null;
+
+  return {
+    bestCategoryPath: best.categoryPath,
+    bestCategoryId: best.categoryId || '',
+    categoryConfidence: best.weightedScore >= 55 ? 'high' : 'medium',
+    categorySource: `ebay-direct-${best.source}-best-match`,
+    categoryVotes: [
+      {
+        categoryPath: best.categoryPath,
+        categoryId: best.categoryId || '',
+        votes: 1,
+        weightedScore: Number(best.weightedScore.toFixed(2)),
+        sources: { sold: 0, image: 0, text: 0, active: 0, [best.source]: 1 },
+        exampleTitles: best.itemTitle ? [best.itemTitle] : [],
+      },
+    ],
+  };
+}
+
 async function enrichEbayItemsWithCategorySuggestions(
   items,
   accessToken,
   query = '',
 ) {
   if (!Array.isArray(items) || !items.length) return [];
+
+  // First pass: keep actual eBay item categories intact. Taxonomy is only a
+  // last-resort annotation for items that have no trustworthy category at all.
+  const hasAnyDirectCategory = items.some((item) => {
+    const path = getDirectEbayCategoryPath(item);
+    const evidenceText = getEvidenceTextForCategoryDecision(query, item);
+    return path && !isWrongVerticalForEvidence(path, evidenceText);
+  });
+
+  if (hasAnyDirectCategory) {
+    return items.map((item) => {
+      const path = getDirectEbayCategoryPath(item);
+      const evidenceText = getEvidenceTextForCategoryDecision(query, item);
+      if (path && isWrongVerticalForEvidence(path, evidenceText)) {
+        return {
+          ...item,
+          categoryPath: '',
+          ebayCategoryPath: '',
+          inferredCategoryPath: '',
+          categoryPathSource: 'rejected-wrong-vertical',
+        };
+      }
+      return item;
+    });
+  }
+
+  const forcedCategory = getForcedCategoryForEvidence(query);
+  if (forcedCategory) {
+    return items.map((item) => ({
+      ...item,
+      categoryPath: forcedCategory.categoryPath,
+      ebayCategoryPath: forcedCategory.categoryPath,
+      inferredCategoryPath: forcedCategory.categoryPath,
+      categoryId: item.categoryId || forcedCategory.categoryId || '',
+      categoryPathSource: forcedCategory.categorySource,
+    }));
+  }
 
   const querySuggestions = query
     ? await getEbayTaxonomyCategorySuggestions(query, accessToken).catch(
@@ -333,7 +660,12 @@ async function enrichEbayItemsWithCategorySuggestions(
     if (!item) continue;
 
     const currentPath = getEbayCategoryPath(item);
-    if (currentPath && !isWeakCategoryPath(currentPath)) {
+    const evidenceText = getEvidenceTextForCategoryDecision(query, item);
+    if (
+      currentPath &&
+      !isWeakCategoryPath(currentPath) &&
+      !isWrongVerticalForEvidence(currentPath, evidenceText)
+    ) {
       enriched.push(item);
       continue;
     }
@@ -348,7 +680,12 @@ async function enrichEbayItemsWithCategorySuggestions(
         )
       : [];
 
-    const bestSuggestion = titleSuggestions[0] || querySuggestions[0] || null;
+    const bestSuggestion = [...titleSuggestions, ...querySuggestions].find(
+      (suggestion) =>
+        suggestion?.categoryPath &&
+        !isWrongVerticalForEvidence(suggestion.categoryPath, evidenceText),
+    );
+
     if (bestSuggestion?.categoryPath) {
       enriched.push({
         ...item,
@@ -356,6 +693,7 @@ async function enrichEbayItemsWithCategorySuggestions(
         ebayCategoryPath: bestSuggestion.categoryPath,
         inferredCategoryPath: bestSuggestion.categoryPath,
         categoryId: item.categoryId || bestSuggestion.categoryId || '',
+        categoryPathSource: 'ebay-taxonomy-last-resort',
         leafCategoryIds:
           Array.isArray(item.leafCategoryIds) && item.leafCategoryIds.length
             ? item.leafCategoryIds
@@ -438,7 +776,7 @@ function normalizeCategoryPath(value) {
   if (!cleaned) return '';
   if (/everything else/i.test(cleaned)) return '';
   if (/specialty category based on item type/i.test(cleaned)) return '';
-  if (/^other| > other/i.test(cleaned)) return '';
+  if (/^other\b| > other\b/i.test(cleaned)) return '';
   return cleaned;
 }
 
@@ -671,6 +1009,36 @@ function buildCategorySuggestion(params = {}) {
   const imageItems = Array.isArray(params.imageItems) ? params.imageItems : [];
   const textItems = Array.isArray(params.textItems) ? params.textItems : [];
 
+  const allEvidenceText = [
+    query,
+    ...soldItems.map((item) => getEvidenceTextForCategoryDecision('', item)),
+    ...imageItems.map((item) => getEvidenceTextForCategoryDecision('', item)),
+    ...textItems.map((item) => getEvidenceTextForCategoryDecision('', item)),
+    ...activeItems.map((item) => getEvidenceTextForCategoryDecision('', item)),
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const forcedCategory = getForcedCategoryForEvidence(allEvidenceText);
+  if (forcedCategory) {
+    return {
+      bestCategoryPath: forcedCategory.categoryPath,
+      bestCategoryId: forcedCategory.categoryId,
+      categoryConfidence: forcedCategory.categoryConfidence,
+      categorySource: forcedCategory.categorySource,
+      categoryVotes: [],
+    };
+  }
+
+  const directCandidate = getDirectCategoryInheritanceCandidate({
+    query,
+    activeItems,
+    soldItems,
+    imageItems,
+    textItems,
+  });
+  if (directCandidate) return directCandidate;
+
   const weightedItems = [
     ...soldItems.map((item, index) => ({
       item,
@@ -707,6 +1075,9 @@ function buildCategorySuggestion(params = {}) {
     const path = normalizeCategoryPath(inferredPath);
 
     if (!path || isWeakCategoryPath(path)) return;
+
+    const evidenceText = getEvidenceTextForCategoryDecision(query, item);
+    if (isWrongVerticalForEvidence(path, evidenceText)) return;
 
     const relevance = getItemTitleRelevanceScore(
       query || item?.title || '',
@@ -785,6 +1156,16 @@ function buildCategorySuggestion(params = {}) {
     };
   }
 
+  if (isWrongVerticalForEvidence(best.categoryPath, allEvidenceText)) {
+    return {
+      bestCategoryPath: '',
+      bestCategoryId: '',
+      categoryConfidence: 'none',
+      categorySource: 'rejected-wrong-vertical',
+      categoryVotes: sortedVotes.slice(0, 8),
+    };
+  }
+
   const bestRootCount = rootCounts.get(getCategoryRoot(best.categoryPath)) || 0;
   const hasSoldSupport = best.sources.sold > 0;
   const hasMultiSupport = best.votes >= 2 || bestRootCount >= 2;
@@ -822,8 +1203,12 @@ function normalizeEbayItem(item) {
 
   const priceValue = item.price?.value ?? null;
   const shippingValue = item.shippingOptions?.[0]?.shippingCost?.value ?? null;
-  const categoryPath =
+  const rawCategoryPath =
     getEbayCategoryPath(item) || inferCategoryPathFromItemEvidence(item);
+  const evidenceText = getEvidenceTextForCategoryDecision('', item);
+  const categoryPath = isWrongVerticalForEvidence(rawCategoryPath, evidenceText)
+    ? ''
+    : rawCategoryPath;
   const categoryId = getEbayCategoryId(item);
 
   return {
@@ -879,9 +1264,10 @@ app.get('/api/ebay-search', async (req, res) => {
     }
 
     const accessToken = await getEbayAccessToken();
+    const ebayQuery = buildHardenedEbaySearchQuery(query);
 
     const url = new URL(EBAY_BROWSE_SEARCH_URL);
-    url.searchParams.set('q', query);
+    url.searchParams.set('q', ebayQuery);
     url.searchParams.set('limit', String(limit));
 
     const ebayResponse = await fetch(url.toString(), {
@@ -917,11 +1303,11 @@ app.get('/api/ebay-search', async (req, res) => {
     const itemSummaries = await enrichEbayItemsWithCategorySuggestions(
       rawItemSummaries,
       accessToken,
-      query,
+      ebayQuery,
     );
 
     const categorySuggestion = buildCategorySuggestion({
-      query,
+      query: ebayQuery,
       activeItems: itemSummaries,
     });
 
@@ -952,9 +1338,10 @@ app.get('/api/ebay-sold', async (req, res) => {
     }
 
     const accessToken = await getEbayAccessToken();
+    const ebayQuery = buildHardenedEbaySearchQuery(query);
 
     const url = new URL(EBAY_BROWSE_SEARCH_URL);
-    url.searchParams.set('q', query);
+    url.searchParams.set('q', ebayQuery);
     url.searchParams.set('limit', String(limit));
     url.searchParams.append('filter', 'buyingOptions:{FIXED_PRICE}');
     url.searchParams.append('filter', 'soldItemsOnly:true');
@@ -992,11 +1379,11 @@ app.get('/api/ebay-sold', async (req, res) => {
     const itemSummaries = await enrichEbayItemsWithCategorySuggestions(
       rawItemSummaries,
       accessToken,
-      query,
+      ebayQuery,
     );
 
     const categorySuggestion = buildCategorySuggestion({
-      query,
+      query: ebayQuery,
       soldItems: itemSummaries,
     });
 
@@ -1005,7 +1392,7 @@ app.get('/api/ebay-sold', async (req, res) => {
       itemSummaries,
       items: normalizeEbayItems(itemSummaries),
       searchType: 'sold',
-      exactQuery: query,
+      exactQuery: ebayQuery,
       ...categorySuggestion,
     });
   } catch (error) {

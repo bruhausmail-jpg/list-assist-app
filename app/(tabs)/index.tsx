@@ -33,6 +33,7 @@ type PhotoKey = 'photo1' | 'photo2';
 type MeasurementKey = 'length' | 'width' | 'depth';
 
 type AppStep =
+  | 'welcome'
   | 'referencePicker'
   | 'sellerTools'
   | 'garageSaleLanding'
@@ -383,6 +384,7 @@ const GARAGE_SALE_FAVORITES_STORAGE_KEY = 'listassist_garage_sale_favorites_v1';
 const THRIFT_STORE_PREFERENCES_STORAGE_KEY =
   'listassist_thrift_store_preferences_v1';
 const HELPER_TIPS_STORAGE_KEY = 'listassist_helper_tips_enabled_v1';
+const WELCOME_STARTUP_STORAGE_KEY = 'listassist_show_welcome_on_startup_v1';
 const SAVED_FINDS_STORAGE_KEY = 'listassist_saved_finds_v1';
 const LOCAL_BACKEND_BASE_URL = 'https://list-assist-app.onrender.com';
 const THRIFT_STORES_API_URL = `${LOCAL_BACKEND_BASE_URL}/api/thrift-stores`;
@@ -649,6 +651,24 @@ const SELLER_TOOLS_PRODUCTS: SellerToolProduct[] = [
 const SELLER_TOOLS_EDIT_NOTE =
   'To add, remove, or reorder recommendations, edit the SELLER_TOOLS_PRODUCTS list in index.tsx. Each item is one product card.';
 
+const PRO_EBAY_LISTING_PROMPT = `
+You are an expert eBay seller with 20+ years of experience across all categories. You understand eBay's Cassini search algorithm, buyer psychology, and what makes listings convert. You also have a strong eye for product photography and know what eBay listing images need to look their best in search results. Your photo notes will help produce polished, upload-ready image files the seller can drag and drop directly into their eBay listing.
+
+A client has submitted PHOTO(S) and minimal item notes. If no notes were provided, work entirely from what can be observed in the photos.
+
+Generate a complete, ready-to-post eBay listing with:
+1. Title, 80 characters max, most-searched keyword first, brand/model/type/key feature/condition when space allows, no punctuation, no all caps, no filler.
+2. Item specifics: Brand, Model / Item Name, Condition, Color, Dimensions or Size, Era / Decade, Unique Identifiers.
+3. Description using opening paragraph, buyer-use paragraph, section dividers using ⸻, Key Features bullets using •, Condition bullets using •, and optional details.
+4. Suggested eBay category path.
+5. Pricing recommendation from typical sold listings.
+6. Shipping recommendation with weight class, fragile yes/no, service, and flat/calculated guidance.
+7. Top 5 search keywords not already repeated in the title.
+8. Photo enhancement notes with hero shot, per-photo notes, and missing shots.
+
+Be specific. Be honest. Avoid filler. Every word should earn its place. Never invent model numbers, dimensions, materials, or accessories not visible from photos or notes.
+`.trim();
+
 const FIT_MODES_US: FitMode[] = [
   { key: 'closest', label: 'Closest Match', padding: 0 },
   { key: 'pad1', label: '+1" Padding', padding: 1 },
@@ -740,6 +760,29 @@ async function openExternalLink(url?: string) {
     console.log('Link open error:', error);
     Alert.alert('Error', 'Something went wrong opening the link.');
   }
+}
+
+async function openSourceAssistApp() {
+  const urlsToTry = [
+    'sourceassist://',
+    'source-assist://',
+    'sourceassist://home',
+    'com.danahauser.sourceassist://',
+  ];
+
+  for (const url of urlsToTry) {
+    try {
+      await Linking.openURL(url);
+      return;
+    } catch (error) {
+      console.log('Source Assist open attempt failed:', url, error);
+    }
+  }
+
+  Alert.alert(
+    'Source Assist',
+    'Source Assist could not be opened from List Assist yet. If Source Assist is installed, it may need a URL scheme added so List Assist can launch it directly.',
+  );
 }
 
 async function openPhoneNumber(phone?: string) {
@@ -1760,6 +1803,45 @@ type EbaySearchItem = {
   condition?: string;
   image?: { imageUrl: string };
   price?: { value: string; currency: string };
+
+  // Optional category fields. Different eBay/backend endpoints can return
+  // these under different names, so the category resolver checks all of them.
+  categoryPath?: string;
+  category?: string;
+  categoryName?: string;
+  primaryCategoryName?: string;
+  leafCategoryName?: string;
+  categories?: Array<{
+    categoryId?: string;
+    categoryName?: string;
+    categoryPath?: string;
+  }>;
+  primaryCategory?: {
+    categoryId?: string;
+    categoryName?: string;
+    categoryPath?: string;
+  };
+  categoryId?: string;
+  categoryIds?: string[];
+  categoryTreeId?: string;
+  itemCategory?: {
+    categoryId?: string;
+    categoryName?: string;
+    categoryPath?: string;
+  };
+  inferredCategory?: string;
+  inferredCategoryPath?: string;
+  ebayCategory?: string;
+  ebayCategoryPath?: string;
+  ebaySuggestedCategoryPath?: string;
+  localizedAspects?: Array<{
+    name?: string;
+    value?: string;
+    values?: string[];
+  }>;
+  aspects?: Record<string, string | string[]>;
+  itemSpecifics?: Record<string, string | string[]>;
+  leafCategoryIds?: string[];
 };
 
 type EbaySearchResponse = {
@@ -1768,6 +1850,10 @@ type EbaySearchResponse = {
   similarItemSummaries?: EbaySearchItem[];
   exactQuery?: string;
   broaderQuery?: string;
+  bestCategoryPath?: string;
+  bestCategoryId?: string;
+  categoryConfidence?: 'high' | 'medium' | 'low' | 'none';
+  categorySource?: string;
 };
 
 function buildLiveEbayQuery(
@@ -1789,6 +1875,21 @@ function buildLiveEbayQuery(
     return 'Voxx Bliss Insoles';
   }
 
+  if (/mac\s*book|macbook/i.test(query)) {
+    query = query
+      .replace(/mac\s*book/gi, 'MacBook')
+      .replace(/\bmacbook air\b/gi, 'MacBook Air')
+      .replace(/\b4\s+05\s*ghz\b/gi, '')
+      .replace(/\b(128|256|512)\s*gb\b/gi, '$1GB SSD')
+      .replace(/\b(1|2|4|8)\s*tb\b/gi, '$1TB SSD')
+      .replace(/\b(m1|m2|m3|m4)\b/gi, (match) => match.toUpperCase())
+      .replace(/\b13\s+in\b/gi, '13 inch')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!/\blaptop\b/i.test(query)) query = `${query} Laptop`;
+  }
+
   if (barcode) {
     query = query
       .replace(new RegExp(barcode.replace(/\D/g, ''), 'g'), ' ')
@@ -1796,6 +1897,67 @@ function buildLiveEbayQuery(
   }
 
   return query;
+}
+
+function applyBackendCategorySuggestionToItems(
+  items: EbaySearchItem[],
+  backendPayload: any,
+  queryText = '',
+): EbaySearchItem[] {
+  const bestCategoryPath = normalizeEbayCategoryPath(
+    backendPayload?.bestCategoryPath,
+  );
+  const bestCategoryId = String(backendPayload?.bestCategoryId || '').trim();
+  const sourceText = [
+    queryText,
+    backendPayload?.exactQuery,
+    backendPayload?.broaderQuery,
+    ...items.slice(0, 5).map((item) => item?.title || ''),
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const forcedCategory = getForcedCategoryForSource(sourceText);
+  const resolvedCategoryPath = forcedCategory || bestCategoryPath;
+
+  if (
+    !resolvedCategoryPath ||
+    isBroadOrUnsafeCategory(resolvedCategoryPath) ||
+    isWrongCategoryForSource(resolvedCategoryPath, sourceText)
+  ) {
+    return items;
+  }
+
+  let attached = false;
+  return items.map((item) => {
+    const itemSourceText = [sourceText, item?.title].filter(Boolean).join(' ');
+    const existingPath = getCategoryPathFromEbayItem(item);
+
+    if (
+      existingPath &&
+      !isBroadOrUnsafeCategory(existingPath) &&
+      !isWrongCategoryForSource(existingPath, itemSourceText)
+    ) {
+      return item;
+    }
+
+    if (attached) return item;
+
+    attached = true;
+    return {
+      ...item,
+      categoryPath: resolvedCategoryPath,
+      ebayCategoryPath: resolvedCategoryPath,
+      inferredCategoryPath: resolvedCategoryPath,
+      categoryId: item.categoryId || bestCategoryId || undefined,
+      leafCategoryIds:
+        Array.isArray(item.leafCategoryIds) && item.leafCategoryIds.length
+          ? item.leafCategoryIds
+          : bestCategoryId
+            ? [bestCategoryId]
+            : item.leafCategoryIds,
+    };
+  });
 }
 
 async function searchEbay(
@@ -1827,20 +1989,38 @@ async function searchEbay(
     throw new Error(backendMessage);
   }
 
-  const backendItems = Array.isArray(backendPayload?.itemSummaries)
-    ? backendPayload.itemSummaries
-    : [];
+  const backendItems = applyBackendCategorySuggestionToItems(
+    Array.isArray(backendPayload?.itemSummaries)
+      ? backendPayload.itemSummaries
+      : [],
+    backendPayload,
+    cleanedQuery,
+  );
+  const exactItems = applyBackendCategorySuggestionToItems(
+    Array.isArray(backendPayload?.exactItemSummaries)
+      ? backendPayload.exactItemSummaries
+      : backendItems,
+    backendPayload,
+    cleanedQuery,
+  );
+  const similarItems = applyBackendCategorySuggestionToItems(
+    Array.isArray(backendPayload?.similarItemSummaries)
+      ? backendPayload.similarItemSummaries
+      : [],
+    backendPayload,
+    cleanedQuery,
+  );
 
   return {
     itemSummaries: backendItems,
-    exactItemSummaries: Array.isArray(backendPayload?.exactItemSummaries)
-      ? backendPayload.exactItemSummaries
-      : backendItems,
-    similarItemSummaries: Array.isArray(backendPayload?.similarItemSummaries)
-      ? backendPayload.similarItemSummaries
-      : [],
+    exactItemSummaries: exactItems,
+    similarItemSummaries: similarItems,
     exactQuery: backendPayload?.exactQuery,
     broaderQuery: backendPayload?.broaderQuery,
+    bestCategoryPath: backendPayload?.bestCategoryPath,
+    bestCategoryId: backendPayload?.bestCategoryId,
+    categoryConfidence: backendPayload?.categoryConfidence,
+    categorySource: backendPayload?.categorySource,
   };
 }
 
@@ -1873,20 +2053,38 @@ async function searchEbaySold(
     throw new Error(backendMessage);
   }
 
-  const backendItems = Array.isArray(backendPayload?.itemSummaries)
-    ? backendPayload.itemSummaries
-    : [];
+  const backendItems = applyBackendCategorySuggestionToItems(
+    Array.isArray(backendPayload?.itemSummaries)
+      ? backendPayload.itemSummaries
+      : [],
+    backendPayload,
+    cleanedQuery,
+  );
+  const exactItems = applyBackendCategorySuggestionToItems(
+    Array.isArray(backendPayload?.exactItemSummaries)
+      ? backendPayload.exactItemSummaries
+      : backendItems,
+    backendPayload,
+    cleanedQuery,
+  );
+  const similarItems = applyBackendCategorySuggestionToItems(
+    Array.isArray(backendPayload?.similarItemSummaries)
+      ? backendPayload.similarItemSummaries
+      : [],
+    backendPayload,
+    cleanedQuery,
+  );
 
   return {
     itemSummaries: backendItems,
-    exactItemSummaries: Array.isArray(backendPayload?.exactItemSummaries)
-      ? backendPayload.exactItemSummaries
-      : backendItems,
-    similarItemSummaries: Array.isArray(backendPayload?.similarItemSummaries)
-      ? backendPayload.similarItemSummaries
-      : [],
+    exactItemSummaries: exactItems,
+    similarItemSummaries: similarItems,
     exactQuery: backendPayload?.exactQuery,
     broaderQuery: backendPayload?.broaderQuery,
+    bestCategoryPath: backendPayload?.bestCategoryPath,
+    bestCategoryId: backendPayload?.bestCategoryId,
+    categoryConfidence: backendPayload?.categoryConfidence,
+    categorySource: backendPayload?.categorySource,
   };
 }
 
@@ -2367,10 +2565,10 @@ function cleanSourcingText(value?: string | null) {
     String(value || '')
       .replace(/[|/_]+/g, ' ')
       .replace(/[\[\](){}]+/g, ' ')
-      .replace(/verilux/gi, 'Verilux')
-      .replace(/happylight/gi, 'HappyLight')
-      .replace(/uv free/gi, 'UV-Free')
-      .replace(/10 000/g, '10,000')
+      .replace(/\bverilux\b/gi, 'Verilux')
+      .replace(/\bhappylight\b/gi, 'HappyLight')
+      .replace(/\buv free\b/gi, 'UV-Free')
+      .replace(/\b10 000\b/g, '10,000')
       .replace(/[^\w\s,+.-]/g, ' '),
   );
 }
@@ -2533,29 +2731,92 @@ function getConditionSentence(condition: SourcingCondition) {
 
 function detectProductSignals(sourceText: string) {
   const normalized = normalizeSearchText(sourceText);
+  const rawText = String(sourceText || '');
+
   return {
     normalized,
     isVoxxBliss:
       /voxx\s*(life|bliss|sports)|hpt|neuro|wellness insole|enhanced wellness/i.test(
-        sourceText,
+        rawText,
       ),
-    isInsole: /insole|orthotic|shoe insert|arch support/i.test(sourceText),
+    isInsole: /insole|orthotic|shoe insert|arch support/i.test(rawText),
     isLamp: /lamp|light therapy|happylight|10\s*,?000\s*lux|uv free/i.test(
-      sourceText,
+      rawText,
     ),
     isClothing:
-      /(shirt|jacket|jeans|pants|hoodie|dress|shoe|sneaker|boot|hat|cap)/i.test(
-        sourceText,
+      /(shirt|jacket|jeans|pants|hoodie|dress|shoe|sneaker|boot|hat|cap|coat|sweater|shorts|skirt|blouse|polo|jersey)/i.test(
+        rawText,
       ),
-    isToy: /(toy|lego|figure|doll|plush|game|puzzle|train|hot wheels)/i.test(
-      sourceText,
-    ),
-    isVintage: /vintage|antique|mid century|retro|collectible/i.test(
-      sourceText,
-    ),
-    sizeLargeMens: /large|men.?s\s*7\s*[-–]\s*13|7\s*[-–]\s*13/i.test(
-      sourceText,
-    ),
+    isToy:
+      /(toy|lego|figure|doll|plush|game|puzzle|train|hot wheels|funko|barbie|nerf)/i.test(
+        rawText,
+      ),
+    isHealthBeauty:
+      /(shampoo|conditioner|dry shampoo|hair spray|texture|beauty|cosmetic|makeup|skin care|skincare|fragrance|lotion|cream|lip balm|chapstick|lip treatment|shea butter|coconut oil|vitamin e|deodorant|antiperspirant|body wash|soap|razor|shave|toothpaste|oral care)/i.test(
+        rawText,
+      ),
+    isLipCare:
+      /(lip balm|chapstick|lip treatment|lip moisturizer|lip repair|dry lips|shea butter|coconut oil|vitamin e)/i.test(
+        rawText,
+      ),
+    isDeodorant:
+      /(deodorant|antiperspirant|anti perspirant|old spice|swagger|secret|dove men|degree|native deodorant|speed stick|axe deodorant|invisible solid|solid stick|odor protection)/i.test(
+        rawText,
+      ),
+    isSupplement:
+      /(supplement|vitamin|mineral|gumm(y|ies)|capsule|tablet|softgel|pill|probiotic|prebiotic|collagen|melatonin|magnesium|turmeric|elderberry|ashwagandha|omega|fish oil|superbeets|super beets|beet|heart health|grape seed|non-gmo|non gmo)/i.test(
+        rawText,
+      ),
+    isVitaminMineral:
+      /(vitamin|mineral|multivitamin|magnesium|zinc|iron|calcium|d3|b12|b complex|omega|fish oil|superbeets|super beets|beet|heart health|grape seed)/i.test(
+        rawText,
+      ),
+    isMedicineOtc:
+      /(pain relief|allergy|cold and flu|cough|ibuprofen|acetaminophen|aspirin|antacid|digestive relief|ointment|first aid|bandage|thermometer|blood pressure)/i.test(
+        rawText,
+      ),
+    isElectronics:
+      /(camera|lens|phone|iphone|ipad|tablet|laptop|computer|keyboard|mouse|monitor|speaker|headphones|earbuds|router|charger|cable|adapter|remote|dvd|blu ray|receiver|stereo|radio|walkman|calculator|video game console)/i.test(
+        rawText,
+      ),
+    isVideoGame:
+      /(xbox|playstation|ps1|ps2|ps3|ps4|ps5|nintendo|switch|wii|gamecube|game boy|gameboy|sega|atari|video game|console|controller)/i.test(
+        rawText,
+      ),
+    isMedia:
+      /(dvd|blu ray|bluray|vhs|cd|vinyl|record|lp album|cassette|book|paperback|hardcover|magazine|comic)/i.test(
+        rawText,
+      ),
+    isKitchen:
+      /(mug|cup|plate|bowl|glass|cookware|pan|pot|skillet|knife|utensil|kitchen|coffee maker|blender|mixer|toaster|air fryer|crock pot|instant pot|thermos|tumbler|stanley cup|yeti|hydro flask|pyrex|corningware|corelle)/i.test(
+        rawText,
+      ),
+    isTool:
+      /(tool|drill|saw|wrench|socket|ratchet|screwdriver|pliers|hammer|craftsman|dewalt|milwaukee|makita|ryobi|bosch|snap on|snap-on|kobalt|husky|stihl)/i.test(
+        rawText,
+      ),
+    isAuto:
+      /(auto|automotive|car|truck|motorcycle|oil filter|spark plug|brake|headlight|tail light|floor mat|wiper|tire|wheel|rim)/i.test(
+        rawText,
+      ),
+    isPet:
+      /(pet|dog|cat|aquarium|fish tank|leash|collar|pet toy|dog toy|cat toy|treats|pet food)/i.test(
+        rawText,
+      ),
+    isBaby:
+      /(baby|infant|toddler|stroller|car seat|diaper|bottle|onesie|crib|high chair)/i.test(
+        rawText,
+      ),
+    isSporting:
+      /(golf|baseball|football|basketball|soccer|hockey|tennis|fishing|camping|hunting|fitness|yoga|bike|bicycle|helmet|glove|bat|ball|reel|rod|treadmill|dumbbell|barbell|exercise)/i.test(
+        rawText,
+      ),
+    isCraft:
+      /(craft|sewing|fabric|yarn|knitting|crochet|scrapbook|cricut|stamp|beads|paint brush|art supplies)/i.test(
+        rawText,
+      ),
+    isVintage: /vintage|antique|mid century|retro|collectible/i.test(rawText),
+    sizeLargeMens: /large|men.?s\s*7\s*[-–]\s*13|7\s*[-–]\s*13/i.test(rawText),
   };
 }
 
@@ -2646,9 +2907,15 @@ function buildPromptStyleTitle(params: {
     title += ` ${conditionKeyword}`;
   }
 
+  if (hasAppleLaptopSignal(sourceText)) {
+    title = normalizeAppleLaptopListingTitle(title);
+  }
+
   title = title
+    .replace(/&/g, ' And ')
+    .replace(/\+/g, ' ')
     .replace(/[“”\"'’]/g, '')
-    .replace(/[()[\]{}]/g, '')
+    .replace(/[()[\]{}:;,.!?#|/\\]/g, ' ')
     .replace(/\s+-\s+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -2669,12 +2936,16 @@ function buildPromptStyleItemSpecifics(params: {
     : extractBrandFromTitle(title) || 'Unbranded';
   const color = signals.isVoxxBliss
     ? 'Blue / White'
-    : signals.isLamp
-      ? 'White / Neutral, if shown in photos'
-      : 'See photos';
+    : signals.isSupplement
+      ? 'See bottle or package label'
+      : signals.isLamp
+        ? 'White / Neutral, if shown in photos'
+        : 'See photos';
   const model = signals.isVoxxBliss
     ? 'VoxxBliss Enhanced Wellness Insoles'
-    : cleanSourcingText(title);
+    : signals.isSupplement
+      ? cleanSourcingText(title)
+      : cleanSourcingText(title);
   const size = signals.isVoxxBliss
     ? "Large — Men's 7–13 (trim-to-fit)"
     : product?.length && product?.width && product?.height
@@ -2717,6 +2988,8 @@ function buildPromptStyleDescription(params: {
       ? `${product.length} in x ${product.width} in x ${product.height} in`
       : '');
   const conditionText = getPromptStyleCondition(condition);
+  const brand = extractBrandFromTitle(title);
+  const category = inferSourcingCategory(sourceText || title);
 
   if (signals.isVoxxBliss) {
     const opener =
@@ -2760,10 +3033,17 @@ function buildPromptStyleDescription(params: {
     ].join('\n');
   }
 
-  const category = inferSourcingCategory(sourceText || title);
-  const brand = extractBrandFromTitle(title);
   const featureCandidates = dedupeWordsKeepOrder([
     brand ? `${brand} brand item` : '',
+    signals.isHealthBeauty
+      ? 'Health and beauty item for everyday personal care use'
+      : '',
+    /dry shampoo/i.test(sourceText || title)
+      ? 'Dry shampoo formula helps refresh hair between washes'
+      : '',
+    /texture|texturizing|beach/i.test(sourceText || title)
+      ? 'Beach texture styling option for added body and grip'
+      : '',
     signals.isVintage
       ? 'Vintage or collectible appeal if confirmed by photos'
       : '',
@@ -2778,21 +3058,22 @@ function buildPromptStyleDescription(params: {
     dimensionText ? `Approximate dimensions: ${dimensionText}` : '',
     product?.barcode ? `UPC / Barcode: ${product.barcode}` : '',
     'Photos show the actual item included in this listing',
-    'See photos for exact item details',
+    'Includes only what is shown in the photos',
   ]).filter(Boolean);
 
   while (featureCandidates.length < 4) {
     const next = [
       'Useful replacement, collector, or everyday item depending on buyer need',
-      'Sourcing photos show the actual item condition',
-      'Includes only the item or accessories shown in photos',
+      'Listing photos show the actual item condition',
+      'Review all photos for labels, packaging, and included contents',
     ].find((item) => !featureCandidates.includes(item));
     if (!next) break;
     featureCandidates.push(next);
   }
 
-  const useCaseSentence =
-    category === 'electronics'
+  const buyerUseSentence = signals.isHealthBeauty
+    ? 'This is a practical pick for someone replacing a favorite product, stocking up, or trying the exact item shown without paying full retail.'
+    : category === 'electronics'
       ? 'This is a practical pick for someone replacing a similar item, completing a setup, or looking for a useful backup.'
       : category === 'clothing'
         ? 'This works well for everyday wear, resale, or anyone looking for this style and size.'
@@ -2801,8 +3082,10 @@ function buildPromptStyleDescription(params: {
           : 'This is a good option for buyers looking for the specific item shown without paying full retail.';
 
   return [
-    `This listing is for ${title} in ${conditionText.toLowerCase()} condition. Please review the photos carefully, as they show the actual item and included contents.`,
-    useCaseSentence,
+    `This listing is for ${title} in ${conditionText.toLowerCase()} condition. Photos show the actual item being sold, including visible packaging, labels, and included contents.`,
+    'Please review all photos closely for exact cosmetic condition and any visible wear from storage or prior handling.',
+    '',
+    buyerUseSentence,
     '',
     '⸻',
     '',
@@ -2813,8 +3096,8 @@ function buildPromptStyleDescription(params: {
     '',
     'Condition:',
     getConditionSentence(condition),
-    '• Please review photos for exact cosmetic condition',
-    '• Any visible wear, marks, labels, packaging, or included parts are shown in the photos',
+    '• Main item details and visible labels are shown in the photos',
+    '• Any visible wear, marks, package wear, residue, or included parts should be reviewed in the photos',
     '• Includes only what is shown in photos',
     ...(dimensionText
       ? ['', '⸻', '', 'Details:', `• Approximate dimensions: ${dimensionText}`]
@@ -2822,24 +3105,1522 @@ function buildPromptStyleDescription(params: {
   ].join('\n');
 }
 
-function buildPromptStyleCategory(sourceText: string) {
+function scoreCategoryRule(sourceText: string, terms: string[]): number {
+  const normalized = normalizeSearchText(sourceText);
+  const normalizedWithSpaces = ` ${normalized} `;
+
+  return terms.reduce((score, term) => {
+    const normalizedTerm = normalizeSearchText(term);
+    if (!normalizedTerm) return score;
+
+    const wordCount = normalizedTerm.split(' ').filter(Boolean).length;
+
+    if (normalizedWithSpaces.includes(` ${normalizedTerm} `)) {
+      return score + Math.max(18, wordCount * 16);
+    }
+
+    if (normalized.includes(normalizedTerm)) {
+      return score + Math.max(12, wordCount * 10);
+    }
+
+    const termWords = normalizedTerm
+      .split(' ')
+      .filter((word) => word.length > 2);
+    const matchedWords = termWords.filter((word) =>
+      normalizedWithSpaces.includes(` ${word} `),
+    );
+
+    if (!matchedWords.length) return score;
+
+    const allWordsMatched = matchedWords.length === termWords.length;
+    return score + matchedWords.length * (allWordsMatched ? 8 : 5);
+  }, 0);
+}
+
+function getComparableCategoryTokens(value: string) {
+  return tokenizeSearchText(value)
+    .map((token) => token.toLowerCase())
+    .filter((token) => token.length > 2)
+    .filter(
+      (token) =>
+        ![
+          'the',
+          'and',
+          'for',
+          'with',
+          'from',
+          'new',
+          'used',
+          'open',
+          'box',
+          'lot',
+          'pack',
+          'packs',
+          'set',
+          'sets',
+          'inch',
+          'inches',
+          'fl',
+          'oz',
+          'ounce',
+          'ounces',
+          'count',
+          'ct',
+          'size',
+          'small',
+          'medium',
+          'large',
+          'xl',
+          'xxl',
+          'picture',
+          'pictures',
+          'pictured',
+          'photo',
+          'photos',
+          'scent',
+          'clean',
+          'excellent',
+          'rare',
+          'all',
+          'purpose',
+          'original',
+          'authentic',
+          'genuine',
+          'read',
+          'please',
+          'nice',
+          'estate',
+          'sale',
+          'listed',
+          'listing',
+        ].includes(token),
+    );
+}
+
+function getEbayItemRelevanceScore(sourceText: string, item: EbaySearchItem) {
+  const sourceTokens = new Set(getComparableCategoryTokens(sourceText));
+  const itemTokens = getComparableCategoryTokens(item?.title || '');
+
+  if (!sourceTokens.size || !itemTokens.length) return 0;
+
+  let score = 0;
+  let exactTokenMatches = 0;
+
+  itemTokens.forEach((token) => {
+    if (sourceTokens.has(token)) {
+      exactTokenMatches += 1;
+      score += token.length >= 5 ? 8 : 5;
+    }
+  });
+
+  const normalizedSource = normalizeSearchText(sourceText);
+  const normalizedTitle = normalizeSearchText(item?.title || '');
+
+  const sourceImportant = Array.from(sourceTokens).filter(
+    (token) => token.length >= 5,
+  );
+  sourceImportant.forEach((token) => {
+    if (normalizedTitle.includes(token)) score += 5;
+  });
+
+  // Multi-word brand/model phrases matter more than generic single terms.
+  const sourcePhrases = normalizedSource
+    .split(/\s+/)
+    .filter(Boolean)
+    .reduce<string[]>((phrases, _word, index, words) => {
+      const two = words.slice(index, index + 2).join(' ');
+      const three = words.slice(index, index + 3).join(' ');
+      if (two.split(' ').length === 2) phrases.push(two);
+      if (three.split(' ').length === 3) phrases.push(three);
+      return phrases;
+    }, [])
+    .filter((phrase) => phrase.length >= 8);
+
+  sourcePhrases.forEach((phrase) => {
+    if (normalizedTitle.includes(phrase)) score += 8;
+  });
+
+  if (normalizedTitle && normalizedSource.includes(normalizedTitle))
+    score += 24;
+  if (normalizedSource && normalizedTitle.includes(normalizedSource))
+    score += 24;
+
+  const overlapRatio = exactTokenMatches / Math.max(1, sourceTokens.size);
+  if (overlapRatio >= 0.65) score += 18;
+  else if (overlapRatio >= 0.45) score += 10;
+  else if (overlapRatio < 0.2) score -= 8;
+
+  const categoryEvidence = normalizeSearchText(
+    getEbayItemCategoryEvidenceText(item),
+  );
+  if (categoryEvidence) score += 4;
+
+  return Math.max(0, score);
+}
+
+function normalizeEbayCategoryPath(value?: string | null) {
+  const cleaned = decodeHtmlEntities(String(value || ''))
+    .replace(/\s*(?:>|›|»|\/)+\s*/g, ' > ')
+    .replace(/\bcategory\s*id\s*[:#]?\s*\d+\b/gi, ' ')
+    .replace(/^\d+\s*[-:|]\s*/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[>\s]+|[>\s]+$/g, '')
+    .trim();
+
+  if (!cleaned) return '';
+  if (/^\d+$/.test(cleaned)) return '';
+  if (/everything else/i.test(cleaned)) return '';
+
+  return cleaned;
+}
+
+function hasAppleLaptopSignal(sourceText: string) {
+  const normalized = normalizeSearchText(sourceText);
+  return (
+    /\b(macbook|mac book|macbook air|macbook pro|apple laptop|apple notebook)\b/.test(
+      normalized,
+    ) ||
+    (/\bapple\b/.test(normalized) &&
+      /\b(laptop|notebook|m1|m2|m3|m4|ssd|retina|macos)\b/.test(normalized))
+  );
+}
+
+function hasComputerLaptopSignal(sourceText: string) {
+  const normalized = normalizeSearchText(sourceText);
+  return (
+    hasAppleLaptopSignal(sourceText) ||
+    /\b(laptop|notebook|ultrabook|chromebook|thinkpad|latitude|elitebook|surface pro|surface laptop|ipad|tablet|computer|ssd|ram|intel|ryzen|core i[3579]|m1|m2|m3|m4)\b/.test(
+      normalized,
+    )
+  );
+}
+
+function getForcedCategoryForSource(sourceText: string) {
+  if (hasAppleLaptopSignal(sourceText)) {
+    return 'Computers/Tablets & Networking > Laptops & Netbooks > Apple Laptops';
+  }
+  return '';
+}
+
+function normalizeAppleLaptopListingTitle(title: string) {
+  let cleaned = String(title || '')
+    .replace(/mac\s*book/gi, 'MacBook')
+    .replace(/\bmacbook air\b/gi, 'MacBook Air')
+    .replace(/\bmacbook pro\b/gi, 'MacBook Pro')
+    .replace(/\b13\s+in\b/gi, '13 inch')
+    .replace(/\b14\s+in\b/gi, '14 inch')
+    .replace(/\b15\s+in\b/gi, '15 inch')
+    .replace(/\b16\s+in\b/gi, '16 inch')
+    .replace(/\b4\s+05\s*ghz\b/gi, '')
+    .replace(/\b(128|256|512)\s*gb\b/gi, '$1GB SSD')
+    .replace(/\b(1|2|4|8)\s*tb\b/gi, '$1TB SSD')
+    .replace(/\b(m1|m2|m3|m4)\b/gi, (match) => match.toUpperCase())
+    .replace(/\bapple\s+macbook/gi, 'Apple MacBook')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (/\bMacBook\b/i.test(cleaned) && !/\b(laptop|notebook)\b/i.test(cleaned)) {
+    cleaned = `${cleaned} Laptop`;
+  }
+
+  return cleaned;
+}
+
+function isWrongCategoryForSource(categoryPath: string, sourceText: string) {
+  const category = normalizeSearchText(categoryPath);
+  if (!category) return true;
+
+  if (hasComputerLaptopSignal(sourceText)) {
+    if (
+      /\b(books magazines|books|magazines|crafts|pottery|dolls|stamps|coins paper money|art|collectibles)\b/.test(
+        category,
+      )
+    ) {
+      return true;
+    }
+
+    const isKnownGoodComputerRoot =
+      /\b(computers tablets networking|consumer electronics)\b/.test(category);
+    const isSpecificLaptopPath =
+      /\b(laptops netbooks|apple laptops|pc laptops netbooks|macbook|notebook)\b/.test(
+        category,
+      );
+
+    if (!isKnownGoodComputerRoot && !isSpecificLaptopPath) return true;
+  }
+
+  return false;
+}
+
+function getAspectValueFromEbayItem(
+  item: EbaySearchItem,
+  wantedName: string,
+): string {
+  const wanted = normalizeSearchText(wantedName);
+
+  if (Array.isArray(item.localizedAspects)) {
+    const match = item.localizedAspects.find(
+      (aspect) => normalizeSearchText(aspect?.name || '') === wanted,
+    );
+
+    if (match) {
+      if (Array.isArray(match.values)) return match.values.join(' ');
+      return String(match.value || '').trim();
+    }
+  }
+
+  const aspectSources = [item.aspects, item.itemSpecifics];
+
+  for (const source of aspectSources) {
+    if (!source) continue;
+
+    const matchingKey = Object.keys(source).find(
+      (key) => normalizeSearchText(key) === wanted,
+    );
+
+    if (matchingKey) {
+      const value = source[matchingKey];
+      return Array.isArray(value)
+        ? value.join(' ')
+        : String(value || '').trim();
+    }
+  }
+
+  return '';
+}
+
+function getEbayItemCategoryCandidates(item: EbaySearchItem): string[] {
+  const candidates = [
+    item.categoryPath,
+    item.inferredCategoryPath,
+    item.ebaySuggestedCategoryPath,
+    item.ebayCategoryPath,
+    item.category,
+    item.categoryName,
+    item.primaryCategoryName,
+    item.leafCategoryName,
+    item.primaryCategory?.categoryPath,
+    item.primaryCategory?.categoryName,
+    item.itemCategory?.categoryPath,
+    item.itemCategory?.categoryName,
+    item.inferredCategory,
+    item.ebayCategory,
+  ];
+
+  if (Array.isArray(item.categories)) {
+    item.categories.forEach((category) => {
+      candidates.push(category?.categoryPath);
+      candidates.push(category?.categoryName);
+    });
+  }
+
+  return candidates
+    .map((candidate) => normalizeEbayCategoryPath(candidate))
+    .filter(Boolean);
+}
+
+function getEbayItemCategoryEvidenceText(item: EbaySearchItem): string {
+  const aspectPairs: string[] = [];
+
+  if (Array.isArray(item.localizedAspects)) {
+    item.localizedAspects.forEach((aspect) => {
+      const name = String(aspect?.name || '').trim();
+      const values = Array.isArray(aspect?.values)
+        ? aspect.values.join(' ')
+        : String(aspect?.value || '').trim();
+
+      if (name || values) {
+        aspectPairs.push(`${name} ${values}`.trim());
+      }
+    });
+  }
+
+  [item.aspects, item.itemSpecifics].forEach((source) => {
+    if (!source) return;
+
+    Object.entries(source).forEach(([key, value]) => {
+      const values = Array.isArray(value)
+        ? value.join(' ')
+        : String(value || '');
+      if (key || values) {
+        aspectPairs.push(`${key} ${values}`.trim());
+      }
+    });
+  });
+
+  return [
+    item.title,
+    item.categoryPath,
+    item.category,
+    item.categoryName,
+    item.primaryCategoryName,
+    item.leafCategoryName,
+    item.primaryCategory?.categoryPath,
+    item.primaryCategory?.categoryName,
+    item.itemCategory?.categoryPath,
+    item.itemCategory?.categoryName,
+    item.inferredCategory,
+    item.inferredCategoryPath,
+    item.ebaySuggestedCategoryPath,
+    item.ebayCategory,
+    item.ebayCategoryPath,
+    ...aspectPairs,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+}
+
+function inferCategoryPathFromEbayItem(item: EbaySearchItem): string {
+  const evidence = getEbayItemCategoryEvidenceText(item);
+  const normalized = normalizeSearchText(evidence);
+
+  if (!normalized) return '';
+
+  if (
+    /(artist|painting|watercolor|production technique|original licensed reproduction|original by|laurie beth|illustration art|cartoon illustration|framed matted|framing framed|subject humor)/.test(
+      normalized,
+    ) &&
+    /(painting|watercolor|original by|laurie beth|artist|production technique)/.test(
+      normalized,
+    )
+  ) {
+    return 'Art > Paintings';
+  }
+
+  if (
+    /(cable tester|wiremapper|wire mapper|linkmaster|rj45|cat5|cat5e|cat6|ethernet tester|network tester|toner|tone generator|62 200|62-200|cable s tested)/.test(
+      normalized,
+    )
+  ) {
+    return 'Business & Industrial > Test, Measurement & Inspection > Testers & Calibrators > Cable Testers & Trackers';
+  }
+
+  if (
+    /(le creuset|stockpot|stock pot|saucepan|cookware|enamel on steel|enameled steel|8 qt|8qt|marseille|set includes lid stockpot)/.test(
+      normalized,
+    )
+  ) {
+    return 'Home & Garden > Kitchen, Dining & Bar > Cookware > Saucepans & Stockpots';
+  }
+
+  if (
+    /(coca cola|coca-cola|coke|type of advertising|theme soda|advertising|glasses|date of creation|original reproduction)/.test(
+      normalized,
+    ) &&
+    /(glass|glasses|ceramic|advertising|soda|coca cola|coca-cola|coke)/.test(
+      normalized,
+    )
+  ) {
+    return 'Collectibles > Advertising > Soda > Coca-Cola > Glasses';
+  }
+
+  if (
+    /(hot honey|mike s hot honey|mikes hot honey|honey infused|chili peppers|chilli peppers|hot sauce|bbq sauce|condiments|sauces|pantry)/.test(
+      normalized,
+    )
+  ) {
+    return 'Home & Garden > Food & Beverages > Pantry > Condiments & Sauces > BBQ & Hot Sauces';
+  }
+
+  if (
+    /(lysol|clorox|disinfecting|disinfectant|sanitizing|all purpose cleaner|cleaning spray|cleaner spray|household cleaner)/.test(
+      normalized,
+    )
+  ) {
+    return 'Home & Garden > Household Supplies & Cleaning > Cleaning Products';
+  }
+
+  if (
+    /(deodorant|antiperspirant|old spice|invisible solid|solid stick|odor protection)/.test(
+      normalized,
+    )
+  ) {
+    return 'Health & Beauty > Bath & Body > Deodorants & Antiperspirants';
+  }
+
+  if (
+    /(lip balm|chapstick|lip treatment|dry lips|shea butter|coconut oil|vitamin e)/.test(
+      normalized,
+    )
+  ) {
+    return 'Health & Beauty > Skin Care > Lip Balm & Treatments';
+  }
+
+  if (
+    /(vitamin|mineral|supplement|superbeets|beet|gummy|gummies|capsule|tablet|softgel|heart health)/.test(
+      normalized,
+    )
+  ) {
+    return 'Health & Beauty > Vitamins & Lifestyle Supplements > Vitamins & Minerals';
+  }
+
+  if (
+    /(dry shampoo|hair care|hair styling|beach texture|texturizing)/.test(
+      normalized,
+    )
+  ) {
+    return 'Health & Beauty > Hair Care & Styling > Dry Shampoos';
+  }
+
+  return '';
+}
+
+function getCategoryPathFromEbayItem(item: EbaySearchItem): string {
+  const categoryCandidates = getEbayItemCategoryCandidates(item);
+
+  const fullPath = categoryCandidates.find((candidate) =>
+    candidate.includes(' > '),
+  );
+
+  if (fullPath) return fullPath;
+
+  const leaf = categoryCandidates.find(Boolean);
+  if (leaf) return mapLeafCategoryNameToEbayPath(leaf);
+
+  return inferCategoryPathFromEbayItem(item);
+}
+
+function mapLeafCategoryNameToEbayPath(value: string) {
+  const normalized = normalizeSearchText(value);
+
+  if (
+    /(^art$|paintings|painting|watercolor painting|original art)/.test(
+      normalized,
+    )
+  ) {
+    return 'Art > Paintings';
+  }
+  if (
+    /cable testers|testers calibrators|test measurement|wiremapper|network tester/.test(
+      normalized,
+    )
+  ) {
+    return 'Business & Industrial > Test, Measurement & Inspection > Testers & Calibrators > Cable Testers & Trackers';
+  }
+  if (/saucepans|stockpots|stockpot|cookware/.test(normalized)) {
+    return 'Home & Garden > Kitchen, Dining & Bar > Cookware > Saucepans & Stockpots';
+  }
+  if (/coca cola|advertising|soda|glasses/.test(normalized)) {
+    return 'Collectibles > Advertising > Soda > Coca-Cola > Glasses';
+  }
+  if (/hot sauce|bbq|condiments|sauces/.test(normalized)) {
+    return 'Home & Garden > Food & Beverages > Pantry > Condiments & Sauces > BBQ & Hot Sauces';
+  }
+  if (
+    /cleaning products|household cleaning|disinfecting|disinfectant|cleaner/.test(
+      normalized,
+    )
+  ) {
+    return 'Home & Garden > Household Supplies & Cleaning > Cleaning Products';
+  }
+  if (/deodorants|antiperspirants|deodorant/.test(normalized)) {
+    return 'Health & Beauty > Bath & Body > Deodorants & Antiperspirants';
+  }
+  if (/lip balm|lip treatments/.test(normalized)) {
+    return 'Health & Beauty > Skin Care > Lip Balm & Treatments';
+  }
+  if (/vitamins|minerals|supplements/.test(normalized)) {
+    return 'Health & Beauty > Vitamins & Lifestyle Supplements > Vitamins & Minerals';
+  }
+  if (/dry shampoo/.test(normalized)) {
+    return 'Health & Beauty > Hair Care & Styling > Dry Shampoos';
+  }
+
+  return value;
+}
+
+function getCategoryRoot(path: string) {
+  return normalizeEbayCategoryPath(path).split(' > ')[0] || '';
+}
+
+function getCategoryLeaf(path: string) {
+  const parts = normalizeEbayCategoryPath(path).split(' > ').filter(Boolean);
+  return parts[parts.length - 1] || '';
+}
+
+function isBroadOrUnsafeCategory(path: string) {
+  const normalized = normalizeSearchText(path);
+  return (
+    !normalized ||
+    /everything else|\bother\b|misc|unknown|not specified|verify exact ebay category|specialty category based on item type/.test(
+      normalized,
+    )
+  );
+}
+
+function getCategoryDepth(path: string) {
+  return normalizeEbayCategoryPath(path).split(' > ').filter(Boolean).length;
+}
+
+function getAllowedCategoryRootsForSource(sourceText: string): string[] {
   const signals = detectProductSignals(sourceText);
-  if (signals.isVoxxBliss || signals.isInsole) {
-    return 'Sporting Goods > Fitness, Running & Yoga > Insoles & Orthotics';
+  const roots = new Set<string>();
+
+  if (
+    signals.isHealthBeauty ||
+    signals.isLipCare ||
+    signals.isDeodorant ||
+    signals.isSupplement ||
+    signals.isVitaminMineral ||
+    signals.isMedicineOtc
+  ) {
+    roots.add('Health & Beauty');
   }
-  if (signals.isLamp) {
-    return 'Home & Garden > Lamps, Lighting & Ceiling Fans > Lamps';
+  if (signals.isVoxxBliss || signals.isInsole || signals.isSporting)
+    roots.add('Sporting Goods');
+  if (signals.isElectronics || signals.isVideoGame)
+    rootAddMany(roots, [
+      'Computers/Tablets & Networking',
+      'Consumer Electronics',
+      'Video Games & Consoles',
+    ]);
+  if (signals.isMedia)
+    rootAddMany(roots, ['Movies & TV', 'Music', 'Books & Magazines']);
+  if (signals.isClothing) roots.add('Clothing, Shoes & Accessories');
+  if (signals.isToy) roots.add('Toys & Hobbies');
+  if (signals.isKitchen || signals.isLamp) roots.add('Home & Garden');
+  if (signals.isTool)
+    rootAddMany(roots, ['Home & Garden', 'Business & Industrial']);
+  if (signals.isAuto) roots.add('eBay Motors');
+  if (signals.isPet) roots.add('Pet Supplies');
+  if (signals.isBaby) roots.add('Baby');
+  if (signals.isCraft) roots.add('Crafts');
+  if (signals.isVintage) roots.add('Collectibles');
+
+  if (
+    /\b(art|painting|watercolor|print|illustration|artist|framed matted)\b/i.test(
+      sourceText,
+    )
+  )
+    roots.add('Art');
+
+  return Array.from(roots);
+}
+
+function rootAddMany(target: Set<string>, roots: string[]) {
+  roots.forEach((root) => target.add(root));
+}
+
+function isCategoryRootCompatibleWithSource(
+  sourceText: string,
+  categoryPath: string,
+) {
+  const allowedRoots = getAllowedCategoryRootsForSource(sourceText);
+  if (!allowedRoots.length) return true;
+
+  const categoryRoot = getCategoryRoot(categoryPath);
+  if (!categoryRoot) return false;
+
+  return allowedRoots.some(
+    (root) => normalizeSearchText(root) === normalizeSearchText(categoryRoot),
+  );
+}
+
+function isHighlySpecificLocalCategory(path: string) {
+  const normalizedPath = normalizeEbayCategoryPath(path);
+  if (!normalizedPath || isBroadOrUnsafeCategory(normalizedPath)) return false;
+
+  const depth = getCategoryDepth(normalizedPath);
+  if (depth >= 3) return true;
+
+  return /^(Art > Paintings|Music > Vinyl Records|Books & Magazines > Books)$/i.test(
+    normalizedPath,
+  );
+}
+
+function getDirectEbayCategoryStrength(item: EbaySearchItem) {
+  const candidates = getEbayItemCategoryCandidates(item);
+  const fullPath = candidates.find((candidate) => candidate.includes(' > '));
+  if (fullPath) return 20;
+
+  const leaf = candidates.find(Boolean);
+  if (leaf && mapLeafCategoryNameToEbayPath(leaf).includes(' > ')) return 12;
+
+  return 0;
+}
+
+function categoryLooksLikeItemNoise(path: string, sourceText: string) {
+  const normalizedPath = normalizeSearchText(path);
+  const normalizedSource = normalizeSearchText(sourceText);
+
+  // These are usually neighbor/noisy comp categories unless the current item
+  // itself clearly says that product family.
+  const mismatches = [
+    { path: /golf/, source: /golf|putter|driver|wedge|club/ },
+    { path: /baby/, source: /baby|infant|toddler|diaper|stroller|car seat/ },
+    { path: /pet supplies/, source: /dog|cat|pet|aquarium|leash|collar/ },
+    {
+      path: /video games|consoles/,
+      source:
+        /xbox|playstation|ps\d|nintendo|switch|wii|gamecube|console|controller|video game/,
+    },
+    {
+      path: /automotive|ebay motors/,
+      source:
+        /auto|car|truck|motorcycle|brake|headlight|wiper|spark plug|oil filter/,
+    },
+  ];
+
+  return mismatches.some(
+    (rule) =>
+      rule.path.test(normalizedPath) && !rule.source.test(normalizedSource),
+  );
+}
+
+function getBestEbayCategoryFromResults(params: {
+  sourceText: string;
+  soldItems?: EbaySearchItem[];
+  activeItems?: EbaySearchItem[];
+}) {
+  const { sourceText, soldItems = [], activeItems = [] } = params;
+
+  const localCategory = buildPromptStyleCategory(sourceText);
+  const localRoot = getCategoryRoot(localCategory);
+  const localSpecific = isHighlySpecificLocalCategory(localCategory);
+  const allowedRoots = getAllowedCategoryRootsForSource(sourceText);
+
+  const candidates = [
+    ...soldItems.map((item, index) => ({
+      item,
+      weight: 1.85,
+      index,
+      source: 'sold' as const,
+    })),
+    ...activeItems.map((item, index) => ({
+      item,
+      weight: 1.15,
+      index,
+      source: 'active' as const,
+    })),
+  ];
+
+  const categoryScores: Record<string, number> = {};
+  const categoryCounts: Record<string, number> = {};
+  const rootCounts: Record<string, number> = {};
+  const categoryBestRelevance: Record<string, number> = {};
+  const categoryDirectEvidence: Record<string, number> = {};
+  const categorySoldCounts: Record<string, number> = {};
+
+  candidates.forEach(({ item, weight, index, source }) => {
+    const directPath = getCategoryPathFromEbayItem(item);
+    const inferredPath = directPath || inferCategoryPathFromEbayItem(item);
+    const normalizedPath = normalizeEbayCategoryPath(inferredPath);
+    if (!normalizedPath || isBroadOrUnsafeCategory(normalizedPath)) return;
+    if (categoryLooksLikeItemNoise(normalizedPath, sourceText)) return;
+
+    const relevance = getEbayItemRelevanceScore(sourceText, item);
+    const directEvidence = getDirectEbayCategoryStrength(item);
+    const inferredEvidenceBoost =
+      !directEvidence && inferCategoryPathFromEbayItem(item) === normalizedPath
+        ? 8
+        : 0;
+
+    // Do not let loosely similar comps hijack category selection. The category
+    // must come from a relevant title/aspect match OR direct category evidence.
+    if (relevance < 12 && directEvidence < 12 && !inferredEvidenceBoost) return;
+
+    const root = getCategoryRoot(normalizedPath);
+    const rootCompatible = isCategoryRootCompatibleWithSource(
+      sourceText,
+      normalizedPath,
+    );
+
+    // If the scanned item has strong root signals, an eBay result from a totally
+    // different root needs very strong relevance and multiple confirmations.
+    if (allowedRoots.length && !rootCompatible && relevance < 42) return;
+
+    if (root) rootCounts[root] = (rootCounts[root] || 0) + 1;
+
+    const depthBoost = Math.min(12, getCategoryDepth(normalizedPath) * 1.75);
+    const positionBoost = Math.max(0, 12 - index) * 0.35;
+    const soldBoost = source === 'sold' ? 8 : 0;
+    const localRootBoost = localRoot && root === localRoot ? 22 : 0;
+    const rootCompatibleBoost = rootCompatible ? 12 : 0;
+    const exactTitleBonus =
+      normalizeSearchText(item.title || '') === normalizeSearchText(sourceText)
+        ? 18
+        : 0;
+
+    categoryCounts[normalizedPath] = (categoryCounts[normalizedPath] || 0) + 1;
+    if (source === 'sold') {
+      categorySoldCounts[normalizedPath] =
+        (categorySoldCounts[normalizedPath] || 0) + 1;
+    }
+    categoryDirectEvidence[normalizedPath] = Math.max(
+      categoryDirectEvidence[normalizedPath] || 0,
+      directEvidence,
+    );
+    categoryBestRelevance[normalizedPath] = Math.max(
+      categoryBestRelevance[normalizedPath] || 0,
+      relevance,
+    );
+    categoryScores[normalizedPath] =
+      (categoryScores[normalizedPath] || 0) +
+      relevance * weight +
+      positionBoost +
+      depthBoost +
+      soldBoost +
+      localRootBoost +
+      rootCompatibleBoost +
+      directEvidence +
+      inferredEvidenceBoost +
+      exactTitleBonus;
+  });
+
+  const scored = Object.entries(categoryScores)
+    .map(([path, score]) => ({
+      path,
+      score,
+      count: categoryCounts[path] || 0,
+      soldCount: categorySoldCounts[path] || 0,
+      directEvidence: categoryDirectEvidence[path] || 0,
+      root: getCategoryRoot(path),
+      leaf: getCategoryLeaf(path),
+      bestRelevance: categoryBestRelevance[path] || 0,
+      depth: getCategoryDepth(path),
+      rootCompatible: isCategoryRootCompatibleWithSource(sourceText, path),
+    }))
+    .sort((a, b) => {
+      const compatibilityDelta =
+        Number(b.rootCompatible) - Number(a.rootCompatible);
+      if (compatibilityDelta) return compatibilityDelta;
+
+      const soldDelta = b.soldCount - a.soldCount;
+      if (soldDelta) return soldDelta;
+
+      const countDelta = b.count - a.count;
+      if (countDelta) return countDelta;
+
+      return b.score - a.score;
+    });
+
+  const best = scored[0];
+  if (!best) return localSpecific ? localCategory : '';
+
+  const bestRootCount = rootCounts[best.root] || 0;
+  const localRootMatches = Boolean(localRoot && best.root === localRoot);
+  const eBayHasRealSupport =
+    best.count >= 2 ||
+    best.soldCount >= 1 ||
+    bestRootCount >= 2 ||
+    best.directEvidence >= 20 ||
+    best.bestRelevance >= 34 ||
+    best.score >= 70;
+
+  if (best.rootCompatible && eBayHasRealSupport) return best.path;
+
+  // If eBay is weak/noisy but our current item text maps to a real specific
+  // category, trust the item in front of the user over neighboring comps.
+  if (localSpecific) return localCategory;
+
+  if (localRootMatches && best.score >= 44) return best.path;
+
+  return eBayHasRealSupport ? best.path : '';
+}
+
+function buildPromptStyleCategory(sourceText: string) {
+  const text = String(sourceText || '').trim();
+  const normalized = normalizeSearchText(text);
+  const signals = detectProductSignals(text);
+
+  if (!normalized) {
+    return '';
   }
-  if (signals.isClothing) {
-    return 'Clothing, Shoes & Accessories > Specialty category based on item type';
+
+  const categoryRules: Array<{
+    path: string;
+    baseScore: number;
+    terms: string[];
+  }> = [
+    {
+      path: 'Art > Paintings',
+      baseScore:
+        /(laurie beth|original by|watercolor painting|painting|artist|framed matted|matted decor|illustration art|cartoon illustration|bathroom humor|bathtub sign)/i.test(
+          text,
+        )
+          ? 135
+          : 0,
+      terms: [
+        'laurie beth',
+        'original by',
+        'artist',
+        'painting',
+        'watercolor',
+        'watercolor painting',
+        'framed',
+        'matted',
+        'framed matted',
+        'illustration art',
+        'cartoon illustration',
+        'bathroom humor',
+        'bathtub',
+        'humor',
+      ],
+    },
+    {
+      path: 'Home & Garden > Household Supplies & Cleaning > Cleaning Products',
+      baseScore:
+        /(lysol|clorox|disinfect|disinfecting|sanitizing|all purpose cleaner|cleaning spray|cleaner spray|household cleaner|lemon breeze)/i.test(
+          text,
+        )
+          ? 115
+          : 0,
+      terms: [
+        'lysol',
+        'clorox',
+        'disinfecting spray',
+        'disinfectant spray',
+        'sanitizing spray',
+        'all purpose cleaner',
+        'cleaning spray',
+        'household cleaner',
+        'lemon breeze',
+      ],
+    },
+    {
+      path: 'Home & Garden > Food & Beverages > Pantry > Condiments & Sauces > BBQ & Hot Sauces',
+      baseScore:
+        /(hot honey|honey infused|chili|chillies|chili peppers|hot sauce|bbq sauce|condiment|mike.?s hot honey)/i.test(
+          text,
+        )
+          ? 115
+          : 0,
+      terms: [
+        'mikes hot honey',
+        'mike hot honey',
+        'hot honey',
+        'honey infused',
+        'chili peppers',
+        'chillies',
+        'hot sauce',
+        'bbq sauce',
+        'condiment',
+      ],
+    },
+    {
+      path: 'Collectibles > Advertising > Soda > Coca-Cola > Glasses',
+      baseScore:
+        /(coca cola|coke|coca-cola).*(glass|glasses|ceramic|advertising|collectible|2003)|white coca cola|coca cola glass/i.test(
+          text,
+        )
+          ? 125
+          : 0,
+      terms: [
+        'coca cola',
+        'coca-cola',
+        'coke',
+        'glass',
+        'glasses',
+        'ceramic',
+        'advertising',
+        'soda',
+        'collectible',
+        '2003',
+      ],
+    },
+    {
+      path: 'Home & Garden > Kitchen, Dining & Bar > Cookware > Saucepans & Stockpots',
+      baseScore:
+        /(le creuset|stockpot|stock pot|dutch oven|saucepan|cookware|enamel on steel|enameled steel|8 qt|8qt|marseille)/i.test(
+          text,
+        )
+          ? 120
+          : 0,
+      terms: [
+        'le creuset',
+        'stockpot',
+        'stock pot',
+        'cookware',
+        'saucepan',
+        'enamel on steel',
+        'enameled steel',
+        '8 qt',
+        '8qt',
+        'marseille',
+      ],
+    },
+    {
+      path: 'Business & Industrial > Test, Measurement & Inspection > Testers & Calibrators > Cable Testers & Trackers',
+      baseScore:
+        /(cable tester|wiremapper|wire mapper|linkmaster|rj45|cat5|cat5e|cat6|ethernet tester|network tester|toner|tone generator|62 200|62-200)/i.test(
+          text,
+        )
+          ? 110
+          : 0,
+      terms: [
+        'ideal',
+        '62-200',
+        '62 200',
+        'linkmaster',
+        'rj45',
+        'cat5',
+        'cat5e',
+        'cat6',
+        'ethernet',
+        'wiremapper',
+        'wire mapper',
+        'cable tester',
+        'network tester',
+        'toner',
+        'tone generator',
+        'testers calibrators',
+        'cable testers trackers',
+      ],
+    },
+    {
+      path: 'Health & Beauty > Bath & Body > Deodorants & Antiperspirants',
+      baseScore: signals.isDeodorant ? 90 : 0,
+      terms: [
+        'deodorant',
+        'antiperspirant',
+        'anti perspirant',
+        'old spice',
+        'swagger',
+        'invisible solid',
+        'solid stick',
+        'aluminum free',
+        'odor protection',
+        'degree',
+        'dove men',
+        'secret',
+        'native deodorant',
+        'axe deodorant',
+        'speed stick',
+      ],
+    },
+    {
+      path: 'Health & Beauty > Skin Care > Lip Balm & Treatments',
+      baseScore: signals.isLipCare ? 90 : 0,
+      terms: [
+        'lip balm',
+        'chapstick',
+        'lip treatment',
+        'lip moisturizer',
+        'lip repair',
+        'dry lips',
+        'itk',
+        'shea butter',
+        'coconut oil',
+        'vitamin e',
+        'hydrating',
+      ],
+    },
+    {
+      path: 'Health & Beauty > Vitamins & Lifestyle Supplements > Vitamins & Minerals',
+      baseScore: signals.isSupplement || signals.isVitaminMineral ? 80 : 0,
+      terms: [
+        'superbeets',
+        'super beets',
+        'beet',
+        'beet root',
+        'heart health',
+        'grape seed',
+        'vitamin',
+        'mineral',
+        'supplement',
+        'gummy',
+        'gummies',
+        'capsule',
+        'tablet',
+        'softgel',
+        'non gmo',
+        '60ct',
+        '60 count',
+      ],
+    },
+    {
+      path: 'Health & Beauty > Hair Care & Styling > Dry Shampoos',
+      baseScore: /dry shampoo/i.test(text) ? 90 : 0,
+      terms: [
+        'dry shampoo',
+        'colab',
+        'beach texture',
+        'texturizing',
+        'texture spray',
+        'hair refresh',
+      ],
+    },
+    {
+      path: 'Health & Beauty > Hair Care & Styling > Styling Products',
+      baseScore: signals.isHealthBeauty ? 10 : 0,
+      terms: [
+        'hair spray',
+        'texture',
+        'texturizing',
+        'styling',
+        'mousse',
+        'gel',
+        'pomade',
+        'hair cream',
+      ],
+    },
+    {
+      path: 'Health & Beauty > Health Care > Over-the-Counter Medicine',
+      baseScore: signals.isMedicineOtc ? 75 : 0,
+      terms: [
+        'pain relief',
+        'allergy',
+        'cold and flu',
+        'cough',
+        'ibuprofen',
+        'acetaminophen',
+        'aspirin',
+        'antacid',
+        'digestive relief',
+        'first aid',
+      ],
+    },
+    {
+      path: 'Health & Beauty > Oral Care > Toothpaste',
+      baseScore: 0,
+      terms: ['toothpaste', 'crest', 'colgate', 'sensodyne', 'oral b'],
+    },
+    {
+      path: 'Sporting Goods > Fitness, Running & Yoga > Insoles & Orthotics',
+      baseScore: signals.isVoxxBliss || signals.isInsole ? 90 : 0,
+      terms: [
+        'voxx',
+        'voxxlife',
+        'voxxbliss',
+        'insole',
+        'insoles',
+        'orthotic',
+        'shoe insert',
+        'arch support',
+        'hpt',
+        'neuro',
+      ],
+    },
+    {
+      path: 'Home & Garden > Lamps, Lighting & Ceiling Fans > Lamps',
+      baseScore: signals.isLamp ? 85 : 0,
+      terms: [
+        'lamp',
+        'desk lamp',
+        'table lamp',
+        'light therapy',
+        'happylight',
+        '10000 lux',
+        'uv free',
+      ],
+    },
+    {
+      path: 'Consumer Electronics > Video Games & Consoles > Video Game Consoles',
+      baseScore: signals.isVideoGame ? 55 : 0,
+      terms: [
+        'xbox',
+        'playstation',
+        'ps5',
+        'ps4',
+        'nintendo switch',
+        'wii',
+        'gamecube',
+        'console',
+      ],
+    },
+    {
+      path: 'Consumer Electronics > Video Games & Consoles > Controllers & Attachments',
+      baseScore: 0,
+      terms: [
+        'controller',
+        'joy con',
+        'gamepad',
+        'xbox controller',
+        'ps5 controller',
+      ],
+    },
+    {
+      path: 'Consumer Electronics > Portable Audio & Headphones > Headphones',
+      baseScore: signals.isElectronics ? 5 : 0,
+      terms: [
+        'headphones',
+        'earbuds',
+        'airpods',
+        'beats',
+        'sony headphones',
+        'jbl headphones',
+      ],
+    },
+    {
+      path: 'Consumer Electronics > Cameras & Photo > Digital Cameras',
+      baseScore: signals.isElectronics ? 5 : 0,
+      terms: [
+        'digital camera',
+        'canon',
+        'nikon',
+        'sony camera',
+        'kodak camera',
+      ],
+    },
+    {
+      path: 'Consumer Electronics > TV, Video & Home Audio > Home Audio',
+      baseScore: signals.isElectronics ? 5 : 0,
+      terms: [
+        'speaker',
+        'receiver',
+        'stereo',
+        'soundbar',
+        'bluetooth speaker',
+        'radio',
+      ],
+    },
+    {
+      path: 'Movies & TV > DVDs & Blu-ray Discs',
+      baseScore: signals.isMedia ? 20 : 0,
+      terms: ['dvd', 'blu ray', 'bluray', 'movie', 'season', 'series'],
+    },
+    {
+      path: 'Music > Vinyl Records',
+      baseScore: signals.isMedia ? 15 : 0,
+      terms: ['vinyl', 'record', 'lp album', '45 rpm'],
+    },
+    {
+      path: 'Books & Magazines > Books',
+      baseScore: signals.isMedia ? 15 : 0,
+      terms: ['book', 'paperback', 'hardcover', 'novel', 'textbook'],
+    },
+    {
+      path: "Clothing, Shoes & Accessories > Men > Men's Clothing > Shirts",
+      baseScore: signals.isClothing ? 20 : 0,
+      terms: ['mens shirt', 'men shirt', 'polo', 't shirt', 'button down'],
+    },
+    {
+      path: "Clothing, Shoes & Accessories > Women > Women's Clothing > Tops",
+      baseScore: signals.isClothing ? 20 : 0,
+      terms: ['womens shirt', 'women shirt', 'blouse', 'top', 'tank top'],
+    },
+    {
+      path: 'Toys & Hobbies > Building Toys > LEGO (R) Building Toys',
+      baseScore: signals.isToy ? 25 : 0,
+      terms: ['lego', 'lego set', 'lego minifigure', 'duplo'],
+    },
+    {
+      path: 'Toys & Hobbies > Action Figures & Accessories > Action Figures',
+      baseScore: signals.isToy ? 25 : 0,
+      terms: [
+        'action figure',
+        'marvel legends',
+        'star wars figure',
+        'wwe figure',
+      ],
+    },
+    {
+      path: 'Toys & Hobbies > Games > Board & Traditional Games',
+      baseScore: signals.isToy ? 20 : 0,
+      terms: ['board game', 'card game', 'puzzle', 'game'],
+    },
+    {
+      path: 'Home & Garden > Kitchen, Dining & Bar > Dinnerware & Serveware',
+      baseScore: signals.isKitchen ? 35 : 0,
+      terms: ['plate', 'bowl', 'mug', 'cup', 'saucer', 'serving dish'],
+    },
+    {
+      path: 'Home & Garden > Kitchen, Dining & Bar > Small Kitchen Appliances',
+      baseScore: signals.isKitchen ? 35 : 0,
+      terms: [
+        'coffee maker',
+        'blender',
+        'mixer',
+        'toaster',
+        'air fryer',
+        'crock pot',
+        'instant pot',
+      ],
+    },
+    {
+      path: 'Home & Garden > Tools & Workshop Equipment > Power Tools',
+      baseScore: signals.isTool ? 35 : 0,
+      terms: [
+        'drill',
+        'saw',
+        'sander',
+        'impact driver',
+        'dewalt',
+        'milwaukee',
+        'makita',
+        'ryobi',
+      ],
+    },
+    {
+      path: 'Home & Garden > Tools & Workshop Equipment > Hand Tools',
+      baseScore: signals.isTool ? 35 : 0,
+      terms: ['wrench', 'socket', 'ratchet', 'screwdriver', 'pliers', 'hammer'],
+    },
+    {
+      path: 'eBay Motors > Parts & Accessories > Car & Truck Parts & Accessories',
+      baseScore: signals.isAuto ? 45 : 0,
+      terms: [
+        'oil filter',
+        'spark plug',
+        'brake',
+        'headlight',
+        'tail light',
+        'floor mat',
+        'wiper',
+      ],
+    },
+    {
+      path: 'Pet Supplies > Dog Supplies > Dog Toys',
+      baseScore: signals.isPet ? 25 : 0,
+      terms: ['dog toy', 'dog chew', 'dog treats', 'leash', 'collar'],
+    },
+    {
+      path: 'Baby > Diapering > Disposable Diapers',
+      baseScore: signals.isBaby ? 25 : 0,
+      terms: ['diaper', 'diapers', 'pampers', 'huggies'],
+    },
+    {
+      path: 'Sporting Goods > Golf > Golf Clubs & Equipment',
+      baseScore: signals.isSporting ? 25 : 0,
+      terms: ['golf club', 'golf clubs', 'putter', 'driver', 'wedge'],
+    },
+    {
+      path: 'Crafts > Multi-Purpose Craft Supplies > Craft Supplies',
+      baseScore: signals.isCraft ? 25 : 0,
+      terms: ['craft', 'cricut', 'scrapbook', 'yarn', 'fabric', 'beads'],
+    },
+    {
+      path: 'Collectibles > Kitchen & Home > Mugs & Cups',
+      baseScore: /(mug|coffee mug|cup|stein|tumbler|travel mug)/i.test(text)
+        ? 70
+        : 0,
+      terms: ['mug', 'coffee mug', 'cup', 'stein', 'travel mug', 'tumbler'],
+    },
+    {
+      path: 'Home & Garden > Kitchen, Dining & Bar > Glassware & Drinkware',
+      baseScore:
+        /(glassware|drinkware|wine glass|shot glass|tumbler|water bottle|stanley cup|yeti|hydro flask)/i.test(
+          text,
+        )
+          ? 70
+          : 0,
+      terms: [
+        'glassware',
+        'drinkware',
+        'wine glass',
+        'shot glass',
+        'tumbler',
+        'water bottle',
+        'stanley',
+        'yeti',
+        'hydro flask',
+      ],
+    },
+    {
+      path: 'Home & Garden > Home Décor > Candles & Home Fragrance',
+      baseScore:
+        /(candle|wax melt|home fragrance|diffuser|essential oil)/i.test(text)
+          ? 70
+          : 0,
+      terms: [
+        'candle',
+        'wax melt',
+        'home fragrance',
+        'diffuser',
+        'essential oil',
+      ],
+    },
+    {
+      path: 'Home & Garden > Home Décor > Decorative Accessories',
+      baseScore:
+        /(home decor|home décor|wall decor|decorative|figurine|vase|picture frame|frame)/i.test(
+          text,
+        )
+          ? 45
+          : 0,
+      terms: [
+        'home decor',
+        'wall decor',
+        'decorative',
+        'figurine',
+        'vase',
+        'picture frame',
+        'frame',
+      ],
+    },
+    {
+      path: 'Consumer Electronics > Cell Phones & Accessories > Cell Phone Accessories',
+      baseScore:
+        /(phone case|iphone case|samsung case|screen protector|cell phone accessory)/i.test(
+          text,
+        )
+          ? 75
+          : 0,
+      terms: [
+        'phone case',
+        'iphone case',
+        'samsung case',
+        'screen protector',
+        'cell phone accessory',
+      ],
+    },
+    {
+      path: 'Consumer Electronics > Multipurpose Batteries & Power > Chargers & Cradles',
+      baseScore:
+        /(charger|charging cable|usb c|lightning cable|power adapter|ac adapter)/i.test(
+          text,
+        )
+          ? 70
+          : 0,
+      terms: [
+        'charger',
+        'charging cable',
+        'usb c',
+        'lightning cable',
+        'power adapter',
+        'ac adapter',
+      ],
+    },
+    {
+      path: "Clothing, Shoes & Accessories > Men > Men's Shoes > Athletic Shoes",
+      baseScore:
+        /(mens sneakers|men sneakers|men.?s shoe|men.?s athletic|nike|adidas|new balance|asics|sneaker)/i.test(
+          text,
+        )
+          ? 65
+          : 0,
+      terms: [
+        'mens sneakers',
+        'men shoes',
+        'athletic shoes',
+        'nike',
+        'adidas',
+        'new balance',
+        'asics',
+        'sneaker',
+      ],
+    },
+    {
+      path: "Clothing, Shoes & Accessories > Women > Women's Shoes > Athletic Shoes",
+      baseScore:
+        /(womens sneakers|women sneakers|women.?s shoe|women.?s athletic|nike|adidas|new balance|asics|sneaker)/i.test(
+          text,
+        )
+          ? 65
+          : 0,
+      terms: [
+        'womens sneakers',
+        'women shoes',
+        'athletic shoes',
+        'nike',
+        'adidas',
+        'new balance',
+        'asics',
+        'sneaker',
+      ],
+    },
+    {
+      path: 'Collectibles > Comics > Comics & Graphic Novels',
+      baseScore:
+        /(comic book|comics|graphic novel|marvel comic|dc comic)/i.test(text)
+          ? 80
+          : 0,
+      terms: [
+        'comic book',
+        'comics',
+        'graphic novel',
+        'marvel comic',
+        'dc comic',
+      ],
+    },
+    {
+      path: 'Collectibles > Non-Sport Trading Cards > Trading Card Singles',
+      baseScore:
+        /(trading card|pokemon card|pokémon card|sports card|baseball card|football card|basketball card)/i.test(
+          text,
+        )
+          ? 70
+          : 0,
+      terms: [
+        'trading card',
+        'pokemon card',
+        'sports card',
+        'baseball card',
+        'football card',
+        'basketball card',
+      ],
+    },
+    {
+      path: 'Collectibles > Decorative Collectibles > Other Decorative Collectibles',
+      baseScore: signals.isVintage ? 30 : 0,
+      terms: [
+        'vintage',
+        'antique',
+        'mid century',
+        'retro',
+        'collectible',
+        'figurine',
+      ],
+    },
+  ];
+
+  const scoredCategories = categoryRules
+    .map((rule) => ({
+      path: rule.path,
+      score: rule.baseScore + scoreCategoryRule(text, rule.terms),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const bestCategory = scoredCategories[0];
+
+  if (bestCategory && bestCategory.score >= 16) {
+    return bestCategory.path;
   }
-  if (signals.isToy) {
-    return 'Toys & Hobbies > Action Figures, Toys & Collectibles > Other Toys & Hobbies';
+
+  if (signals.isDeodorant)
+    return 'Health & Beauty > Bath & Body > Deodorants & Antiperspirants';
+  if (signals.isLipCare)
+    return 'Health & Beauty > Skin Care > Lip Balm & Treatments';
+  if (signals.isSupplement || signals.isVitaminMineral)
+    return 'Health & Beauty > Vitamins & Lifestyle Supplements > Vitamins & Minerals';
+  if (signals.isHealthBeauty) return '';
+  if (signals.isElectronics || signals.isVideoGame) return '';
+  if (signals.isClothing) return '';
+  if (signals.isToy) return '';
+  if (signals.isKitchen || signals.isLamp) return '';
+  if (signals.isTool) return '';
+  if (signals.isAuto) return '';
+  if (signals.isPet) return '';
+  if (signals.isBaby) return '';
+  if (signals.isSporting) return '';
+  if (signals.isCraft) return '';
+  if (signals.isMedia) return '';
+  if (signals.isVintage) return '';
+
+  return '';
+}
+
+function buildPromptStyleCategoryFromEbayResults(params: {
+  sourceText: string;
+  soldItems?: EbaySearchItem[];
+  activeItems?: EbaySearchItem[];
+}) {
+  const forcedCategory = getForcedCategoryForSource(params.sourceText);
+  if (forcedCategory) return forcedCategory;
+
+  const ebayCategory = getBestEbayCategoryFromResults(params);
+  if (
+    ebayCategory &&
+    !isBroadOrUnsafeCategory(ebayCategory) &&
+    !isWrongCategoryForSource(ebayCategory, params.sourceText)
+  )
+    return ebayCategory;
+
+  // If the backend does not return trustworthy eBay category paths, do NOT blend
+  // unrelated comp titles. Fall back only to the current item title/OCR text.
+  const localCategory = buildPromptStyleCategory(params.sourceText);
+  if (
+    localCategory &&
+    !isBroadOrUnsafeCategory(localCategory) &&
+    !isWrongCategoryForSource(localCategory, params.sourceText)
+  ) {
+    return localCategory;
   }
-  if (signals.isVintage) {
-    return 'Collectibles > Specialty category based on item type';
-  }
-  return 'Everything Else > Other';
+
+  // Last resort: do not invent a generic category. This keeps the app honest
+  // when eBay did not return a trustworthy category from matching results.
+  return 'No trusted eBay category match yet — rerun with clearer title/photos';
 }
 
 function buildPromptStylePricing(params: {
@@ -2909,26 +4690,34 @@ function buildPromptStylePhotoNotes(params: { sourceText: string }) {
         'Close-up of the Size Large / Men 7–13 label',
         'Photo of UPC, lot number, or box end panel if visible',
       ]
-    : [
-        'Clear front hero shot on a clean background',
-        'Back, bottom, label, tag, model number, or maker mark close-up',
-        'Close-up of any wear, damage, or included accessories',
-        'Size reference photo when scale is not obvious',
-      ];
+    : signals.isHealthBeauty
+      ? [
+          'Clear front label photo with the full brand and product name readable',
+          'Back label photo showing directions, ingredients, barcode, and size',
+          'Bottom or lot/date code photo if present',
+          'Close-up of any dents, scratches, leaks, residue, or package wear',
+        ]
+      : [
+          'Clear front hero shot on a clean background',
+          'Back, bottom, label, tag, model number, or maker mark close-up',
+          'Close-up of any wear, damage, or included accessories',
+          'Size reference photo when scale is not obvious',
+        ];
 
   return [
     'Hero Shot:',
-    'Use the clearest front-facing photo as the main image. Crop tight on the item and remove background clutter so it stands out in search results.',
+    'Use the sharpest front-facing photo as the main listing image. Crop tight on the item, keep it centered, and use a clean white, light gray, or neutral background so it stands out in search results.',
     '',
     'Per-Photo Notes:',
-    '• Crop tight on the subject and keep the item centered',
-    '• Brighten slightly if the image looks dim or gray',
-    '• Do not use blurry, dark, or duplicate photos as main images',
+    '• Photo 1: Crop tight on the subject and remove background clutter. Brightness/contrast adjustment: yes if the image looks dim, gray, or yellow. Usable if label/details are sharp.',
+    '• Photo 2: Use for back, bottom, label, tag, barcode, or condition detail. Straighten the image and crop to square when possible.',
+    '• Additional photos: Keep only clear, helpful angles. Do not use blurry, dark, duplicate, or heavily cluttered shots.',
     '',
     'Missing Shots:',
     ...missing.map((item) => `• ${item}`),
   ].join('\n');
 }
+
 function buildBestSourcingTitle(
   product: BarcodeProduct | null,
   condition: SourcingCondition,
@@ -6712,6 +8501,7 @@ function buildProEbaySourcingDraft(params: {
   packageFrontSearchText: string;
   packageFrontDetectedText?: string | null;
   soldItems?: EbaySearchItem[];
+  activeItems?: EbaySearchItem[];
 }): SourcingDraft {
   const {
     condition,
@@ -6721,6 +8511,7 @@ function buildProEbaySourcingDraft(params: {
     packageFrontSearchText,
     packageFrontDetectedText,
     soldItems,
+    activeItems,
   } = params;
 
   const sourceText = getSourcingSourceText({
@@ -6747,15 +8538,55 @@ function buildProEbaySourcingDraft(params: {
     packageFrontSearchText,
     packageFrontDetectedText,
   });
+
+  // Keep listing recommendations tied to the current item.
+  // Package-front OCR text can be stale if the user scans a new item right after
+  // a previous scan, so category/description/specifics should primarily use the
+  // resolved current product title instead of old OCR helper text.
+  const currentProductSourceText = [
+    listingProduct?.title,
+    title,
+    listingProduct?.barcode,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+
+  const currentProductNormalized = normalizeSearchText(
+    currentProductSourceText,
+  );
+  const currentOcrText = [packageFrontSearchText, packageFrontDetectedText]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  const currentOcrNormalized = normalizeSearchText(currentOcrText);
+  const hasLikelyMatchingOcr =
+    Boolean(currentOcrNormalized) &&
+    tokenizeSearchText(currentProductNormalized)
+      .filter((word) => word.length > 3)
+      .some((word) => currentOcrNormalized.includes(word));
+
+  const listingSourceText =
+    [currentProductSourceText, hasLikelyMatchingOcr ? currentOcrText : '']
+      .filter(Boolean)
+      .join(' ')
+      .trim() ||
+    sourceText ||
+    title;
+
   const fullDescription = buildPromptStyleDescription({
     title,
     product: listingProduct,
     condition,
     measurements,
     isCylinder,
-    sourceText: sourceText || title,
+    sourceText: listingSourceText,
   });
-  const suggestedCategory = buildPromptStyleCategory(sourceText || title);
+  const suggestedCategory = buildPromptStyleCategoryFromEbayResults({
+    sourceText: listingSourceText,
+    soldItems: soldItems || [],
+    activeItems: activeItems || [],
+  });
   const pricingRecommendation = buildPromptStylePricing({
     product: listingProduct,
     condition,
@@ -6763,20 +8594,20 @@ function buildProEbaySourcingDraft(params: {
   });
   const shippingRecommendation = buildPromptStyleShipping({
     product: listingProduct,
-    sourceText: sourceText || title,
+    sourceText: listingSourceText,
   });
   const itemSpecifics = buildPromptStyleItemSpecifics({
     product: listingProduct,
     condition,
-    sourceText: sourceText || title,
+    sourceText: listingSourceText,
   });
   const photoNotes = buildPromptStylePhotoNotes({
-    sourceText: sourceText || title,
+    sourceText: listingSourceText,
   });
 
   const titleTokens = new Set(tokenizeSearchText(title));
   const keywordCandidates = dedupeWordsKeepOrder(
-    tokenizeSearchText(sourceText || title)
+    tokenizeSearchText(listingSourceText)
       .filter((word) => word.length > 2)
       .filter((word) => !titleTokens.has(word))
       .filter(
@@ -8003,6 +9834,49 @@ export default function HomeScreen() {
     });
   };
 
+  useEffect(() => {
+    let isMounted = true;
+
+    AsyncStorage.getItem(WELCOME_STARTUP_STORAGE_KEY)
+      .then((storedValue) => {
+        if (!isMounted) return;
+
+        const shouldShowWelcome =
+          storedValue === null ? true : storedValue === 'true';
+        setShowWelcomeOnStartup(shouldShowWelcome);
+        setWelcomePreferenceLoaded(true);
+
+        if (shouldShowWelcome) {
+          setStep('welcome');
+        } else if (step === 'welcome') {
+          setStep('referencePicker');
+        }
+      })
+      .catch((error) => {
+        console.log('Welcome startup preference load error:', error);
+        if (!isMounted) return;
+        setShowWelcomeOnStartup(true);
+        setWelcomePreferenceLoaded(true);
+        setStep('welcome');
+      });
+
+    return () => {
+      isMounted = false;
+    };
+    // Run once on app load only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleWelcomeStartupToggle = (value: boolean) => {
+    setShowWelcomeOnStartup(value);
+    AsyncStorage.setItem(
+      WELCOME_STARTUP_STORAGE_KEY,
+      value ? 'true' : 'false',
+    ).catch((error) => {
+      console.log('Welcome startup preference save error:', error);
+    });
+  };
+
   const scrollGarageSaleCardToTop = (
     saleId: string,
     attempt = 0,
@@ -8034,6 +9908,8 @@ export default function HomeScreen() {
 
   const [helperTipsEnabled, setHelperTipsEnabled] = useState(true);
   const [helperTipIndex, setHelperTipIndex] = useState(0);
+  const [showWelcomeOnStartup, setShowWelcomeOnStartup] = useState(true);
+  const [welcomePreferenceLoaded, setWelcomePreferenceLoaded] = useState(false);
 
   const advanceHelperTip = (tipCount: number) => {
     if (tipCount <= 1) return;
@@ -8316,6 +10192,11 @@ export default function HomeScreen() {
       isCylinder,
       packageFrontSearchText,
       packageFrontDetectedText,
+      soldItems: ebaySoldResults?.length ? ebaySoldResults : [],
+      activeItems: [
+        ...(ebayExactResults?.length ? ebayExactResults : ebayResults || []),
+        ...(ebaySimilarResults || []),
+      ],
     });
 
     setSourcingDraft(nextDraft);
@@ -8336,6 +10217,10 @@ export default function HomeScreen() {
     measurements.depth,
     packageFrontDetectedText,
     packageFrontSearchText,
+    ebaySoldResults?.length ?? 0,
+    ebayResults?.length ?? 0,
+    ebayExactResults?.length ?? 0,
+    ebaySimilarResults?.length ?? 0,
   ]);
   const [selectedGarageSalePinId, setSelectedGarageSalePinId] = useState<
     string | null
@@ -10760,6 +12645,16 @@ Barcode not found, try Box instead.`,
   const applyResolvedProduct = (product: BarcodeProduct) => {
     setBarcodeProduct(product);
 
+    // Prevent stale OCR/search/eBay results from a previous item from influencing
+    // the next listing's category, description, or item specifics.
+    setPackageFrontSearchText('');
+    setPackageFrontDetectedText('');
+    setEbayResults([]);
+    setEbayExactResults([]);
+    setEbaySimilarResults([]);
+    setEbaySoldResults([]);
+    setSourcingDraft(null);
+
     const hasPackageDimensions =
       product.length > 0 && product.width > 0 && product.height > 0;
 
@@ -12691,6 +14586,155 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
   };
 
   // ===== GARAGE SALE PHASE 1: HOME SCREEN UI START =====
+
+  const renderWelcomePage = () => (
+    <SafeAreaView style={styles.screen}>
+      <ScrollView
+        ref={activeScrollRef}
+        style={styles.flexFill}
+        contentContainerStyle={styles.packageFrontScrollContent}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.headerRow}>
+          <Image
+            source={require('../../assets/logo-icon.png')}
+            style={styles.headerIcon}
+            resizeMode="contain"
+          />
+          <Text style={styles.headerTitle}>List Assist</Text>
+        </View>
+
+        <View style={styles.resultCard}>
+          <Text style={styles.title}>Welcome to List Assist</Text>
+          <Text style={[styles.infoText, { marginTop: 8, textAlign: 'left' }]}>
+            List Assist helps you move from finding an item to getting it ready
+            to sell. Use Sourcing when you are checking whether something is
+            worth buying. Use Listing when you are ready to build a listing and
+            get the item posted.
+          </Text>
+
+          <View style={{ marginTop: 18, gap: 12 }}>
+            <View>
+              <Text
+                style={{ color: '#0F172A', fontSize: 16, fontWeight: '900' }}
+              >
+                1. Scan or photograph the item
+              </Text>
+              <Text
+                style={{
+                  color: '#475569',
+                  fontSize: 14,
+                  fontWeight: '700',
+                  lineHeight: 20,
+                  marginTop: 4,
+                }}
+              >
+                Barcode works best for packaged retail items. Box helps with
+                sizing. Item is best for loose finds, thrift items, and estate
+                sale finds.
+              </Text>
+            </View>
+
+            <View>
+              <Text
+                style={{ color: '#0F172A', fontSize: 16, fontWeight: '900' }}
+              >
+                2. Check sourcing and listing details
+              </Text>
+              <Text
+                style={{
+                  color: '#475569',
+                  fontSize: 14,
+                  fontWeight: '700',
+                  lineHeight: 20,
+                  marginTop: 4,
+                }}
+              >
+                The app can help compare prices, review sold comps, estimate
+                profit, suggest listing text, and keep your stronger finds saved
+                for later.
+              </Text>
+            </View>
+
+            <View>
+              <Text
+                style={{ color: '#0F172A', fontSize: 16, fontWeight: '900' }}
+              >
+                3. Save, list, or source more
+              </Text>
+              <Text
+                style={{
+                  color: '#475569',
+                  fontSize: 14,
+                  fontWeight: '700',
+                  lineHeight: 20,
+                  marginTop: 4,
+                }}
+              >
+                Save promising items, open seller tools, or jump into Source
+                Assist when you want to find places to shop.
+              </Text>
+            </View>
+          </View>
+
+          <View
+            style={{
+              marginTop: 22,
+              padding: 14,
+              borderRadius: 18,
+              borderWidth: 1,
+              borderColor: '#CBD5E1',
+              backgroundColor: '#F8FAFC',
+              flexDirection: 'row',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 14,
+            }}
+          >
+            <View style={{ flex: 1 }}>
+              <Text
+                style={{ color: '#0F172A', fontSize: 15, fontWeight: '900' }}
+              >
+                Show this Page on Startup
+              </Text>
+              <Text
+                style={{
+                  color: '#64748B',
+                  fontSize: 12,
+                  fontWeight: '700',
+                  marginTop: 3,
+                }}
+              >
+                Turn this off once you know your way around.
+              </Text>
+            </View>
+            <Switch
+              value={showWelcomeOnStartup}
+              onValueChange={handleWelcomeStartupToggle}
+              trackColor={{ false: '#E5E7EB', true: '#34C759' }}
+              thumbColor="#FFFFFF"
+              ios_backgroundColor="#E5E7EB"
+            />
+          </View>
+
+          <TouchableOpacity
+            style={[styles.primaryButton, { marginTop: 22 }]}
+            onPress={() => {
+              setStep('referencePicker');
+              scrollToTop();
+            }}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.primaryButtonText}>
+              Start Using List Assist
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+
   const renderReferencePicker = () => {
     const isListingOnly = homeMode === 'dealFinder';
 
@@ -12912,7 +14956,52 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               </View>
               <Text style={styles.subtitle}></Text>
 
+              <View
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  paddingVertical: 8,
+                  paddingHorizontal: 14,
+                  borderRadius: 18,
+                  borderWidth: 1,
+                  borderColor: '#CBD5E1',
+                  backgroundColor: '#F8FAFC',
+                  marginBottom: 12,
+                }}
+              >
+                <View style={{ flex: 1, paddingRight: 12 }}>
+                  <Text
+                    style={{
+                      color: '#0F172A',
+                      fontSize: 14,
+                      fontWeight: '900',
+                    }}
+                  >
+                    Show Instructions
+                  </Text>
+                  <Text
+                    style={{
+                      color: '#64748B',
+                      fontSize: 12,
+                      fontWeight: '700',
+                      marginTop: 2,
+                    }}
+                  >
+                    Show the welcome page when List Assist starts.
+                  </Text>
+                </View>
+                <Switch
+                  value={showWelcomeOnStartup}
+                  onValueChange={handleWelcomeStartupToggle}
+                  trackColor={{ false: '#E5E7EB', true: '#34C759' }}
+                  thumbColor="#FFFFFF"
+                  ios_backgroundColor="#E5E7EB"
+                />
+              </View>
+
               {renderHelperToggle()}
+
               {renderHelperTip(
                 'Choose Your Next Move',
                 'Pick Sourcing when you are buying to flip. Pick Listing when you are ready to post and ship.',
@@ -13132,103 +15221,20 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
 
               {homeScanMode === 'source' ? (
                 <View style={[styles.resultCard, { marginTop: 18 }]}>
-                  <Text style={styles.sectionLabel}></Text>
-
                   <TouchableOpacity
                     style={[
                       styles.secondaryButton,
                       styles.finderButton,
                       {
-                        backgroundColor: '#0F766E',
-                        borderColor: '#0F766E',
+                        backgroundColor: '#0F172A',
+                        borderColor: '#0F172A',
                       },
                     ]}
-                    onPress={() => {
-                      setHomeMode('dealFinder');
-                      setGarageFinderMode('thrift');
-                      setGarageSaleRadiusMiles(10);
-                      setStep('referencePicker');
-                      scrollToTop();
-                    }}
+                    onPress={openSourceAssistApp}
                     activeOpacity={0.75}
                   >
                     <Text style={styles.finderButtonText}>
-                      Thrift Store Finder
-                    </Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[
-                      styles.secondaryButton,
-                      styles.finderButton,
-                      {
-                        marginTop: 16,
-                        backgroundColor: '#F97316',
-                        borderColor: '#F97316',
-                      },
-                    ]}
-                    onPress={() => {
-                      setHomeMode('dealFinder');
-                      setGarageFinderMode('garage');
-                      setGarageSaleRadiusMiles(10);
-                      setGarageSaleDayFilter('today');
-                      setSelectedGarageSalePinId(null);
-                      setVisibleGarageSalesCount(10);
-                      setStep('referencePicker');
-                      scrollToTop();
-                    }}
-                    activeOpacity={0.75}
-                  >
-                    <Text style={styles.finderButtonText}>
-                      Garage Sale Mapper
-                    </Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[
-                      styles.secondaryButton,
-                      styles.finderButton,
-                      {
-                        marginTop: 16,
-                        backgroundColor: '#1E3A8A',
-                        borderColor: '#1E3A8A',
-                      },
-                    ]}
-                    onPress={() => {
-                      setHomeMode('dealFinder');
-                      setGarageFinderMode('garage');
-                      setGarageSaleRadiusMiles(10);
-                      setStep('garageSaleLanding');
-                      scrollToTop();
-                    }}
-                    activeOpacity={0.75}
-                  >
-                    <Text style={styles.finderButtonText}>
-                      Garage Sale Finder
-                    </Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[
-                      styles.secondaryButton,
-                      styles.finderButton,
-                      {
-                        marginTop: 16,
-                        backgroundColor: '#2563EB',
-                        borderColor: '#2563EB',
-                      },
-                    ]}
-                    onPress={() => {
-                      setHomeMode('boxFinder');
-                      setGarageFinderMode('sales');
-                      setGarageSaleRadiusMiles(10);
-                      setStep('estateSaleLanding');
-                      scrollToTop();
-                    }}
-                    activeOpacity={0.75}
-                  >
-                    <Text style={styles.finderButtonText}>
-                      Estate Sale Finder
+                      Open Source Assist
                     </Text>
                   </TouchableOpacity>
                 </View>
@@ -13244,27 +15250,32 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                   />
 
                   <TouchableOpacity
-                    style={styles.homeSellerToolsButton}
+                    style={[
+                      styles.homeUtilityButton,
+                      styles.homeSellerToolsButton,
+                    ]}
                     onPress={() => {
                       setStep('sellerTools');
                       scrollToTop();
                     }}
                     activeOpacity={0.82}
                   >
-                    <Text style={styles.homeSellerToolsIcon}>🧰</Text>
-                    <Text style={styles.homeSellerToolsText}>
-                      Recommended Seller Tools
-                    </Text>
+                    <View style={styles.homeUtilityIconWrap}>
+                      <Text style={styles.homeUtilityIcon}>🧰</Text>
+                    </View>
+                    <View style={styles.homeUtilityTextWrap}>
+                      <Text style={styles.homeUtilityTitle}>Seller Tools</Text>
+                      <Text style={styles.homeUtilitySubtitle}>
+                        Recommended supplies
+                      </Text>
+                    </View>
+                    <Text style={styles.homeUtilityChevron}>›</Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
                     style={[
-                      styles.homeSellerToolsButton,
-                      {
-                        marginTop: 14,
-                        backgroundColor: '#EFF6FF',
-                        borderColor: '#BFDBFE',
-                      },
+                      styles.homeUtilityButton,
+                      styles.homeBugReportButton,
                     ]}
                     onPress={() => {
                       setStep('bugReport');
@@ -13272,11 +15283,39 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                     }}
                     activeOpacity={0.82}
                   >
-                    <Text style={styles.homeSellerToolsIcon}>🐞</Text>
-                    <Text
-                      style={[styles.homeSellerToolsText, { color: '#1D4ED8' }]}
+                    <View
+                      style={[
+                        styles.homeUtilityIconWrap,
+                        styles.homeBugReportIconWrap,
+                      ]}
                     >
-                      Report a Bug / Suggestion
+                      <Text style={styles.homeUtilityIcon}>🐞</Text>
+                    </View>
+                    <View style={styles.homeUtilityTextWrap}>
+                      <Text
+                        style={[
+                          styles.homeUtilityTitle,
+                          styles.homeBugReportTitle,
+                        ]}
+                      >
+                        Bug / Suggestion
+                      </Text>
+                      <Text
+                        style={[
+                          styles.homeUtilitySubtitle,
+                          styles.homeBugReportSubtitle,
+                        ]}
+                      >
+                        Send feedback
+                      </Text>
+                    </View>
+                    <Text
+                      style={[
+                        styles.homeUtilityChevron,
+                        styles.homeBugReportChevron,
+                      ]}
+                    >
+                      ›
                     </Text>
                   </TouchableOpacity>
                 </View>
@@ -13362,7 +15401,15 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                     }}
                     activeOpacity={0.75}
                   >
-                    <Text style={styles.secondaryButtonText}>
+                    <Text
+                      style={[
+                        styles.secondaryButtonText,
+                        {
+                          color: '#FFFFFF',
+                          fontWeight: '900',
+                        },
+                      ]}
+                    >
                       View on Amazon
                     </Text>
                   </TouchableOpacity>
@@ -17137,8 +19184,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
 
   const buildCurrentSavedFind = (): SavedFind | null => {
     const activeItems = [
-      ...(ebayExactResults.length ? ebayExactResults : ebayResults),
-      ...ebaySimilarResults,
+      ...(ebayExactResults?.length ? ebayExactResults : ebayResults || []),
+      ...(ebaySimilarResults || []),
     ];
     const estimatedCost = parsePriceInput(buyCostInput);
     const confidence = getConfidenceScore({
@@ -17321,8 +19368,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
 
   const renderConfidenceScoreCard = () => {
     const activeItems = [
-      ...(ebayExactResults.length ? ebayExactResults : ebayResults),
-      ...ebaySimilarResults,
+      ...(ebayExactResults?.length ? ebayExactResults : ebayResults || []),
+      ...(ebaySimilarResults || []),
     ];
     const estimatedCost = parsePriceInput(buyCostInput);
     const confidence = getConfidenceScore({
@@ -17401,15 +19448,12 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               keyboardType="decimal-pad"
               returnKeyType="done"
               onSubmitEditing={() => Keyboard.dismiss()}
-              style={[styles.packageTextInput, styles.buyCostTextInput]}
+              style={[
+                styles.packageTextInput,
+                styles.buyCostTextInput,
+                { flex: 1 },
+              ]}
             />
-            <TouchableOpacity
-              style={styles.buyCostSetButton}
-              onPress={() => Keyboard.dismiss()}
-              activeOpacity={0.75}
-            >
-              <Text style={styles.buyCostSetButtonText}>Set</Text>
-            </TouchableOpacity>
           </View>
         </View>
 
@@ -18488,7 +20532,11 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
         isCylinder,
         packageFrontSearchText,
         packageFrontDetectedText,
-        soldItems: ebaySoldResults.length ? ebaySoldResults : [],
+        soldItems: ebaySoldResults?.length ? ebaySoldResults : [],
+        activeItems: [
+          ...(ebayExactResults?.length ? ebayExactResults : ebayResults || []),
+          ...(ebaySimilarResults || []),
+        ],
       });
 
     const cleanedTitleOptions = dedupeTitleOptions(draft.titleOptions ?? []);
@@ -18513,8 +20561,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
       listingMarketQuery || (barcodeProduct?.barcode || '').trim(),
     );
     const listingActiveItems = [
-      ...(ebayExactResults.length ? ebayExactResults : ebayResults),
-      ...ebaySimilarResults,
+      ...(ebayExactResults?.length ? ebayExactResults : ebayResults || []),
+      ...(ebaySimilarResults || []),
     ];
     const listingEstimatedCost = parsePriceInput(buyCostInput);
     const listingPricingConfidence = getConfidenceScore({
@@ -20189,13 +22237,13 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                     borderRadius: 16,
                     padding: 12,
                     marginTop: 10,
-                    maxHeight: 220,
                   }}
                 >
                   <Text
+                    selectable
                     style={{
-                      fontSize: 14,
-                      lineHeight: 21,
+                      fontSize: 13,
+                      lineHeight: 20,
                       fontWeight: '600',
                       color: '#334155',
                     }}
@@ -20460,7 +22508,8 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
   // ===== GARAGE SALE PHASE 1: HOME SCREEN UI END =====
   let screen = renderReferencePicker();
 
-  if (step === 'barcodeScanner') screen = renderBarcodeScanner();
+  if (step === 'welcome') screen = renderWelcomePage();
+  else if (step === 'barcodeScanner') screen = renderBarcodeScanner();
   else if (step === 'barcodeFailure') screen = renderBarcodeFailure();
   else if (step === 'referenceObjectPicker')
     screen = renderReferenceObjectPicker();
@@ -20548,6 +22597,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
     // Final footer rule: never show the old generic Back to Home control.
     // Home and full-screen camera/scanner screens do not need a footer action.
     const hiddenSteps: AppStep[] = [
+      'welcome',
       'referencePicker',
       'barcodeScanner',
       'packageFrontCamera',
@@ -20891,36 +22941,81 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     includeFontPadding: false,
   },
+  homeUtilityButton: {
+    minHeight: 58,
+    borderRadius: 18,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginTop: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+    flexDirection: 'row',
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.1,
+    shadowRadius: 7,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 3,
+  },
   homeSellerToolsButton: {
-    minHeight: 64,
-    borderRadius: 20,
-    paddingVertical: 16,
-    paddingHorizontal: 18,
     marginTop: 2,
     backgroundColor: '#6D28D9',
-    borderColor: '#6D28D9',
+    borderColor: '#8B5CF6',
+  },
+  homeBugReportButton: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#DCEAFE',
+  },
+  homeUtilityIconWrap: {
+    width: 38,
+    height: 38,
+    borderRadius: 14,
+    marginRight: 12,
+    backgroundColor: 'rgba(255,255,255,0.18)',
     alignItems: 'center',
     justifyContent: 'center',
-    flexDirection: 'row',
-    shadowColor: '#000000',
-    shadowOpacity: 0.16,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 5 },
-    elevation: 4,
   },
-  homeSellerToolsIcon: {
-    color: '#FFFFFF',
-    fontSize: 22,
-    marginRight: 10,
-    lineHeight: 26,
+  homeBugReportIconWrap: {
+    backgroundColor: '#EFF6FF',
   },
-  homeSellerToolsText: {
-    color: '#FFFFFF',
-    fontSize: 18,
-    fontWeight: '800',
-    lineHeight: 22,
-    textAlign: 'center',
+  homeUtilityIcon: {
+    fontSize: 19,
+    lineHeight: 23,
     includeFontPadding: false,
+  },
+  homeUtilityTextWrap: {
+    flex: 1,
+  },
+  homeUtilityTitle: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '900',
+    lineHeight: 19,
+    includeFontPadding: false,
+  },
+  homeBugReportTitle: {
+    color: '#1D4ED8',
+  },
+  homeUtilitySubtitle: {
+    color: 'rgba(255,255,255,0.82)',
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 16,
+    marginTop: 2,
+    includeFontPadding: false,
+  },
+  homeBugReportSubtitle: {
+    color: '#64748B',
+  },
+  homeUtilityChevron: {
+    color: '#FFFFFF',
+    fontSize: 28,
+    fontWeight: '700',
+    lineHeight: 30,
+    marginLeft: 8,
+    includeFontPadding: false,
+  },
+  homeBugReportChevron: {
+    color: '#2563EB',
   },
 
   headerRow: {
@@ -23580,8 +25675,8 @@ const styles = StyleSheet.create({
   },
 
   amazonButtonText: {
-    color: '#111827',
-    fontWeight: '600',
+    color: '#FFFFFF',
+    fontWeight: '700',
     fontSize: 12,
   },
   mapStickyHeaderRow: {
