@@ -2687,14 +2687,20 @@ async function fetchCraigslistGarageSales({
   const today = new Date();
   const tomorrow = new Date(today);
   tomorrow.setDate(today.getDate() + 1);
+  const dayAfterTomorrow = new Date(today);
+  dayAfterTomorrow.setDate(today.getDate() + 2);
   const normalizedTargetDay =
-    day === 'today' || day === 'tomorrow' ? day : null;
+    day === 'today' || day === 'tomorrow' || day === 'dayaftertomorrow'
+      ? day
+      : null;
   const targetDate =
-    normalizedTargetDay === 'tomorrow'
-      ? tomorrow
-      : normalizedTargetDay === 'today'
-        ? today
-        : null;
+    normalizedTargetDay === 'dayaftertomorrow'
+      ? dayAfterTomorrow
+      : normalizedTargetDay === 'tomorrow'
+        ? tomorrow
+        : normalizedTargetDay === 'today'
+          ? today
+          : null;
   const targetDateKey = targetDate ? dateKeyFromDate(targetDate) : '';
 
   const postalCode = normalizePostalCode(postal) || inferPostalFromCoords(latitude, longitude);
@@ -2896,9 +2902,11 @@ async function fetchCraigslistGarageSales({
         selectedSaleDateKey ? formatSaleDateKeyLabel(selectedSaleDateKey) : '';
       const selectedDayLabel =
         targetDateKey && selectedSaleDateKey === targetDateKey && normalizedTargetDay
-          ? normalizedTargetDay === 'tomorrow'
-            ? 'Tomorrow'
-            : 'Today'
+          ? normalizedTargetDay === 'dayaftertomorrow'
+            ? '2 Days Out'
+            : normalizedTargetDay === 'tomorrow'
+              ? 'Tomorrow'
+              : 'Today'
           : selectedSaleDateKey
             ? formatSaleDateKeyDayLabel(selectedSaleDateKey)
             : '';
@@ -3109,9 +3117,11 @@ async function fetchCraigslistGarageSales({
           selectedDayLabel ||
           cleanAddressFragment(pageDetails.dayLabel) ||
           (normalizedTargetDay
-            ? normalizedTargetDay === 'tomorrow'
-              ? 'Tomorrow'
-              : 'Today'
+            ? normalizedTargetDay === 'dayaftertomorrow'
+              ? '2 Days Out'
+              : normalizedTargetDay === 'tomorrow'
+                ? 'Tomorrow'
+                : 'Today'
             : ''),
         timeLabel: selectedTimeLabel,
         startTime: selectedStartTime,
@@ -3198,9 +3208,11 @@ async function fetchCraigslistGarageSales({
           selectedDayLabel ||
           cleanAddressFragment(pageDetails.dayLabel) ||
           (normalizedTargetDay
-            ? normalizedTargetDay === 'tomorrow'
-              ? 'Tomorrow'
-              : 'Today'
+            ? normalizedTargetDay === 'dayaftertomorrow'
+              ? '2 Days Out'
+              : normalizedTargetDay === 'tomorrow'
+                ? 'Tomorrow'
+                : 'Today'
             : ''),
         timingConfidence:
           pageDetails.timingConfidence ||
@@ -3319,12 +3331,18 @@ async function handleGarageSales(req, res) {
     const postal = normalizePostalCode(
       req.query.postal || req.query.zip || req.query.postalCode || '',
     );
+    const rawDay = String(req.query.day || '').toLowerCase().trim();
     const day =
-      req.query.day === 'tomorrow'
-        ? 'tomorrow'
-        : req.query.day === 'today'
-          ? 'today'
-          : null;
+      rawDay === 'dayaftertomorrow' ||
+      rawDay === 'day-after-tomorrow' ||
+      rawDay === '2daysout' ||
+      rawDay === 'two-days-out'
+        ? 'dayaftertomorrow'
+        : rawDay === 'tomorrow'
+          ? 'tomorrow'
+          : rawDay === 'today'
+            ? 'today'
+            : null;
     const area =
       String(req.query.area || normalizeAreaFromCoords(latitude, longitude))
         .trim()
