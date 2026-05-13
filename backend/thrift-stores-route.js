@@ -267,7 +267,7 @@ function getEffectiveQueryLimit(radiusMiles) {
 }
 
 function getCacheKey(latitude, longitude, radiusMiles, limit) {
-  return `google_places_thrift_v7_fuller__${Number(latitude).toFixed(3)}__${Number(longitude).toFixed(3)}__${radiusMiles}__${limit}__${GOOGLE_QUERY_LIMIT}`;
+  return `google_places_thrift_v8_full_address__${Number(latitude).toFixed(3)}__${Number(longitude).toFixed(3)}__${radiusMiles}__${limit}__${GOOGLE_QUERY_LIMIT}`;
 }
 
 function getCached(key) {
@@ -287,6 +287,72 @@ function setCached(key, payload) {
   });
 }
 
+
+function getAddressComponent(place, componentType) {
+  const components = Array.isArray(place?.addressComponents)
+    ? place.addressComponents
+    : [];
+
+  const match = components.find((component) => {
+    const types = Array.isArray(component?.types) ? component.types : [];
+    return types.includes(componentType);
+  });
+
+  return String(match?.shortText || match?.longText || '').trim();
+}
+
+function normalizeStreetSuffixes(value = '') {
+  return String(value || '')
+    .replace(/\bDr\.?\b/gi, 'Drive')
+    .replace(/\bSt\.?\b/gi, 'Street')
+    .replace(/\bRd\.?\b/gi, 'Road')
+    .replace(/\bAve\.?\b/gi, 'Avenue')
+    .replace(/\bBlvd\.?\b/gi, 'Boulevard')
+    .replace(/\bLn\.?\b/gi, 'Lane')
+    .replace(/\bCt\.?\b/gi, 'Court')
+    .replace(/\bCir\.?\b/gi, 'Circle')
+    .replace(/\bPkwy\.?\b/gi, 'Parkway')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function addressHasCityState(value = '') {
+  const text = String(value || '').trim();
+  return /,\s*[A-Za-z][A-Za-z .'-]+,\s*[A-Z]{2}\b/.test(text) ||
+    /\b[A-Za-z][A-Za-z .'-]+,\s*[A-Z]{2}\b/.test(text);
+}
+
+function buildFullGooglePlaceAddress(place = {}) {
+  const formattedAddress = String(place?.formattedAddress || '')
+    .replace(/,\s*USA\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const streetNumber = getAddressComponent(place, 'street_number');
+  const route = getAddressComponent(place, 'route');
+  const city =
+    getAddressComponent(place, 'locality') ||
+    getAddressComponent(place, 'postal_town') ||
+    getAddressComponent(place, 'sublocality') ||
+    getAddressComponent(place, 'administrative_area_level_3');
+  const state = getAddressComponent(place, 'administrative_area_level_1');
+  const zip = getAddressComponent(place, 'postal_code');
+  const street = normalizeStreetSuffixes([streetNumber, route].filter(Boolean).join(' '));
+
+  if (street && city && state) {
+    return [street, `${city}, ${[state, zip].filter(Boolean).join(' ')}`]
+      .filter(Boolean)
+      .join(', ')
+      .trim();
+  }
+
+  if (formattedAddress && addressHasCityState(formattedAddress)) {
+    return normalizeStreetSuffixes(formattedAddress);
+  }
+
+  return normalizeStreetSuffixes(formattedAddress);
+}
+
 function parseGooglePlace(place, originLatitude, originLongitude) {
   if (!looksLikeUsefulStore(place)) return null;
 
@@ -295,7 +361,7 @@ function parseGooglePlace(place, originLatitude, originLongitude) {
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
 
   const title = String(place?.displayName?.text || 'Thrift Store').trim();
-  const address = String(place?.formattedAddress || '').trim();
+  const address = buildFullGooglePlaceAddress(place);
   const types = Array.isArray(place?.types) ? place.types : [];
   const distanceMiles = calculateDistanceMiles(
     originLatitude,
@@ -331,6 +397,8 @@ function parseGooglePlace(place, originLatitude, originLongitude) {
     latitude,
     longitude,
     address,
+    fullAddress: address,
+    formattedAddress: address,
     addressLabel: address || 'Address not provided',
     displayAddress: address || 'Tap for directions',
     mapAddress: address,
@@ -490,6 +558,7 @@ async function fetchGooglePlacesQuery({
           'places.id',
           'places.displayName',
           'places.formattedAddress',
+          'places.addressComponents',
           'places.location',
           'places.nationalPhoneNumber',
           'places.internationalPhoneNumber',
