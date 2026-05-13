@@ -213,9 +213,17 @@ function extractStreetAddressFromText(value) {
 
   if (!text) return '';
 
+  const houseNumber = '(?:\\d+[A-Za-z]+\\d+|\\d+[A-Za-z]?|\\d+-\\d+)';
+  const streetSuffix = '(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy|Route|Rt)';
   const patterns = [
-    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6}\s(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy))\b/i,
-    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6})\b/i,
+    new RegExp(
+      `\\b(${houseNumber}\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z0-9.#'\\-]+(?:\\s+[A-Za-z0-9.#'\\-]+){0,7}\\s${streetSuffix}\\.?)\\b`,
+      'i',
+    ),
+    new RegExp(
+      `\\b(${houseNumber}\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z][A-Za-z0-9.#'\\-]+(?:\\s+[A-Za-z0-9.#'\\-]+){1,4})\\b`,
+      'i',
+    ),
   ];
 
   for (const pattern of patterns) {
@@ -224,11 +232,15 @@ function extractStreetAddressFromText(value) {
       const candidate = String(match[1])
         .replace(/[,:;.-]+$/g, '')
         .trim();
-      const hasRoadSuffix = /\b(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)\b/i.test(candidate);
+      const candidateHasRoadSuffix = hasRoadSuffix(candidate);
 
-      // Avoid treating listing years like "2026 The Tall Grass" as a street
-      // address when Craigslist/body text puts the year near the title.
-      if (hasYearLikeHouseNumberPrefix(candidate) && !hasRoadSuffix) {
+      // Avoid treating listing years or item/size text like "24 month" and
+      // "100 Years Old Books" as a street address. Prefer real road suffixes
+      // and the map/address block from the Craigslist detail page.
+      if (
+        (!candidateHasRoadSuffix && hasYearLikeHouseNumberPrefix(candidate)) ||
+        looksLikeSaleItemNotAddress(candidate)
+      ) {
         continue;
       }
 
@@ -383,12 +395,28 @@ function normalizeNearAddressText(value) {
 
 function hasHouseNumberPrefix(value) {
   const text = cleanAddressFragment(value);
-  return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\b/i.test(text);
+  return /^(?:\d+[A-Za-z]+\d+|\d+[A-Za-z]?|\d+-\d+)\b/i.test(text);
 }
 function hasYearLikeHouseNumberPrefix(value) {
   const text = cleanAddressFragment(value);
   const match = text.match(/^(19\d{2}|20\d{2})\b/);
   return Boolean(match);
+}
+
+function hasRoadSuffix(value) {
+  return /\b(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy|Route|Rt)\b/i.test(
+    String(value || ''),
+  );
+}
+
+function looksLikeSaleItemNotAddress(value) {
+  const text = cleanAddressFragment(value).toLowerCase();
+  if (!text) return false;
+  if (/^\d+\s*(?:month|months|mo|mos|yr|yrs|year|years|t|x|xl|xxl|inch|inches|cm|mm)\b/i.test(text)) return true;
+  if (/^\d+\s+years?\s+old\b/i.test(text)) return true;
+  if (/^\d+\s*(?:books?|clothing|clothes|shoes?|toys?|comics?|records?|dvds?|cds?|watches?|games?)\b/i.test(text)) return true;
+  if (/\b(?:boys?|girls?|children|kids?|toddler|baby|women|womens|men|mens|clothing|clothes|shoes?|books?|toys?|coach|skecher|madden|toms|comics?|watches?)\b/i.test(text) && !hasRoadSuffix(text)) return true;
+  return false;
 }
 
 
@@ -404,7 +432,7 @@ function isLikelyStreetName(value) {
     return true;
   }
 
-  return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,5}$/i.test(
+  return /^(?:\d+[A-Za-z]+\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,5}$/i.test(
     text,
   );
 }
@@ -892,17 +920,11 @@ function stripDateNoiseFromText(value) {
 function looksLikeRealStreetAddress(value) {
   const text = cleanAddressFragment(value);
   if (!text) return false;
-  if (
-    /\b\d{1,6}\s+[A-Za-z]/.test(text) &&
-    /\b(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)\b/i.test(
-      text,
-    )
-  ) {
+  if (looksLikeSaleItemNotAddress(text)) return false;
+  if (/\b(?:\d+[A-Za-z]+\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z]/.test(text) && hasRoadSuffix(text)) {
     return true;
   }
-  return /^\d{1,6}\s+[A-Za-z][A-Za-z0-9.#'\-]*(?:\s+[A-Za-z0-9.#'\-]+){0,4}$/i.test(
-    text,
-  );
+  return /^(?:\d+[A-Za-z]+\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z][A-Za-z0-9.#'\-]*(?:\s+[A-Za-z0-9.#'\-]+){1,3}$/i.test(text);
 }
 
 function buildBestAddressLabel({ mapAddress, title, hood }) {
