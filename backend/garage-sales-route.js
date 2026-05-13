@@ -136,9 +136,11 @@ function normalizeAreaFromCoords(latitude, longitude) {
 function parseCraigslistDate(textValue, fallbackDay) {
   const text = String(textValue || '').trim();
   if (!text)
-    return fallbackDay === 'tomorrow'
-      ? 'Tomorrow'
-      : fallbackDay === 'today'
+    return fallbackDay === 'dayaftertomorrow'
+      ? '2 Days Out'
+      : fallbackDay === 'tomorrow'
+        ? 'Tomorrow'
+        : fallbackDay === 'today'
         ? 'Today'
         : '';
 
@@ -798,16 +800,22 @@ function buildFinalAddressData({
     extractStreetAddressFromText(stripDateNoiseFromText(title)),
   );
 
-  // Prefer a complete street/city/state/ZIP found in the posting body.
-  // Craigslist often shows a vague map label like "Bradford near Hull" while
-  // the seller writes the exact address in the body.
+  // Craigslist's best human-facing location is the text directly under the map
+  // on the ad detail page (the circled spot in the user's screenshots). Use that
+  // before scanning the ad body, because the body can contain item/size text like
+  // "24 month" or "8 and 10" that looks address-ish but is not the sale address.
+  const mapExactAddress = extractExactAddressFromText(cleanMapAddress);
+  const mapParts = splitNearAddress(cleanMapAddress);
+  const mapHasUsableAddress = Boolean(
+    mapExactAddress.street || mapParts.street || mapParts.crossStreet,
+  );
+
   const locationExactAddress = extractExactAddressFromText(cleanLocationDetail);
   const bodyExactAddress = extractExactAddressFromText(cleanBodyText);
   const exactBodyAddress = locationExactAddress.addressLabel
     ? locationExactAddress
     : bodyExactAddress;
 
-  const mapParts = splitNearAddress(cleanMapAddress);
   const approxParts = splitNearAddress(cleanApproximateAddress);
   const hoodParts = parseCityStateZip(cleanHood);
 
@@ -817,15 +825,17 @@ function buildFinalAddressData({
       : '';
 
   const street =
-    exactBodyAddress.street ||
+    mapExactAddress.street ||
     mapParts.street ||
+    (!mapHasUsableAddress ? exactBodyAddress.street : '') ||
     trustedTitleStreet ||
     approxParts.street ||
     '';
 
-  const crossStreet = exactBodyAddress.street
-    ? ''
-    : mapParts.crossStreet || approxParts.crossStreet || '';
+  const crossStreet =
+    mapExactAddress.street || mapParts.street || exactBodyAddress.street
+      ? mapParts.crossStreet || ''
+      : approxParts.crossStreet || '';
 
   const contextualCity = getDefaultCityFromContext({
     hood: cleanHood,
@@ -837,7 +847,8 @@ function buildFinalAddressData({
   });
 
   const inferredCity =
-    exactBodyAddress.city ||
+    mapExactAddress.city ||
+    (!mapHasUsableAddress ? exactBodyAddress.city : '') ||
     contextualCity ||
     (isGenericCraigslistRegion(cleanHood) ? '' : hoodParts.city);
 
@@ -850,18 +861,29 @@ function buildFinalAddressData({
       ? cleanApproximateAddress
       : '');
 
-  const state = exactBodyAddress.state || hoodParts.state || 'IL';
-  const zip = exactBodyAddress.zip || hoodParts.zip || '';
+  const state =
+    mapExactAddress.state ||
+    (!mapHasUsableAddress ? exactBodyAddress.state : '') ||
+    hoodParts.state ||
+    'IL';
+  const zip =
+    mapExactAddress.zip ||
+    (!mapHasUsableAddress ? exactBodyAddress.zip : '') ||
+    hoodParts.zip ||
+    '';
+
+  const mapBasedAddress = buildMapsQuery([
+    street,
+    crossStreet ? `near ${crossStreet}` : '',
+    city,
+    state,
+    zip,
+  ]);
 
   const displayAddress =
-    buildMapsQuery([
-      street,
-      crossStreet ? `near ${crossStreet}` : '',
-      city,
-      state,
-      zip,
-    ]) ||
-    exactBodyAddress.addressLabel ||
+    mapBasedAddress ||
+    mapExactAddress.addressLabel ||
+    (!mapHasUsableAddress ? exactBodyAddress.addressLabel : '') ||
     cleanMapAddress ||
     cleanApproximateAddress ||
     cleanHood ||
@@ -879,7 +901,8 @@ function buildFinalAddressData({
       approximateAddress: cleanApproximateAddress,
       fallbackAddressLabel: cleanFallback,
     }) ||
-    exactBodyAddress.addressLabel;
+    mapExactAddress.addressLabel ||
+    (!mapHasUsableAddress ? exactBodyAddress.addressLabel : '');
 
   return {
     street,
@@ -891,8 +914,14 @@ function buildFinalAddressData({
     addressLabel: displayAddress,
     displayAddress,
     mapAddress:
-      buildMapsQuery([street, city, state, zip]) ||
-      exactBodyAddress.addressLabel ||
+      buildMapsQuery([
+        street,
+        crossStreet ? `near ${crossStreet}` : '',
+        city,
+        state,
+        zip,
+      ]) ||
+      mapExactAddress.addressLabel ||
       cleanMapAddress ||
       cleanApproximateAddress ||
       cleanHood ||
