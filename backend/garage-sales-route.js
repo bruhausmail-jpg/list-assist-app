@@ -137,7 +137,7 @@ function parseCraigslistDate(textValue, fallbackDay) {
   const text = String(textValue || '').trim();
   if (!text)
     return fallbackDay === 'dayaftertomorrow'
-      ? '2 Days Out'
+      ? formatTargetDayLabel('dayaftertomorrow', dateKeyFromDate(new Date(Date.now() + 2 * 24 * 60 * 60 * 1000)))
       : fallbackDay === 'tomorrow'
         ? 'Tomorrow'
         : fallbackDay === 'today'
@@ -1234,6 +1234,15 @@ function formatSaleDateKeyLabel(dateKey) {
 function formatSaleDateKeyDayLabel(dateKey) {
   const date = dateFromDateKey(dateKey);
   return date ? formatSaleDayLabel(date) : '';
+}
+
+function formatTargetDayLabel(day, targetDateKey = '') {
+  if (day === 'today') return 'Today';
+  if (day === 'tomorrow') return 'Tomorrow';
+  if (day === 'dayaftertomorrow') {
+    return formatSaleDateKeyDayLabel(targetDateKey) || formatSaleDayLabel(new Date(Date.now() + 2 * 24 * 60 * 60 * 1000));
+  }
+  return '';
 }
 
 function uniqueDateKeysList(values) {
@@ -2953,11 +2962,7 @@ async function fetchCraigslistGarageSales({
         selectedSaleDateKey ? formatSaleDateKeyLabel(selectedSaleDateKey) : '';
       const selectedDayLabel =
         targetDateKey && selectedSaleDateKey === targetDateKey && normalizedTargetDay
-          ? normalizedTargetDay === 'dayaftertomorrow'
-            ? '2 Days Out'
-            : normalizedTargetDay === 'tomorrow'
-              ? 'Tomorrow'
-              : 'Today'
+          ? formatTargetDayLabel(normalizedTargetDay, targetDateKey)
           : selectedSaleDateKey
             ? formatSaleDateKeyDayLabel(selectedSaleDateKey)
             : '';
@@ -3168,11 +3173,7 @@ async function fetchCraigslistGarageSales({
           selectedDayLabel ||
           cleanAddressFragment(pageDetails.dayLabel) ||
           (normalizedTargetDay
-            ? normalizedTargetDay === 'dayaftertomorrow'
-              ? '2 Days Out'
-              : normalizedTargetDay === 'tomorrow'
-                ? 'Tomorrow'
-                : 'Today'
+            ? formatTargetDayLabel(normalizedTargetDay, targetDateKey)
             : ''),
         timeLabel: selectedTimeLabel,
         startTime: selectedStartTime,
@@ -3259,11 +3260,7 @@ async function fetchCraigslistGarageSales({
           selectedDayLabel ||
           cleanAddressFragment(pageDetails.dayLabel) ||
           (normalizedTargetDay
-            ? normalizedTargetDay === 'dayaftertomorrow'
-              ? '2 Days Out'
-              : normalizedTargetDay === 'tomorrow'
-                ? 'Tomorrow'
-                : 'Today'
+            ? formatTargetDayLabel(normalizedTargetDay, targetDateKey)
             : ''),
         timingConfidence:
           pageDetails.timingConfidence ||
