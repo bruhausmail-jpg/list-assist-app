@@ -7,8 +7,8 @@ const router = express.Router();
 // from crashing the whole estate-sale route. Regex flags still use /.../g normally.
 const g = 'g';
 
-const ESTATE_ROUTE_VERSION = 'source-assist-v60-multiday-detail-date-keys';
-const ESTATE_ROUTE_DEPLOY_STAMP = '2026-05-07-v60-multiday-detail-date-keys';
+const ESTATE_ROUTE_VERSION = 'source-assist-v61-national-state-zip-support';
+const ESTATE_ROUTE_DEPLOY_STAMP = '2026-06-13-v61-national-state-zip-support';
 
 const ESTATE_SALES_ZIPS = []; // disabled: single user ZIP/radius search only
 const REQUEST_TIMEOUT_MS = 15000;
@@ -223,12 +223,12 @@ function makeStableId(url = '') {
 }
 
 function extractLocationFromUrl(url = '') {
-  const match = url.match(/\/(IL|IN)\/([^/]+)\/(\d{5})\/(\d+)/i);
+  const match = url.match(/\/([A-Z]{2})\/([^/]+)\/(\d{5})\/(\d+)/i);
 
   if (!match) {
     return {
       city: '',
-      state: 'IL',
+      state: '',
       zip: '',
       sourceListingId: '',
     };
@@ -1944,7 +1944,7 @@ function extractEstateSaleLinksFromHtml(html = '') {
       .replace(/^https?:\/\/www\.estatesales\.net/i, '')
       .replace(/^https?:\/\/estatesales\.net/i, '');
 
-    const pathMatch = href.match(/\/(?:IL|IN)\/[^\s"'<>?#]+\/\d{5}\/\d+/i);
+    const pathMatch = href.match(/\/[A-Z]{2}\/[^\s"'<>?#]+\/\d{5}\/\d+/i);
     if (!pathMatch?.[0]) return;
 
     href = decodeUrlPath(pathMatch[0]);
@@ -1955,11 +1955,11 @@ function extractEstateSaleLinksFromHtml(html = '') {
   };
 
   const patterns = [
-    /href=["']([^"']*\/(?:IL|IN)\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
-    /["'](https?:\\?\/\\?\/www\.estatesales\.net\/(?:IL|IN)\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
-    /["'](\/(?:IL|IN)\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
-    /((?:https?:)?\\?\/\\?\/www\.estatesales\.net\\?\/IL\\?\/[^\s"'<>?#]+\\?\/\d{5}\\?\/\d+)/gi,
-    /(\\?\/IL\\?\/[^\s"'<>?#]+\\?\/\d{5}\\?\/\d+)/gi,
+    /href=["']([^"']*\/[A-Z]{2}\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /["'](https?:\\?\/\\?\/www\.estatesales\.net\/[A-Z]{2}\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /["'](\/[A-Z]{2}\/[^"'?#]+\/\d{5}\/\d+)(?:[?#][^"']*)?["']/gi,
+    /((?:https?:)?\\?\/\\?\/www\.estatesales\.net\\?\/[A-Z]{2}\\?\/[^\s"'<>?#]+\\?\/\d{5}\\?\/\d+)/gi,
+    /(\\?\/[A-Z]{2}\\?\/[^\s"'<>?#]+\\?\/\d{5}\\?\/\d+)/gi,
   ];
 
   for (const pattern of patterns) {
@@ -2291,6 +2291,79 @@ function normalizeCitySlug(city = '') {
     .replace(/\s+/g, '-');
 }
 
+function normalizeStateCode(value = '') {
+  const text = String(value || '').trim().toUpperCase();
+  const match = text.match(/\b[A-Z]{2}\b/);
+  return match ? match[0] : '';
+}
+
+function inferStateFromZip(zip = '') {
+  const cleanZip = String(zip || '').trim().replace(/[^0-9]/g, '').slice(0, 5);
+  if (!/^\d{5}$/.test(cleanZip)) return '';
+  const prefix = Number(cleanZip.slice(0, 3));
+  const firstTwo = Number(cleanZip.slice(0, 2));
+
+  // Practical USPS ZIP prefix ranges. This keeps the EstateSales.net URL path
+  // correct outside Illinois/Indiana without needing a paid geocoder.
+  const ranges = [
+    ['MA', 10, 27], ['RI', 28, 29], ['NH', 30, 38], ['ME', 39, 49], ['VT', 50, 59], ['CT', 60, 69], ['NJ', 70, 89],
+    ['NY', 100, 149], ['PA', 150, 196], ['DE', 197, 199], ['DC', 200, 205], ['VA', 201, 246], ['WV', 247, 268],
+    ['NC', 270, 289], ['SC', 290, 299], ['GA', 300, 319], ['FL', 320, 349], ['AL', 350, 369], ['TN', 370, 385],
+    ['MS', 386, 397], ['KY', 400, 427], ['OH', 430, 459], ['IN', 460, 479], ['MI', 480, 499], ['IA', 500, 528],
+    ['WI', 530, 549], ['MN', 550, 567], ['SD', 570, 577], ['ND', 580, 588], ['MT', 590, 599], ['IL', 600, 629],
+    ['MO', 630, 658], ['KS', 660, 679], ['NE', 680, 693], ['LA', 700, 714], ['AR', 716, 729], ['OK', 730, 749],
+    ['TX', 750, 799], ['CO', 800, 816], ['WY', 820, 831], ['ID', 832, 838], ['UT', 840, 847], ['AZ', 850, 865],
+    ['NM', 870, 884], ['NV', 889, 898], ['CA', 900, 961], ['OR', 970, 979], ['WA', 980, 994], ['AK', 995, 999],
+  ];
+
+  for (const [state, start, end] of ranges) {
+    if (prefix >= start && prefix <= end) return state;
+  }
+
+  // Territories / special cases by first two digits.
+  if (firstTwo === 6) return 'CT';
+  if (firstTwo === 9) return 'NJ';
+  return '';
+}
+
+function getRequestedState(requestedOrigin = {}, requestedZip = '') {
+  return (
+    normalizeStateCode(requestedOrigin?.state) ||
+    normalizeStateCode(requestedOrigin?.region) ||
+    normalizeStateCode(requestedOrigin?.administrativeArea) ||
+    inferStateFromZip(requestedZip || requestedOrigin?.zip || requestedOrigin?.postalCode || requestedOrigin?.postal) ||
+    'IL'
+  );
+}
+
+function inferCityFromKnownZip(zip = '') {
+  const cleanZip = String(zip || '').trim().replace(/[^0-9]/g, '').slice(0, 5);
+  const known = {
+    '99202': 'Spokane',
+    '99201': 'Spokane',
+    '99203': 'Spokane',
+    '99204': 'Spokane',
+    '99205': 'Spokane',
+    '99206': 'Spokane Valley',
+    '99207': 'Spokane',
+    '99208': 'Spokane',
+    '99212': 'Spokane Valley',
+    '99216': 'Spokane Valley',
+    '99217': 'Spokane',
+    '99223': 'Spokane',
+    '99224': 'Spokane',
+    '60565': 'Naperville',
+  };
+  return known[cleanZip] || '';
+}
+
+function getRequestedCity(requestedOrigin = {}, requestedZip = '') {
+  const rawCity = String(requestedOrigin?.city || requestedOrigin?.location || '').split(',')[0].trim();
+  if (rawCity && !/^naperville$/i.test(rawCity)) return rawCity;
+  const inferred = inferCityFromKnownZip(requestedZip || requestedOrigin?.zip || requestedOrigin?.postalCode || requestedOrigin?.postal);
+  return inferred || rawCity || 'Naperville';
+}
+
 function getEstateSalesSearchTargets(
   requestedZip = '60565',
   requestedCity = 'Naperville',
@@ -2300,7 +2373,7 @@ function getEstateSalesSearchTargets(
   const targets = [];
   const seen = new Set();
 
-  const addTarget = (city, zip, state = 'IL', latitude = null, longitude = null, distanceFromOrigin = null) => {
+  const addTarget = (city, zip, state = '', latitude = null, longitude = null, distanceFromOrigin = null) => {
     const cleanCity = String(city || '').split(',')[0].trim();
     const cleanZip = String(zip || '').trim().replace(/[^0-9]/g, '');
     if (!cleanCity || !cleanZip) return;
@@ -2310,7 +2383,7 @@ function getEstateSalesSearchTargets(
     targets.push({
       city: cleanCity,
       zip: cleanZip,
-      state: String(state || 'IL').toUpperCase(),
+      state: getRequestedState({ state }, cleanZip),
       latitude,
       longitude,
       distanceFromOrigin,
@@ -2323,8 +2396,10 @@ function getEstateSalesSearchTargets(
   const hasOriginCoordinates = Number.isFinite(originLatitude) && Number.isFinite(originLongitude);
   const radiusBufferMiles = radius >= 50 ? 8 : 4;
 
+  const requestedState = getRequestedState(requestedOrigin, requestedZip || '60565');
+
   // Always fetch the user's selected origin page first.
-  addTarget(requestedCity || 'Naperville', requestedZip || '60565');
+  addTarget(requestedCity || 'Naperville', requestedZip || '60565', requestedState, originLatitude, originLongitude, 0);
 
   const seedCandidates = ESTATE_SALES_CITY_ZIP_SEEDS
     .map((seed) => {
@@ -2359,7 +2434,7 @@ function getEstateSalesSearchTargets(
     });
 
   seedCandidates.forEach((seed) => {
-    addTarget(seed.city, seed.zip, seed.state || 'IL', seed.latitude, seed.longitude, seed.distanceFromOrigin);
+    addTarget(seed.city, seed.zip, seed.state || getRequestedState({}, seed.zip), seed.latitude, seed.longitude, seed.distanceFromOrigin);
   });
 
   return targets;
@@ -2378,7 +2453,7 @@ function makeAbsoluteEstateSalesUrl(href = '', baseUrl = 'https://www.estatesale
 }
 
 function isEstateSalesListingDetailUrl(url = '') {
-  return /\/((?:IL|IN))\/[^/]+\/\d{5}\/\d+(?:[/?#]|$)/i.test(String(url || ''));
+  return /\/([A-Z]{2})\/[^/]+\/\d{5}\/\d+(?:[/?#]|$)/i.test(String(url || ''));
 }
 
 function extractPaginationUrlsFromHtml(html = '', currentUrl = '') {
@@ -2512,8 +2587,8 @@ async function fetchEstateSalesForTarget(target, radiusMiles = 50, requestedDay 
   // v37 fix: do not put a regex-looking string in the live URL.
   // v36 was requesting /(?:IL|IN)/City/ZIP, which EstateSales.net does not serve,
   // so every target parsed as zero. Build a real state path instead.
-  const inferredState = String(target?.state || (rawZip === '46373' ? 'IN' : 'IL')).toUpperCase();
-  const safeState = inferredState === 'IN' ? 'IN' : 'IL';
+  const inferredState = getRequestedState({ state: target?.state }, rawZip);
+  const safeState = encodeURIComponent(inferredState || 'IL');
 
   const urlsToTry = [
     // Real live listing page format. This is the page that currently shows the
@@ -2570,8 +2645,8 @@ async function fetchEstateSalesForTargets(
   return targetResults.flat().filter(Boolean);
 }
 
-async function fetchEstateSalesForZip(zip, radiusMiles = 50, city = 'Naperville', requestedDay = '') {
-  return fetchEstateSalesForTarget({ zip, city }, radiusMiles, requestedDay);
+async function fetchEstateSalesForZip(zip, radiusMiles = 50, city = 'Naperville', requestedDay = '', state = '') {
+  return fetchEstateSalesForTarget({ zip, city, state: state || inferStateFromZip(zip) }, radiusMiles, requestedDay);
 }
 
 async function enrichSalesWithDetailPages(sales = []) {
@@ -2825,7 +2900,7 @@ function normalizeRequestedDay(value = '') {
 
   if (normalized === 'today') return 'today';
   if (normalized === 'tomorrow') return 'tomorrow';
-  if (['upcoming', 'future', 'later'].includes(normalized)) return 'upcoming';
+  if (['upcoming', 'future', 'later', 'dayaftertomorrow', 'day-after-tomorrow', '2daysout', '2-days-out'].includes(normalized)) return 'upcoming';
   if (
     [
       'nexttwoweeks',
@@ -3865,7 +3940,7 @@ async function fetchAllEstateSales(
     requestedOrigin,
   )[0] || '60565';
 
-  const city = requestedOrigin?.city || 'Naperville';
+  const city = getRequestedCity(requestedOrigin, searchZip);
   const searchTargets = getEstateSalesSearchTargets(
     searchZip,
     city,
@@ -4062,15 +4137,16 @@ router.get('/', async (req, res) => {
     requestedDay = 'tomorrow';
   }
   const requestedRadiusMiles = normalizeRequestedRadiusMiles(
-    req.query?.radiusMiles,
+    req.query?.radiusMiles || req.query?.radius || req.query?.miles,
   );
   const requestedOrigin = {
-    latitude: normalizeRequestedOriginCoordinate(req.query?.latitude),
-    longitude: normalizeRequestedOriginCoordinate(req.query?.longitude),
+    latitude: normalizeRequestedOriginCoordinate(req.query?.latitude || req.query?.lat),
+    longitude: normalizeRequestedOriginCoordinate(req.query?.longitude || req.query?.lon || req.query?.lng),
     zip: req.query?.zip || req.query?.postalCode || req.query?.postal || '',
     postalCode: req.query?.postalCode || req.query?.zip || req.query?.postal || '',
     postal: req.query?.postal || req.query?.zip || req.query?.postalCode || '',
-    city: req.query?.city || req.query?.location || 'Naperville',
+    city: req.query?.city || req.query?.location || '',
+    state: req.query?.state || req.query?.region || req.query?.administrativeArea || '',
   };
 
   try {
