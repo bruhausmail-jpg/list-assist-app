@@ -574,7 +574,10 @@ function buildLocalThriftFallbackPins(params: {
       const bDistance = Number.isFinite(b.distanceMiles as number)
         ? Number(b.distanceMiles)
         : 9999;
-      return aDistance - bDistance || a.title.localeCompare(b.title);
+      return (
+        Number(aDistance) - Number(bDistance) ||
+        String(a.title || '').localeCompare(String(b.title || ''))
+      );
     });
 }
 
@@ -1314,7 +1317,10 @@ async function openCraigslistGarageSalesLink(options?: {
     const place = reverse?.[0];
     const craigslistArea = getCraigslistAreaFromPlace(place);
     const postalCode = place?.postalCode;
-    const url = buildFilteredCraigslistUrl(craigslistArea, postalCode);
+    const url = buildFilteredCraigslistUrl(
+      craigslistArea,
+      postalCode ?? undefined,
+    );
 
     await openExternalLink(url);
   } catch (error) {
@@ -1834,6 +1840,9 @@ type EbaySearchItem = {
   ebayCategory?: string;
   ebayCategoryPath?: string;
   ebaySuggestedCategoryPath?: string;
+  backendBestCategoryPath?: string;
+  backendBestCategoryId?: string;
+  categorySource?: string;
   localizedAspects?: Array<{
     name?: string;
     value?: string;
@@ -1854,6 +1863,21 @@ type EbaySearchResponse = {
   bestCategoryId?: string;
   categoryConfidence?: 'high' | 'medium' | 'low' | 'none';
   categorySource?: string;
+  categoryVotes?: Array<{
+    categoryPath?: string;
+    categoryId?: string;
+    votes?: number;
+    sources?: Record<string, number>;
+    exampleTitles?: string[];
+  }>;
+};
+
+type EbayCategoryChoice = {
+  categoryPath: string;
+  votes: number;
+  soldVotes: number;
+  activeVotes: number;
+  exampleTitles: string[];
 };
 
 function buildLiveEbayQuery(
@@ -1908,47 +1932,22 @@ function applyBackendCategorySuggestionToItems(
     backendPayload?.bestCategoryPath,
   );
   const bestCategoryId = String(backendPayload?.bestCategoryId || '').trim();
-  const sourceText = [
-    queryText,
-    backendPayload?.exactQuery,
-    backendPayload?.broaderQuery,
-    ...items.slice(0, 5).map((item) => item?.title || ''),
-  ]
-    .filter(Boolean)
-    .join(' ');
 
-  const forcedCategory = getForcedCategoryForSource(sourceText);
-  const resolvedCategoryPath = forcedCategory || bestCategoryPath;
+  if (!Array.isArray(items) || !items.length) return [];
 
-  if (
-    !resolvedCategoryPath ||
-    isBroadOrUnsafeCategory(resolvedCategoryPath) ||
-    isWrongCategoryForSource(resolvedCategoryPath, sourceText)
-  ) {
-    return items;
-  }
-
-  let attached = false;
-  return items.map((item) => {
-    const itemSourceText = [sourceText, item?.title].filter(Boolean).join(' ');
-    const existingPath = getCategoryPathFromEbayItem(item);
-
-    if (
-      existingPath &&
-      !isBroadOrUnsafeCategory(existingPath) &&
-      !isWrongCategoryForSource(existingPath, itemSourceText)
-    ) {
-      return item;
-    }
-
-    if (attached) return item;
-
-    attached = true;
-    return {
+  // The backend now chooses the category by counting eBay-returned category
+  // paths from matched listings. If it sends a bestCategoryPath, preserve that
+  // as the authoritative consensus category on every result so the listing
+  // helper cannot miss it because one item used a leaf-only category field.
+  if (bestCategoryPath && !isBroadOrUnsafeCategory(bestCategoryPath)) {
+    return items.map((item) => ({
       ...item,
-      categoryPath: resolvedCategoryPath,
-      ebayCategoryPath: resolvedCategoryPath,
-      inferredCategoryPath: resolvedCategoryPath,
+      backendBestCategoryPath: bestCategoryPath,
+      backendBestCategoryId: bestCategoryId || item.categoryId,
+      categorySource: backendPayload?.categorySource || item.categorySource,
+      categoryPath: bestCategoryPath,
+      ebayCategoryPath: bestCategoryPath,
+      inferredCategoryPath: bestCategoryPath,
       categoryId: item.categoryId || bestCategoryId || undefined,
       leafCategoryIds:
         Array.isArray(item.leafCategoryIds) && item.leafCategoryIds.length
@@ -1956,8 +1955,10 @@ function applyBackendCategorySuggestionToItems(
           : bestCategoryId
             ? [bestCategoryId]
             : item.leafCategoryIds,
-    };
-  });
+    }));
+  }
+
+  return items;
 }
 
 async function searchEbay(
@@ -2021,6 +2022,7 @@ async function searchEbay(
     bestCategoryId: backendPayload?.bestCategoryId,
     categoryConfidence: backendPayload?.categoryConfidence,
     categorySource: backendPayload?.categorySource,
+    categoryVotes: backendPayload?.categoryVotes,
   };
 }
 
@@ -2085,6 +2087,7 @@ async function searchEbaySold(
     bestCategoryId: backendPayload?.bestCategoryId,
     categoryConfidence: backendPayload?.categoryConfidence,
     categorySource: backendPayload?.categorySource,
+    categoryVotes: backendPayload?.categoryVotes,
   };
 }
 
@@ -2144,6 +2147,12 @@ type EbaySearchSummary = {
 
 type LooseItemLookupApiResponse = {
   itemSummaries?: EbaySearchItem[];
+  imageItemSummaries?: EbaySearchItem[];
+  textItemSummaries?: EbaySearchItem[];
+  bestCategoryPath?: string;
+  bestCategoryId?: string;
+  categoryConfidence?: 'high' | 'medium' | 'low' | 'none';
+  categorySource?: string;
   note?: string;
   error?: string;
   message?: string;
@@ -2528,7 +2537,7 @@ function sortThriftStoresWithLearning(
 
     if (distanceA !== distanceB) return distanceA - distanceB;
 
-    return a.title.localeCompare(b.title);
+    return String(a.title || '').localeCompare(String(b.title || ''));
   });
 }
 
@@ -2808,7 +2817,10 @@ function detectProductSignals(sourceText: string) {
         rawText,
       ),
     isSporting:
-      /(golf|baseball|football|basketball|soccer|hockey|tennis|fishing|camping|hunting|fitness|yoga|bike|bicycle|helmet|glove|bat|ball|reel|rod|treadmill|dumbbell|barbell|exercise)/i.test(
+      /\b(golf|baseball|football|basketball|soccer|hockey|tennis|fishing|camping|hunting|fitness|yoga|bike|bicycle|helmet|glove|bat|ball|reel|rod|treadmill|dumbbell|barbell|exercise)\b/i.test(
+        rawText,
+      ) &&
+      !/\b(mouse|mice|trackball|trackballs|logitech|usb|bluetooth|wireless mouse|ergonomic mouse|computer mouse|pc mouse|mac mouse|keyboard|keyboards)\b/i.test(
         rawText,
       ),
     isCraft:
@@ -3295,10 +3307,32 @@ function hasComputerLaptopSignal(sourceText: string) {
   );
 }
 
+function hasComputerPeripheralSignal(sourceText: string) {
+  const normalized = normalizeSearchText(sourceText);
+  return (
+    hasComputerLaptopSignal(sourceText) ||
+    /\b(mouse|mice|trackball|trackballs|keyboard|keyboards|logitech|usb|bluetooth|wireless mouse|gaming mouse|ergonomic mouse|computer mouse|pc mouse|mac mouse|pointer|pointers|input device|input devices|dongle|receiver)\b/.test(
+      normalized,
+    )
+  );
+}
+
+function hasMouseOrTrackballSignal(sourceText: string) {
+  const normalized = normalizeSearchText(sourceText);
+  return /\b(mouse|mice|trackball|trackballs|logitech|m570|m575|ergo m575|trackman|wireless mouse|ergonomic mouse|computer mouse|pc mouse|mac mouse)\b/.test(
+    normalized,
+  );
+}
+
 function getForcedCategoryForSource(sourceText: string) {
   if (hasAppleLaptopSignal(sourceText)) {
     return 'Computers/Tablets & Networking > Laptops & Netbooks > Apple Laptops';
   }
+
+  if (hasMouseOrTrackballSignal(sourceText)) {
+    return 'Computers/Tablets & Networking > Keyboards, Mice & Pointers > Mice, Trackballs & Touchpads';
+  }
+
   return '';
 }
 
@@ -3330,9 +3364,9 @@ function isWrongCategoryForSource(categoryPath: string, sourceText: string) {
   const category = normalizeSearchText(categoryPath);
   if (!category) return true;
 
-  if (hasComputerLaptopSignal(sourceText)) {
+  if (hasComputerPeripheralSignal(sourceText)) {
     if (
-      /\b(books magazines|books|magazines|crafts|pottery|dolls|stamps|coins paper money|art|collectibles)\b/.test(
+      /\b(books magazines|books|magazines|crafts|pottery|dolls|stamps|coins paper money|art|collectibles|sporting goods|golf|golf clubs equipment)\b/.test(
         category,
       )
     ) {
@@ -3341,12 +3375,20 @@ function isWrongCategoryForSource(categoryPath: string, sourceText: string) {
 
     const isKnownGoodComputerRoot =
       /\b(computers tablets networking|consumer electronics)\b/.test(category);
-    const isSpecificLaptopPath =
-      /\b(laptops netbooks|apple laptops|pc laptops netbooks|macbook|notebook)\b/.test(
+    const isSpecificComputerPath =
+      /\b(laptops netbooks|apple laptops|pc laptops netbooks|macbook|notebook|keyboards mice pointers|mice trackballs touchpads|trackballs|mice|mouse|keyboards|input devices)\b/.test(
         category,
       );
 
-    if (!isKnownGoodComputerRoot && !isSpecificLaptopPath) return true;
+    if (!isKnownGoodComputerRoot && !isSpecificComputerPath) return true;
+  }
+
+  // Extra guard against the common trackball -> ball -> golf drift.
+  if (
+    hasMouseOrTrackballSignal(sourceText) &&
+    /\b(sporting goods|golf|club|clubs|ball)\b/.test(category)
+  ) {
+    return true;
   }
 
   return false;
@@ -3391,6 +3433,7 @@ function getAspectValueFromEbayItem(
 
 function getEbayItemCategoryCandidates(item: EbaySearchItem): string[] {
   const candidates = [
+    item.backendBestCategoryPath,
     item.categoryPath,
     item.inferredCategoryPath,
     item.ebaySuggestedCategoryPath,
@@ -3408,6 +3451,15 @@ function getEbayItemCategoryCandidates(item: EbaySearchItem): string[] {
   ];
 
   if (Array.isArray(item.categories)) {
+    const categoryNames = item.categories
+      .map((category) => String(category?.categoryName || '').trim())
+      .filter(Boolean);
+
+    if (categoryNames.length >= 2) {
+      const namesRootToLeaf = categoryNames.slice().reverse();
+      candidates.push(namesRootToLeaf.join(' > '));
+    }
+
     item.categories.forEach((category) => {
       candidates.push(category?.categoryPath);
       candidates.push(category?.categoryName);
@@ -3569,16 +3621,17 @@ function inferCategoryPathFromEbayItem(item: EbaySearchItem): string {
 function getCategoryPathFromEbayItem(item: EbaySearchItem): string {
   const categoryCandidates = getEbayItemCategoryCandidates(item);
 
+  // Use only eBay-returned category data. Do not force local category rules or
+  // infer a category from the title/photo text here.
   const fullPath = categoryCandidates.find((candidate) =>
     candidate.includes(' > '),
   );
-
-  if (fullPath) return fullPath;
+  if (fullPath && !isBroadOrUnsafeCategory(fullPath)) return fullPath;
 
   const leaf = categoryCandidates.find(Boolean);
-  if (leaf) return mapLeafCategoryNameToEbayPath(leaf);
+  if (leaf && !isBroadOrUnsafeCategory(leaf)) return leaf;
 
-  return inferCategoryPathFromEbayItem(item);
+  return '';
 }
 
 function mapLeafCategoryNameToEbayPath(value: string) {
@@ -3597,6 +3650,13 @@ function mapLeafCategoryNameToEbayPath(value: string) {
     )
   ) {
     return 'Business & Industrial > Test, Measurement & Inspection > Testers & Calibrators > Cable Testers & Trackers';
+  }
+  if (
+    /mice|mouse|trackballs|trackball|touchpads|keyboard|keyboards|pointers/.test(
+      normalized,
+    )
+  ) {
+    return 'Computers/Tablets & Networking > Keyboards, Mice & Pointers > Mice, Trackballs & Touchpads';
   }
   if (/saucepans|stockpots|stockpot|cookware/.test(normalized)) {
     return 'Home & Garden > Kitchen, Dining & Bar > Cookware > Saucepans & Stockpots';
@@ -3657,6 +3717,13 @@ function getAllowedCategoryRootsForSource(sourceText: string): string[] {
   const signals = detectProductSignals(sourceText);
   const roots = new Set<string>();
 
+  if (hasComputerPeripheralSignal(sourceText)) {
+    rootAddMany(roots, [
+      'Computers/Tablets & Networking',
+      'Consumer Electronics',
+    ]);
+  }
+
   if (
     signals.isHealthBeauty ||
     signals.isLipCare ||
@@ -3667,7 +3734,10 @@ function getAllowedCategoryRootsForSource(sourceText: string): string[] {
   ) {
     roots.add('Health & Beauty');
   }
-  if (signals.isVoxxBliss || signals.isInsole || signals.isSporting)
+  if (
+    (signals.isVoxxBliss || signals.isInsole || signals.isSporting) &&
+    !hasComputerPeripheralSignal(sourceText)
+  )
     roots.add('Sporting Goods');
   if (signals.isElectronics || signals.isVideoGame)
     rootAddMany(roots, [
@@ -3768,155 +3838,74 @@ function categoryLooksLikeItemNoise(path: string, sourceText: string) {
   );
 }
 
+function getEbayCategoryChoicesFromResults(params: {
+  soldItems?: EbaySearchItem[];
+  activeItems?: EbaySearchItem[];
+}): EbayCategoryChoice[] {
+  const { soldItems = [], activeItems = [] } = params;
+  const candidates = [
+    ...soldItems.map((item) => ({ item, source: 'sold' as const })),
+    ...activeItems.map((item) => ({ item, source: 'active' as const })),
+  ];
+
+  const categoryMap = new Map<string, EbayCategoryChoice>();
+
+  candidates.forEach(({ item, source }) => {
+    const categoryCandidates = [
+      item.backendBestCategoryPath,
+      getCategoryPathFromEbayItem(item),
+    ]
+      .map((value) => normalizeEbayCategoryPath(value))
+      .filter((value) => value && !isBroadOrUnsafeCategory(value));
+
+    const path = categoryCandidates[0];
+    if (!path) return;
+
+    const current = categoryMap.get(path) || {
+      categoryPath: path,
+      votes: 0,
+      soldVotes: 0,
+      activeVotes: 0,
+      exampleTitles: [],
+    };
+
+    current.votes += 1;
+    if (source === 'sold') current.soldVotes += 1;
+    else current.activeVotes += 1;
+
+    if (item.title && current.exampleTitles.length < 5) {
+      current.exampleTitles.push(item.title);
+    }
+
+    categoryMap.set(path, current);
+  });
+
+  return Array.from(categoryMap.values()).sort((a, b) => {
+    const voteDelta = b.votes - a.votes;
+    if (voteDelta) return voteDelta;
+
+    const soldDelta = b.soldVotes - a.soldVotes;
+    if (soldDelta) return soldDelta;
+
+    const depthDelta =
+      getCategoryDepth(b.categoryPath) - getCategoryDepth(a.categoryPath);
+    if (depthDelta) return depthDelta;
+
+    return a.categoryPath.localeCompare(b.categoryPath);
+  });
+}
+
 function getBestEbayCategoryFromResults(params: {
   sourceText: string;
   soldItems?: EbaySearchItem[];
   activeItems?: EbaySearchItem[];
 }) {
-  const { sourceText, soldItems = [], activeItems = [] } = params;
-
-  const localCategory = buildPromptStyleCategory(sourceText);
-  const localRoot = getCategoryRoot(localCategory);
-  const localSpecific = isHighlySpecificLocalCategory(localCategory);
-  const allowedRoots = getAllowedCategoryRootsForSource(sourceText);
-
-  const candidates = [
-    ...soldItems.map((item, index) => ({
-      item,
-      weight: 1.85,
-      index,
-      source: 'sold' as const,
-    })),
-    ...activeItems.map((item, index) => ({
-      item,
-      weight: 1.15,
-      index,
-      source: 'active' as const,
-    })),
-  ];
-
-  const categoryScores: Record<string, number> = {};
-  const categoryCounts: Record<string, number> = {};
-  const rootCounts: Record<string, number> = {};
-  const categoryBestRelevance: Record<string, number> = {};
-  const categoryDirectEvidence: Record<string, number> = {};
-  const categorySoldCounts: Record<string, number> = {};
-
-  candidates.forEach(({ item, weight, index, source }) => {
-    const directPath = getCategoryPathFromEbayItem(item);
-    const inferredPath = directPath || inferCategoryPathFromEbayItem(item);
-    const normalizedPath = normalizeEbayCategoryPath(inferredPath);
-    if (!normalizedPath || isBroadOrUnsafeCategory(normalizedPath)) return;
-    if (categoryLooksLikeItemNoise(normalizedPath, sourceText)) return;
-
-    const relevance = getEbayItemRelevanceScore(sourceText, item);
-    const directEvidence = getDirectEbayCategoryStrength(item);
-    const inferredEvidenceBoost =
-      !directEvidence && inferCategoryPathFromEbayItem(item) === normalizedPath
-        ? 8
-        : 0;
-
-    // Do not let loosely similar comps hijack category selection. The category
-    // must come from a relevant title/aspect match OR direct category evidence.
-    if (relevance < 12 && directEvidence < 12 && !inferredEvidenceBoost) return;
-
-    const root = getCategoryRoot(normalizedPath);
-    const rootCompatible = isCategoryRootCompatibleWithSource(
-      sourceText,
-      normalizedPath,
-    );
-
-    // If the scanned item has strong root signals, an eBay result from a totally
-    // different root needs very strong relevance and multiple confirmations.
-    if (allowedRoots.length && !rootCompatible && relevance < 42) return;
-
-    if (root) rootCounts[root] = (rootCounts[root] || 0) + 1;
-
-    const depthBoost = Math.min(12, getCategoryDepth(normalizedPath) * 1.75);
-    const positionBoost = Math.max(0, 12 - index) * 0.35;
-    const soldBoost = source === 'sold' ? 8 : 0;
-    const localRootBoost = localRoot && root === localRoot ? 22 : 0;
-    const rootCompatibleBoost = rootCompatible ? 12 : 0;
-    const exactTitleBonus =
-      normalizeSearchText(item.title || '') === normalizeSearchText(sourceText)
-        ? 18
-        : 0;
-
-    categoryCounts[normalizedPath] = (categoryCounts[normalizedPath] || 0) + 1;
-    if (source === 'sold') {
-      categorySoldCounts[normalizedPath] =
-        (categorySoldCounts[normalizedPath] || 0) + 1;
-    }
-    categoryDirectEvidence[normalizedPath] = Math.max(
-      categoryDirectEvidence[normalizedPath] || 0,
-      directEvidence,
-    );
-    categoryBestRelevance[normalizedPath] = Math.max(
-      categoryBestRelevance[normalizedPath] || 0,
-      relevance,
-    );
-    categoryScores[normalizedPath] =
-      (categoryScores[normalizedPath] || 0) +
-      relevance * weight +
-      positionBoost +
-      depthBoost +
-      soldBoost +
-      localRootBoost +
-      rootCompatibleBoost +
-      directEvidence +
-      inferredEvidenceBoost +
-      exactTitleBonus;
+  const choices = getEbayCategoryChoicesFromResults({
+    soldItems: params.soldItems,
+    activeItems: params.activeItems,
   });
 
-  const scored = Object.entries(categoryScores)
-    .map(([path, score]) => ({
-      path,
-      score,
-      count: categoryCounts[path] || 0,
-      soldCount: categorySoldCounts[path] || 0,
-      directEvidence: categoryDirectEvidence[path] || 0,
-      root: getCategoryRoot(path),
-      leaf: getCategoryLeaf(path),
-      bestRelevance: categoryBestRelevance[path] || 0,
-      depth: getCategoryDepth(path),
-      rootCompatible: isCategoryRootCompatibleWithSource(sourceText, path),
-    }))
-    .sort((a, b) => {
-      const compatibilityDelta =
-        Number(b.rootCompatible) - Number(a.rootCompatible);
-      if (compatibilityDelta) return compatibilityDelta;
-
-      const soldDelta = b.soldCount - a.soldCount;
-      if (soldDelta) return soldDelta;
-
-      const countDelta = b.count - a.count;
-      if (countDelta) return countDelta;
-
-      return b.score - a.score;
-    });
-
-  const best = scored[0];
-  if (!best) return localSpecific ? localCategory : '';
-
-  const bestRootCount = rootCounts[best.root] || 0;
-  const localRootMatches = Boolean(localRoot && best.root === localRoot);
-  const eBayHasRealSupport =
-    best.count >= 2 ||
-    best.soldCount >= 1 ||
-    bestRootCount >= 2 ||
-    best.directEvidence >= 20 ||
-    best.bestRelevance >= 34 ||
-    best.score >= 70;
-
-  if (best.rootCompatible && eBayHasRealSupport) return best.path;
-
-  // If eBay is weak/noisy but our current item text maps to a real specific
-  // category, trust the item in front of the user over neighboring comps.
-  if (localSpecific) return localCategory;
-
-  if (localRootMatches && best.score >= 44) return best.path;
-
-  return eBayHasRealSupport ? best.path : '';
+  return choices[0]?.categoryPath || '';
 }
 
 function buildPromptStyleCategory(sourceText: string) {
@@ -4596,31 +4585,26 @@ function buildPromptStyleCategoryFromEbayResults(params: {
   soldItems?: EbaySearchItem[];
   activeItems?: EbaySearchItem[];
 }) {
-  const forcedCategory = getForcedCategoryForSource(params.sourceText);
-  if (forcedCategory) return forcedCategory;
-
   const ebayCategory = getBestEbayCategoryFromResults(params);
-  if (
-    ebayCategory &&
-    !isBroadOrUnsafeCategory(ebayCategory) &&
-    !isWrongCategoryForSource(ebayCategory, params.sourceText)
-  )
+  if (ebayCategory && !isBroadOrUnsafeCategory(ebayCategory)) {
     return ebayCategory;
-
-  // If the backend does not return trustworthy eBay category paths, do NOT blend
-  // unrelated comp titles. Fall back only to the current item title/OCR text.
-  const localCategory = buildPromptStyleCategory(params.sourceText);
-  if (
-    localCategory &&
-    !isBroadOrUnsafeCategory(localCategory) &&
-    !isWrongCategoryForSource(localCategory, params.sourceText)
-  ) {
-    return localCategory;
   }
 
-  // Last resort: do not invent a generic category. This keeps the app honest
-  // when eBay did not return a trustworthy category from matching results.
-  return 'No trusted eBay category match yet — rerun with clearer title/photos';
+  // No local fallback. The listing helper should reflect the majority category
+  // among matched eBay results only.
+  return 'No eBay category returned from matched items yet';
+}
+
+function getTrustedSuggestedCategoryForDraft(
+  draft: SourcingDraft | null | undefined,
+) {
+  const currentCategory = normalizeEbayCategoryPath(draft?.suggestedCategory);
+
+  if (currentCategory && !isBroadOrUnsafeCategory(currentCategory)) {
+    return currentCategory;
+  }
+
+  return 'No eBay category returned from matched items yet';
 }
 
 function buildPromptStylePricing(params: {
@@ -5474,37 +5458,40 @@ async function findLearnedPackageFrontProduct(
   let bestMatch: { entry: PackageFrontMemoryEntry; score: number } | null =
     null;
 
-  entries.forEach((entry) => {
+  for (const entry of entries) {
     let entryBestScore = 0;
 
-    candidateTexts.forEach((candidateText) => {
+    for (const candidateText of candidateTexts) {
       entryBestScore = Math.max(
         entryBestScore,
         scoreLocalPackageMemoryText(candidateText, entry.product.title),
       );
 
-      entry.sampleTexts.forEach((sampleText) => {
+      for (const sampleText of entry.sampleTexts) {
         entryBestScore = Math.max(
           entryBestScore,
           scoreLocalPackageMemoryText(candidateText, sampleText),
         );
-      });
-    });
+      }
+    }
 
     if (!bestMatch || entryBestScore > bestMatch.score) {
       bestMatch = { entry, score: entryBestScore };
     }
-  });
+  }
 
   if (!bestMatch || bestMatch.score < 42) {
     return null;
   }
 
+  const matchedEntry = bestMatch.entry;
+  const matchedScore = bestMatch.score;
+
   return {
-    ...bestMatch.entry.product,
-    barcode: normalizeBarcode(bestMatch.entry.barcode),
+    ...matchedEntry.product,
+    barcode: normalizeBarcode(matchedEntry.barcode),
     source: 'Local package memory',
-    confidence: bestMatch.score >= 70 ? 'high' : 'medium',
+    confidence: matchedScore >= 70 ? 'high' : 'medium',
   };
 }
 
@@ -6914,7 +6901,8 @@ function getThriftStoreAreaClusterInfo(
       );
 
       return (
-        Number.isFinite(distanceFromThisStore) && distanceFromThisStore <= 1.5
+        Number.isFinite(distanceFromThisStore) &&
+        Number(distanceFromThisStore) <= 1.5
       );
     }),
   ) as GarageSaleMapPin[];
@@ -6933,7 +6921,10 @@ function getThriftStoreAreaClusterInfo(
       b.longitude,
     );
 
-    return aDistance - bDistance || a.title.localeCompare(b.title);
+    return (
+      Number(aDistance) - Number(bDistance) ||
+      String(a.title || '').localeCompare(String(b.title || ''))
+    );
   });
 
   // If the route can’t actually include at least 3 stores, don’t show the
@@ -7519,7 +7510,7 @@ function calculateFits(
   const MAX_TOTAL_SLACK = getMaxTotalSlack(unitSystem);
 
   return boxes
-    .map((box) => {
+    .map<FitResult | null>((box) => {
       let bestFit: FitResult | null = null;
 
       orientations.forEach((orientation) => {
@@ -8258,7 +8249,7 @@ function cleanDetectedTextForSourcing(value?: string | null): string {
 
   const lines = value
     .split(/[\n\r]+/)
-    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .map((line) => String(line).replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
   const badTokens = new Set(['dar', 'ha', 'car', 'pkg', 'lbl', 'ocr', 'usa']);
@@ -9514,7 +9505,7 @@ function sortRouteStopsByNearest(
       if (aHasDistance && !bHasDistance) return -1;
       if (!aHasDistance && bHasDistance) return 1;
 
-      return a.title.localeCompare(b.title);
+      return String(a.title || '').localeCompare(String(b.title || ''));
     });
   }
 
@@ -9785,16 +9776,6 @@ export default function HomeScreen() {
     typeof setTimeout
   > | null>(null);
   const packageFrontLookupRequestIdRef = useRef(0);
-  useEffect(() => {
-    activeScrollRef.current?.scrollTo?.({ y: 0, animated: false });
-    requestAnimationFrame(() => {
-      activeScrollRef.current?.scrollTo?.({ y: 0, animated: false });
-      setTimeout(() => {
-        activeScrollRef.current?.scrollTo?.({ y: 0, animated: false });
-      }, 0);
-    });
-  }, [step]);
-
   const lastBarcodeLookupAtRef = useRef(0);
   const lastBarcodeValueRef = useRef<string | null>(null);
   const barcode429UntilRef = useRef(0);
@@ -9841,40 +9822,60 @@ export default function HomeScreen() {
       .then((storedValue) => {
         if (!isMounted) return;
 
-        const shouldShowWelcome =
-          storedValue === null ? true : storedValue === 'true';
-        setShowWelcomeOnStartup(shouldShowWelcome);
+        const hasSeenWelcome =
+          storedValue === 'seen' || storedValue === 'false';
+
+        setShowWelcomeOnStartup(!hasSeenWelcome);
         setWelcomePreferenceLoaded(true);
 
-        if (shouldShowWelcome) {
+        if (!hasSeenWelcome) {
+          // First app launch only: show Welcome, then immediately mark it seen
+          // so the next app open goes straight to Home. Users can still reopen
+          // Welcome manually from the Home screen link.
           setStep('welcome');
-        } else if (step === 'welcome') {
-          setStep('referencePicker');
+          AsyncStorage.setItem(WELCOME_STARTUP_STORAGE_KEY, 'seen').catch(
+            (error) => {
+              console.log('Welcome startup preference save error:', error);
+            },
+          );
+          return;
         }
+
+        setStep((currentStep) =>
+          currentStep === 'welcome' ? 'referencePicker' : currentStep,
+        );
       })
       .catch((error) => {
         console.log('Welcome startup preference load error:', error);
         if (!isMounted) return;
-        setShowWelcomeOnStartup(true);
+
+        // If storage fails, do not keep forcing Welcome on every app open.
+        // Default to Home so Welcome remains a manual option only.
+        setShowWelcomeOnStartup(false);
         setWelcomePreferenceLoaded(true);
-        setStep('welcome');
+        setStep((currentStep) =>
+          currentStep === 'welcome' ? 'referencePicker' : currentStep,
+        );
       });
 
     return () => {
       isMounted = false;
     };
     // Run once on app load only.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleWelcomeStartupToggle = (value: boolean) => {
-    setShowWelcomeOnStartup(value);
-    AsyncStorage.setItem(
-      WELCOME_STARTUP_STORAGE_KEY,
-      value ? 'true' : 'false',
-    ).catch((error) => {
+  const closeInstructionsAndStart = () => {
+    setShowWelcomeOnStartup(false);
+    AsyncStorage.setItem(WELCOME_STARTUP_STORAGE_KEY, 'seen').catch((error) => {
       console.log('Welcome startup preference save error:', error);
     });
+    setStep('referencePicker');
+    scrollToTop();
+  };
+
+  const openInstructions = () => {
+    setStep('welcome');
+    scrollToTop();
   };
 
   const scrollGarageSaleCardToTop = (
@@ -9903,6 +9904,17 @@ export default function HomeScreen() {
 
   const [facing, setFacing] = useState<CameraType>('back');
   const [step, setStep] = useState<AppStep>('referencePicker');
+
+  useEffect(() => {
+    activeScrollRef.current?.scrollTo?.({ y: 0, animated: false });
+    requestAnimationFrame(() => {
+      activeScrollRef.current?.scrollTo?.({ y: 0, animated: false });
+      setTimeout(() => {
+        activeScrollRef.current?.scrollTo?.({ y: 0, animated: false });
+      }, 0);
+    });
+  }, [step]);
+
   const [homeMode, setHomeMode] = useState<HomeMode>('boxFinder');
   const [homeScanMode, setHomeScanMode] = useState<HomeScanMode>('source');
 
@@ -10140,6 +10152,8 @@ export default function HomeScreen() {
   const [listingHelperStep, setListingHelperStep] = useState<
     'title' | 'description' | 'pricing'
   >('title');
+  const [listingCategoryChoiceIndex, setListingCategoryChoiceIndex] =
+    useState(0);
   const [copiedListingAction, setCopiedListingAction] = useState<
     'title' | 'description' | null
   >(null);
@@ -10180,48 +10194,6 @@ export default function HomeScreen() {
     void loadSavedFinds();
   }, []);
 
-  useEffect(() => {
-    // Keep the Sourcing Builder synced with the current scanned item and
-    // automatically use the stronger Pro eBay listing format. This removes the
-    // extra Generate Pro Sourcing tap and keeps title/description current when
-    // the user changes condition.
-    const nextDraft = buildProEbaySourcingDraft({
-      condition: listingCondition,
-      product: barcodeProduct,
-      measurements,
-      isCylinder,
-      packageFrontSearchText,
-      packageFrontDetectedText,
-      soldItems: ebaySoldResults?.length ? ebaySoldResults : [],
-      activeItems: [
-        ...(ebayExactResults?.length ? ebayExactResults : ebayResults || []),
-        ...(ebaySimilarResults || []),
-      ],
-    });
-
-    setSourcingDraft(nextDraft);
-  }, [
-    barcodeProduct?.barcode,
-    barcodeProduct?.title,
-    barcodeProduct?.source,
-    barcodeProduct?.confidence,
-    barcodeProduct?.length,
-    barcodeProduct?.width,
-    barcodeProduct?.height,
-    barcodeProduct?.weightOz,
-    isCylinder,
-    listingCondition,
-    listingPlatform,
-    measurements.length,
-    measurements.width,
-    measurements.depth,
-    packageFrontDetectedText,
-    packageFrontSearchText,
-    ebaySoldResults?.length ?? 0,
-    ebayResults?.length ?? 0,
-    ebayExactResults?.length ?? 0,
-    ebaySimilarResults?.length ?? 0,
-  ]);
   const [selectedGarageSalePinId, setSelectedGarageSalePinId] = useState<
     string | null
   >(null);
@@ -10274,6 +10246,62 @@ export default function HomeScreen() {
   const [ebayError, setEbayError] = useState<string | null>(null);
   const [ebayQueryLabel, setEbayQueryLabel] = useState('');
   const [ebayBroaderQueryLabel, setEbayBroaderQueryLabel] = useState('');
+
+  useEffect(() => {
+    // Keep the Sourcing Builder synced with the current scanned item and
+    // automatically use the stronger Pro eBay listing format. This removes the
+    // extra Generate Pro Sourcing tap and keeps title/description current when
+    // the user changes condition.
+    const nextDraft = buildProEbaySourcingDraft({
+      condition: listingCondition,
+      product: barcodeProduct,
+      measurements,
+      isCylinder,
+      packageFrontSearchText,
+      packageFrontDetectedText,
+      soldItems: ebaySoldResults?.length ? ebaySoldResults : [],
+      activeItems: [
+        ...(ebayExactResults?.length ? ebayExactResults : ebayResults || []),
+        ...(ebaySimilarResults || []),
+      ],
+    });
+
+    setSourcingDraft(nextDraft);
+  }, [
+    barcodeProduct?.barcode,
+    barcodeProduct?.title,
+    barcodeProduct?.source,
+    barcodeProduct?.confidence,
+    barcodeProduct?.length,
+    barcodeProduct?.width,
+    barcodeProduct?.height,
+    barcodeProduct?.weightOz,
+    isCylinder,
+    listingCondition,
+    listingPlatform,
+    measurements.length,
+    measurements.width,
+    measurements.depth,
+    packageFrontDetectedText,
+    packageFrontSearchText,
+    ebaySoldResults?.length ?? 0,
+    ebayResults?.length ?? 0,
+    ebayExactResults?.length ?? 0,
+    ebaySimilarResults?.length ?? 0,
+  ]);
+
+  useEffect(() => {
+    setListingCategoryChoiceIndex(0);
+  }, [
+    barcodeProduct?.barcode,
+    barcodeProduct?.title,
+    packageFrontDetectedText,
+    packageFrontSearchText,
+    ebaySoldResults?.length ?? 0,
+    ebayResults?.length ?? 0,
+    ebayExactResults?.length ?? 0,
+    ebaySimilarResults?.length ?? 0,
+  ]);
 
   const lastHandledHomeResetRef = useRef<string | undefined>(undefined);
 
@@ -10674,6 +10702,7 @@ export default function HomeScreen() {
     website?: string;
     source?: string;
     openingHours?: string;
+    openNow?: boolean | null;
   }) => {
     try {
       const exists = savedGarageSales.some((item) => item.id === card.id);
@@ -10706,6 +10735,7 @@ export default function HomeScreen() {
               website: card.website,
               source: card.source,
               openingHours: card.openingHours,
+              openNow: card.openNow,
             },
             ...savedGarageSales,
           ].slice(0, 20);
@@ -10770,7 +10800,10 @@ export default function HomeScreen() {
                 const resetThriftPreferences = Object.fromEntries(
                   Object.entries(thriftStorePreferences).map(([key, value]) => [
                     key,
-                    { ...value, hiddenCount: 0 },
+                    {
+                      ...(value as ThriftStorePreferenceStats),
+                      hiddenCount: 0,
+                    },
                   ]),
                 ) as Record<string, ThriftStorePreferenceStats>;
                 setThriftStorePreferences(resetThriftPreferences);
@@ -10882,7 +10915,7 @@ export default function HomeScreen() {
           );
         }
 
-        return a.title.localeCompare(b.title);
+        return String(a.title || '').localeCompare(String(b.title || ''));
       });
     };
 
@@ -11141,7 +11174,10 @@ export default function HomeScreen() {
               source,
             } satisfies GarageSaleMapPin;
           })
-          .filter((pin): pin is GarageSaleMapPin => pin !== null);
+          .filter(
+            (pin: GarageSaleMapPin | null): pin is GarageSaleMapPin =>
+              pin !== null,
+          );
 
         const dedupedBackendThriftPins = dedupeThriftStorePins(thriftPins);
 
@@ -11390,9 +11426,9 @@ export default function HomeScreen() {
             hasCoordinates &&
             !hasExactCoordinates;
 
-          const latitude = hasCoordinates ? rawLatitude : Number.NaN;
+          const latitude = hasCoordinates ? Number(rawLatitude) : Number.NaN;
 
-          const longitude = hasCoordinates ? rawLongitude : Number.NaN;
+          const longitude = hasCoordinates ? Number(rawLongitude) : Number.NaN;
 
           const backendProbableSale =
             sale?.isProbableSale === true ||
@@ -11491,7 +11527,10 @@ export default function HomeScreen() {
             isApproximateLocation,
           } satisfies GarageSaleMapPin;
         })
-        .filter((pin): pin is GarageSaleMapPin => pin !== null);
+        .filter(
+          (pin: GarageSaleMapPin | null): pin is GarageSaleMapPin =>
+            pin !== null,
+        );
 
       const sortedMappedPins = sortGarageSalePinsNearestFirst(mappedPins);
       const combinedPins = filterCachedEstatePins(sortedMappedPins);
@@ -12430,7 +12469,7 @@ Barcode not found, try Box instead.`,
         .replace(/\bIn\b/g, 'in');
 
     const cleanedDetectedLines = detectedLines
-      .map((line) => line.replace(/\s+/g, ' ').trim())
+      .map((line) => String(line).replace(/\s+/g, ' ').trim())
       .filter((line) => line.length >= 3);
 
     const firstDetectedLine = cleanedDetectedLines[0] ?? '';
@@ -12702,7 +12741,11 @@ Barcode not found, try Box instead.`,
         params.photoUri,
         imageHelperText,
       );
-      const matches = (result.itemSummaries ?? []).slice(0, 8);
+      const matches = applyBackendCategorySuggestionToItems(
+        result.itemSummaries ?? [],
+        result,
+        imageHelperText,
+      ).slice(0, 8);
 
       setLooseItemMatches(matches);
       setLooseItemLookupNote(
@@ -12945,7 +12988,11 @@ Barcode not found, try Box instead.`,
         lookupPhotoUris,
         helperText,
       );
-      const matches = (result.itemSummaries ?? []).slice(0, 8);
+      const matches = applyBackendCategorySuggestionToItems(
+        result.itemSummaries ?? [],
+        result,
+        helperText,
+      ).slice(0, 8);
       setLooseItemMatches(matches);
       setLooseItemLookupNote(
         result.note ??
@@ -12977,7 +13024,11 @@ Barcode not found, try Box instead.`,
             lookupPhotoUris[0],
             helperText,
           );
-          const retryMatches = (retryResult.itemSummaries ?? []).slice(0, 8);
+          const retryMatches = applyBackendCategorySuggestionToItems(
+            retryResult.itemSummaries ?? [],
+            retryResult,
+            helperText,
+          ).slice(0, 8);
           setLooseItemMatches(retryMatches);
           setLooseItemLookupNote(
             retryResult.note ??
@@ -14571,10 +14622,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
 
           <TouchableOpacity
             style={[styles.secondaryButton, { marginTop: 12 }]}
-            onPress={() => {
-              setStep('referencePicker');
-              scrollToTop();
-            }}
+            onPress={closeInstructionsAndStart}
             activeOpacity={0.75}
           >
             <Text style={styles.secondaryButtonText}>Back to Home</Text>
@@ -14606,124 +14654,76 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
         </View>
 
         <View style={styles.resultCard}>
-          <Text style={styles.title}>Welcome to List Assist</Text>
+          <Text style={styles.title}>Instructions</Text>
           <Text style={[styles.infoText, { marginTop: 8, textAlign: 'left' }]}>
-            List Assist helps you move from finding an item to getting it ready
-            to sell. Use Sourcing when you are checking whether something is
-            worth buying. Use Listing when you are ready to build a listing and
-            get the item posted.
+            List Assist helps you move from item idea to eBay-ready listing. Use
+            it to scan items, check comps, estimate pricing, save promising
+            finds, and build better listing content.
           </Text>
 
-          <View style={{ marginTop: 18, gap: 12 }}>
+          <View style={{ marginTop: 18, gap: 14 }}>
             <View>
-              <Text
-                style={{ color: '#0F172A', fontSize: 16, fontWeight: '900' }}
-              >
-                1. Scan or photograph the item
-              </Text>
-              <Text
-                style={{
-                  color: '#475569',
-                  fontSize: 14,
-                  fontWeight: '700',
-                  lineHeight: 20,
-                  marginTop: 4,
-                }}
-              >
-                Barcode works best for packaged retail items. Box helps with
-                sizing. Item is best for loose finds, thrift items, and estate
-                sale finds.
+              <Text style={styles.instructionSectionTitle}>Barcode</Text>
+              <Text style={styles.instructionBodyText}>
+                Use Barcode for packaged retail items with a UPC. Scan the code,
+                review the product match, check sold listings, and confirm the
+                item before trusting the pricing.
               </Text>
             </View>
 
             <View>
-              <Text
-                style={{ color: '#0F172A', fontSize: 16, fontWeight: '900' }}
-              >
-                2. Check sourcing and listing details
-              </Text>
-              <Text
-                style={{
-                  color: '#475569',
-                  fontSize: 14,
-                  fontWeight: '700',
-                  lineHeight: 20,
-                  marginTop: 4,
-                }}
-              >
-                The app can help compare prices, review sold comps, estimate
-                profit, suggest listing text, and keep your stronger finds saved
-                for later.
+              <Text style={styles.instructionSectionTitle}>Box</Text>
+              <Text style={styles.instructionBodyText}>
+                Use Box when you want help estimating item size, box fit, and
+                shipping prep. Pick a reference object, take clean photos, and
+                confirm measurements before using the final box suggestion.
               </Text>
             </View>
 
             <View>
-              <Text
-                style={{ color: '#0F172A', fontSize: 16, fontWeight: '900' }}
-              >
-                3. Save, list, or source more
-              </Text>
-              <Text
-                style={{
-                  color: '#475569',
-                  fontSize: 14,
-                  fontWeight: '700',
-                  lineHeight: 20,
-                  marginTop: 4,
-                }}
-              >
-                Save promising items, open seller tools, or jump into Source
-                Assist when you want to find places to shop.
+              <Text style={styles.instructionSectionTitle}>Item</Text>
+              <Text style={styles.instructionBodyText}>
+                Use Item for loose or unboxed finds. Take a clear front photo
+                first. Add up to two more angles when helpful. More clean angles
+                usually means better identification and better comp matching.
               </Text>
             </View>
-          </View>
 
-          <View
-            style={{
-              marginTop: 22,
-              padding: 14,
-              borderRadius: 18,
-              borderWidth: 1,
-              borderColor: '#CBD5E1',
-              backgroundColor: '#F8FAFC',
-              flexDirection: 'row',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: 14,
-            }}
-          >
-            <View style={{ flex: 1 }}>
-              <Text
-                style={{ color: '#0F172A', fontSize: 15, fontWeight: '900' }}
-              >
-                Show this Page on Startup
-              </Text>
-              <Text
-                style={{
-                  color: '#64748B',
-                  fontSize: 12,
-                  fontWeight: '700',
-                  marginTop: 3,
-                }}
-              >
-                Turn this off once you know your way around.
+            <View>
+              <Text style={styles.instructionSectionTitle}>Saved Finds</Text>
+              <Text style={styles.instructionBodyText}>
+                Save items you want to review later. Use the status choices to
+                track Ready to List, Needs Work, and Listed items. Resume a
+                saved find when you are ready to finish the listing.
               </Text>
             </View>
-            <Switch
-              value={showWelcomeOnStartup}
-              onValueChange={handleWelcomeStartupToggle}
-              trackColor={{ false: '#E5E7EB', true: '#34C759' }}
-              thumbColor="#FFFFFF"
-              ios_backgroundColor="#E5E7EB"
-            />
+
+            <View>
+              <Text style={styles.instructionSectionTitle}>
+                eBay Listing Help
+              </Text>
+              <Text style={styles.instructionBodyText}>
+                List Assist can help with sold comps, active listings, suggested
+                category, pricing guidance, title ideas, item specifics,
+                descriptions, shipping notes, and photo notes. Always verify the
+                final details before posting to eBay.
+              </Text>
+            </View>
+
+            <View>
+              <Text style={styles.instructionSectionTitle}>Best Results</Text>
+              <Text style={styles.instructionBodyText}>
+                Use good light, avoid glare, fill the frame, and include brand,
+                model, size, color, or condition details when you know them.
+                Sold listings matter more than active listings when deciding
+                whether an item is worth buying or listing.
+              </Text>
+            </View>
           </View>
 
           <TouchableOpacity
             style={[styles.primaryButton, { marginTop: 22 }]}
-            onPress={() => {
-              setStep('referencePicker');
-              scrollToTop();
-            }}
+            onPress={closeInstructionsAndStart}
             activeOpacity={0.8}
           >
             <Text style={styles.primaryButtonText}>
@@ -14793,7 +14793,6 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                     flexDirection: 'row',
                     alignItems: 'center',
                     justifyContent: 'space-between',
-                    alignItems: 'center',
                     gap: 12,
                   }}
                 >
@@ -14946,59 +14945,44 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
           ) : (
             <>
               {/* ===== GARAGE SALE PHASE 1: STANDARD HOME BLOCK ===== */}
-              <View style={styles.headerRow}>
-                <Image
-                  source={require('../../assets/logo-icon.png')}
-                  style={styles.headerIcon}
-                  resizeMode="contain"
-                />
-                <Text style={styles.headerTitle}>List Assist</Text>
+              <View
+                style={[
+                  styles.headerRow,
+                  { justifyContent: 'space-between', alignItems: 'center' },
+                ]}
+              >
+                <View
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    flex: 1,
+                  }}
+                >
+                  <Image
+                    source={require('../../assets/logo-icon.png')}
+                    style={styles.headerIcon}
+                    resizeMode="contain"
+                  />
+                  <Text style={styles.headerTitle}>List Assist</Text>
+                </View>
+
+                <TouchableOpacity
+                  onPress={openInstructions}
+                  activeOpacity={0.75}
+                >
+                  <Text
+                    style={{
+                      color: '#2563EB',
+                      fontSize: 13,
+                      fontWeight: '900',
+                      textAlign: 'right',
+                    }}
+                  >
+                    Open Instructions
+                  </Text>
+                </TouchableOpacity>
               </View>
               <Text style={styles.subtitle}></Text>
-
-              <View
-                style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  paddingVertical: 8,
-                  paddingHorizontal: 14,
-                  borderRadius: 18,
-                  borderWidth: 1,
-                  borderColor: '#CBD5E1',
-                  backgroundColor: '#F8FAFC',
-                  marginBottom: 12,
-                }}
-              >
-                <View style={{ flex: 1, paddingRight: 12 }}>
-                  <Text
-                    style={{
-                      color: '#0F172A',
-                      fontSize: 14,
-                      fontWeight: '900',
-                    }}
-                  >
-                    Show Instructions
-                  </Text>
-                  <Text
-                    style={{
-                      color: '#64748B',
-                      fontSize: 12,
-                      fontWeight: '700',
-                      marginTop: 2,
-                    }}
-                  >
-                    Show the welcome page when List Assist starts.
-                  </Text>
-                </View>
-                <Switch
-                  value={showWelcomeOnStartup}
-                  onValueChange={handleWelcomeStartupToggle}
-                  trackColor={{ false: '#E5E7EB', true: '#34C759' }}
-                  thumbColor="#FFFFFF"
-                  ios_backgroundColor="#E5E7EB"
-                />
-              </View>
 
               {renderHelperToggle()}
 
@@ -16035,7 +16019,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                       locationLabel,
                       weatherData?.latitude,
                       weatherData?.longitude,
-                      [card],
+                      [{ ...card, savedAt: Date.now() }],
                     )[0];
 
                     openExternalLink(
@@ -16874,7 +16858,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                   ref={garageSalesMapRef}
                   style={{ width: '100%', height: 320, borderRadius: 16 }}
                   customMapStyle={GARAGE_SALE_MAP_STYLE}
-                  showsPointsOfInterest={false}
+                  showsPointsOfInterests={false}
                   showsBuildings={false}
                   showsIndoors={false}
                   showsTraffic={false}
@@ -19565,6 +19549,148 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
     );
   };
 
+  const renderResults = () => {
+    const hasAllMeasurements =
+      measurements.length !== null &&
+      measurements.width !== null &&
+      measurements.depth !== null;
+
+    const unitSystem: UnitSystem = 'us';
+    const boxes = BOXES_US;
+    const fitModes = FIT_MODES_US;
+    const selectedFitMode =
+      fitModes.find((mode) => mode.key === selectedFitModeKey) || fitModes[0];
+
+    const fits = hasAllMeasurements
+      ? calculateFits(
+          Number(measurements.length),
+          Number(measurements.width),
+          Number(measurements.depth),
+          boxes,
+          selectedFitMode.padding,
+          unitSystem,
+        ).slice(0, 5)
+      : [];
+
+    const nearestMiss =
+      hasAllMeasurements && fits.length === 0
+        ? calculateNearestMiss(
+            Number(measurements.length),
+            Number(measurements.width),
+            Number(measurements.depth),
+            boxes,
+            selectedFitMode.padding,
+          )
+        : null;
+
+    return (
+      <SafeAreaView style={styles.screen}>
+        <ScrollView
+          ref={activeScrollRef}
+          style={styles.flexFill}
+          contentContainerStyle={styles.packageFrontScrollContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator
+          contentInsetAdjustmentBehavior="automatic"
+        >
+          <Text style={styles.title}>Box Results</Text>
+          <Text style={styles.subtitle}>
+            {buildDimensionsText(measurements, isCylinder)}
+          </Text>
+
+          <View style={styles.resultCard}>
+            <Text style={styles.resultLabel}>Fit Mode</Text>
+            <View style={styles.chipRow}>
+              {fitModes.map((mode) => {
+                const isSelected = selectedFitModeKey === mode.key;
+                return (
+                  <TouchableOpacity
+                    key={mode.key}
+                    style={[
+                      styles.boxBuddyChip,
+                      isSelected && styles.boxBuddyChipSelected,
+                    ]}
+                    onPress={() => setSelectedFitModeKey(mode.key)}
+                    activeOpacity={0.75}
+                  >
+                    <Text
+                      style={[
+                        styles.boxBuddyChipText,
+                        isSelected && styles.boxBuddyChipTextSelected,
+                      ]}
+                    >
+                      {mode.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+
+          {!hasAllMeasurements ? (
+            <View style={styles.resultCard}>
+              <Text style={styles.resultValueSmall}>Measurements Missing</Text>
+              <Text style={styles.resultDescription}>
+                Go back and finish length, width, and depth before checking box
+                fit.
+              </Text>
+            </View>
+          ) : fits.length ? (
+            fits.map((fit, index) => (
+              <View key={fit.box.id} style={styles.resultCard}>
+                <Text style={styles.resultLabel}>
+                  {index === 0 ? 'Best Match' : `Option ${index + 1}`}
+                </Text>
+                <Text style={styles.resultValueSmall}>{fit.box.name}</Text>
+                <Text style={styles.resultDescription}>
+                  Fit score: {fit.fitScore} • {fit.fitLabel}
+                </Text>
+                <Text style={styles.resultDescription}>
+                  Slack: L {formatNumber(fit.slackLength)} × W{' '}
+                  {formatNumber(fit.slackWidth)} × H{' '}
+                  {formatNumber(fit.slackHeight)} in
+                </Text>
+                {fit.box.amazonSearchUrl ? (
+                  <TouchableOpacity
+                    style={[styles.primaryButton, { marginTop: 12 }]}
+                    onPress={() => void openAmazonLink(fit.box.amazonSearchUrl)}
+                    activeOpacity={0.75}
+                  >
+                    <Text style={styles.primaryButtonText}>
+                      {getAmazonButtonText(unitSystem, index === 0)}
+                    </Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+            ))
+          ) : (
+            <View style={styles.resultCard}>
+              <Text style={styles.resultValueSmall}>No Perfect Fit Found</Text>
+              <Text style={styles.resultDescription}>
+                {nearestMiss
+                  ? `Closest miss: ${nearestMiss.box.name}. Overage: ${formatNumber(
+                      nearestMiss.totalOverage,
+                    )} in.`
+                  : 'Try another fit mode or recheck the measurements.'}
+              </Text>
+            </View>
+          )}
+
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={() => {
+              setStep('referencePicker');
+              scrollToTop();
+            }}
+            activeOpacity={0.75}
+          >
+            <Text style={styles.secondaryButtonText}>Back to Home</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  };
+
   const renderCompCheck = () => {
     const resolvedTitle = (barcodeProduct?.title || '').trim();
     const resolvedBarcode = (barcodeProduct?.barcode || '').trim();
@@ -20564,6 +20690,18 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
       ...(ebayExactResults?.length ? ebayExactResults : ebayResults || []),
       ...(ebaySimilarResults || []),
     ];
+    const listingCategoryChoices = getEbayCategoryChoicesFromResults({
+      soldItems: ebaySoldResults?.length ? ebaySoldResults : [],
+      activeItems: listingActiveItems,
+    });
+    const listingSelectedCategoryIndex = listingCategoryChoices.length
+      ? listingCategoryChoiceIndex % listingCategoryChoices.length
+      : 0;
+    const listingSelectedCategoryChoice =
+      listingCategoryChoices[listingSelectedCategoryIndex];
+    const listingSelectedCategoryText =
+      listingSelectedCategoryChoice?.categoryPath ||
+      getTrustedSuggestedCategoryForDraft(draft);
     const listingEstimatedCost = parsePriceInput(buyCostInput);
     const listingPricingConfidence = getConfidenceScore({
       product: barcodeProduct,
@@ -21566,17 +21704,79 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
                   >
                     Suggested Category
                   </Text>
-                  <Text
+                  <View
                     style={{
-                      fontSize: 16,
-                      fontWeight: '900',
-                      color: '#0F172A',
-                      lineHeight: 22,
+                      flexDirection: 'row',
+                      alignItems: 'flex-start',
+                      justifyContent: 'space-between',
+                      gap: 10,
                     }}
                   >
-                    {draft.suggestedCategory ||
-                      'Use the closest eBay category match'}
-                  </Text>
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text
+                        style={{
+                          fontSize: 16,
+                          fontWeight: '900',
+                          color: '#0F172A',
+                          lineHeight: 22,
+                        }}
+                      >
+                        {listingSelectedCategoryText}
+                      </Text>
+                      {listingCategoryChoices.length ? (
+                        <Text
+                          style={{
+                            fontSize: 11,
+                            lineHeight: 15,
+                            fontWeight: '800',
+                            color: '#64748B',
+                            marginTop: 4,
+                          }}
+                        >
+                          {`Choice ${listingSelectedCategoryIndex + 1} of ${listingCategoryChoices.length} • ${listingSelectedCategoryChoice?.votes || 0} matched item${(listingSelectedCategoryChoice?.votes || 0) === 1 ? '' : 's'}`}
+                        </Text>
+                      ) : null}
+                    </View>
+
+                    <TouchableOpacity
+                      disabled={listingCategoryChoices.length < 2}
+                      onPress={() => {
+                        if (listingCategoryChoices.length < 2) return;
+                        setListingCategoryChoiceIndex(
+                          (current) =>
+                            (current + 1) % listingCategoryChoices.length,
+                        );
+                      }}
+                      style={{
+                        backgroundColor:
+                          listingCategoryChoices.length < 2
+                            ? '#F1F5F9'
+                            : '#EFF6FF',
+                        borderColor:
+                          listingCategoryChoices.length < 2
+                            ? '#CBD5E1'
+                            : '#93C5FD',
+                        borderWidth: 1,
+                        borderRadius: 999,
+                        paddingHorizontal: 10,
+                        paddingVertical: 7,
+                      }}
+                      activeOpacity={0.75}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 11,
+                          fontWeight: '900',
+                          color:
+                            listingCategoryChoices.length < 2
+                              ? '#94A3B8'
+                              : '#1D4ED8',
+                        }}
+                      >
+                        New Category
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
                 </View>
               ) : null}
 
@@ -22279,12 +22479,12 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
               {renderSourcingDetailSection(
                 'suggestedCategory',
                 'Suggested Category',
-                draft.suggestedCategory,
+                listingSelectedCategoryText,
                 false,
                 {
                   icon: '🏷️',
                   summary: getReviewCardSummary(
-                    draft.suggestedCategory,
+                    listingSelectedCategoryText,
                     'Choose the closest category match in eBay',
                   ),
                   detailLabel: 'Setup Detail',
@@ -22506,7 +22706,7 @@ This barcode may not be in the local catalog yet${barcode429UntilRef.current > D
   }
 
   // ===== GARAGE SALE PHASE 1: HOME SCREEN UI END =====
-  let screen = renderReferencePicker();
+  let screen: any = renderReferencePicker();
 
   if (step === 'welcome') screen = renderWelcomePage();
   else if (step === 'barcodeScanner') screen = renderBarcodeScanner();
@@ -22750,6 +22950,77 @@ function clamp(value: number, min: number, max: number) {
 }
 
 const styles = StyleSheet.create({
+  instructionSectionTitle: {
+    color: '#0F172A',
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  instructionBodyText: {
+    color: '#475569',
+    fontSize: 14,
+    fontWeight: '700',
+    lineHeight: 20,
+    marginTop: 4,
+  },
+  barcodeFailureTitle: {
+    color: '#0F172A',
+    fontSize: 24,
+    fontWeight: '900',
+    marginBottom: 8,
+  },
+  cameraTopSpacer: {
+    width: 64,
+    height: 1,
+  },
+  lookupStatusCard: {
+    backgroundColor: 'rgba(15, 23, 42, 0.72)',
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginTop: 12,
+  },
+  lookupStatusText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  sectionTitle: {
+    color: '#0F172A',
+    fontSize: 18,
+    fontWeight: '900',
+    marginBottom: 8,
+  },
+  helperText: {
+    color: '#64748B',
+    fontSize: 14,
+    fontWeight: '700',
+    lineHeight: 20,
+  },
+  confidenceStatRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 12,
+  },
+  confidenceStatBox: {
+    flex: 1,
+    backgroundColor: '#F8FAFC',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    padding: 10,
+  },
+  confidenceStatLabel: {
+    color: '#64748B',
+    fontSize: 12,
+    fontWeight: '800',
+    marginBottom: 4,
+  },
+  confidenceStatValue: {
+    color: '#0F172A',
+    fontSize: 16,
+    fontWeight: '900',
+  },
   // Action hierarchy: each screen should have one filled primary action.
   // Secondary actions stay outline/text so the next move is obvious fast.
   appRoot: {
@@ -23090,27 +23361,6 @@ const styles = StyleSheet.create({
     marginTop: 18,
     marginBottom: 18,
   },
-  splitActionButton: {
-    flex: 1,
-    height: 62,
-    minHeight: 62,
-    maxHeight: 62,
-    borderRadius: 18,
-    paddingVertical: 0,
-    justifyContent: 'center',
-    alignItems: 'center',
-    overflow: 'hidden',
-  },
-  splitActionButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '800',
-    lineHeight: 20,
-    textAlign: 'center',
-    includeFontPadding: false,
-    textAlignVertical: 'center',
-  },
-
   splitActionButton: {
     flex: 1,
     height: 62,
@@ -23504,29 +23754,6 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 3 },
     elevation: 6,
-  },
-  userCalloutTitle: {
-    fontSize: 22,
-    lineHeight: 22,
-    fontWeight: '800',
-    color: '#111827',
-    marginBottom: 6,
-  },
-  userCalloutText: {
-    fontSize: 16,
-    lineHeight: 20,
-    color: '#374151',
-  },
-  userCalloutArrow: {
-    width: 0,
-    height: 0,
-    borderLeftWidth: 10,
-    borderRightWidth: 10,
-    borderTopWidth: 12,
-    borderLeftColor: 'transparent',
-    borderRightColor: 'transparent',
-    borderTopColor: '#ffffff',
-    marginTop: -1,
   },
   userCalloutWrap: {
     alignItems: 'center',
@@ -24020,7 +24247,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    alignItems: 'center',
     marginBottom: 6,
     gap: 8,
   },
@@ -24308,7 +24534,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     flexDirection: 'row',
-    alignItems: 'center',
     gap: 6,
   },
   saleActionButtonMap: {
@@ -24634,7 +24859,6 @@ const styles = StyleSheet.create({
   },
   adjustBottomRow: {
     flexDirection: 'row',
-    alignItems: 'center',
     gap: 7,
     justifyContent: 'space-between',
     alignItems: 'stretch',
@@ -24782,7 +25006,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    alignItems: 'center',
     gap: 10,
     flexWrap: 'wrap',
     marginBottom: 10,
@@ -25005,7 +25228,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    alignItems: 'center',
     marginBottom: 4,
     gap: 8,
   },
