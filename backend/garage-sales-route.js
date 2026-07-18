@@ -1,8 +1,40 @@
-const express = require('express');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const express = require("express");
+const axios = require("axios");
+const cheerio = require("cheerio");
 
 const router = express.Router();
+
+// Craigslist will temporarily block a server that sends a large burst of
+// requests. Keep searches small, share recent responses between app refreshes,
+// and retain a stale result as a temporary fallback during a 403 window.
+const GARAGE_RESULTS_CACHE_TTL_MS = 5 * 60 * 1000;
+const GARAGE_RESULTS_STALE_TTL_MS = 6 * 60 * 60 * 1000;
+const garageResultsCache = new Map();
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+      if (nextIndex < items.length) await wait(225);
+    }
+  }
+
+  const workerCount = Math.max(
+    1,
+    Math.min(Number(concurrency) || 1, items.length || 1),
+  );
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
 
 function toRadians(value) {
   return (Number(value) * Math.PI) / 180;
@@ -40,45 +72,475 @@ function distanceMiles(startLat, startLon, endLat, endLon) {
   return Math.round(earthRadiusMiles * c * 100) / 100;
 }
 
-
 function normalizePostalCode(value) {
-  const match = String(value || '').match(/\b\d{5}(?:-\d{4})?\b/);
-  return match ? match[0].slice(0, 5) : '';
+  const match = String(value || "").match(/\b\d{5}(?:-\d{4})?\b/);
+  return match ? match[0].slice(0, 5) : "";
 }
 
-function inferPostalFromCoords(latitude, longitude) {
+const CRAIGSLIST_REGION_CENTERS = [
+  {
+    area: "spokane",
+    zip: "99202",
+    state: "WA",
+    suffix: "Washington, USA",
+    latitude: 47.6588,
+    longitude: -117.426,
+  },
+  {
+    area: "seattle",
+    zip: "98101",
+    state: "WA",
+    suffix: "Washington, USA",
+    latitude: 47.6062,
+    longitude: -122.3321,
+  },
+  {
+    area: "portland",
+    zip: "97205",
+    state: "OR",
+    suffix: "Oregon, USA",
+    latitude: 45.5152,
+    longitude: -122.6784,
+  },
+  {
+    area: "boise",
+    zip: "83702",
+    state: "ID",
+    suffix: "Idaho, USA",
+    latitude: 43.615,
+    longitude: -116.2023,
+  },
+  {
+    area: "missoula",
+    zip: "59802",
+    state: "MT",
+    suffix: "Montana, USA",
+    latitude: 46.8721,
+    longitude: -113.994,
+  },
+  {
+    area: "billings",
+    zip: "59101",
+    state: "MT",
+    suffix: "Montana, USA",
+    latitude: 45.7833,
+    longitude: -108.5007,
+  },
+  {
+    area: "saltlakecity",
+    zip: "84101",
+    state: "UT",
+    suffix: "Utah, USA",
+    latitude: 40.7608,
+    longitude: -111.891,
+  },
+  {
+    area: "denver",
+    zip: "80202",
+    state: "CO",
+    suffix: "Colorado, USA",
+    latitude: 39.7392,
+    longitude: -104.9903,
+  },
+  {
+    area: "phoenix",
+    zip: "85004",
+    state: "AZ",
+    suffix: "Arizona, USA",
+    latitude: 33.4484,
+    longitude: -112.074,
+  },
+  {
+    area: "lasvegas",
+    zip: "89101",
+    state: "NV",
+    suffix: "Nevada, USA",
+    latitude: 36.1699,
+    longitude: -115.1398,
+  },
+  {
+    area: "sfbay",
+    zip: "94103",
+    state: "CA",
+    suffix: "California, USA",
+    latitude: 37.7749,
+    longitude: -122.4194,
+  },
+  {
+    area: "sacramento",
+    zip: "95814",
+    state: "CA",
+    suffix: "California, USA",
+    latitude: 38.5816,
+    longitude: -121.4944,
+  },
+  {
+    area: "losangeles",
+    zip: "90012",
+    state: "CA",
+    suffix: "California, USA",
+    latitude: 34.0522,
+    longitude: -118.2437,
+  },
+  {
+    area: "sandiego",
+    zip: "92101",
+    state: "CA",
+    suffix: "California, USA",
+    latitude: 32.7157,
+    longitude: -117.1611,
+  },
+  {
+    area: "chicago",
+    zip: "60565",
+    state: "IL",
+    suffix: "Illinois, USA",
+    latitude: 41.8781,
+    longitude: -87.6298,
+  },
+  {
+    area: "milwaukee",
+    zip: "53202",
+    state: "WI",
+    suffix: "Wisconsin, USA",
+    latitude: 43.0389,
+    longitude: -87.9065,
+  },
+  {
+    area: "madison",
+    zip: "53703",
+    state: "WI",
+    suffix: "Wisconsin, USA",
+    latitude: 43.0731,
+    longitude: -89.4012,
+  },
+  {
+    area: "minneapolis",
+    zip: "55401",
+    state: "MN",
+    suffix: "Minnesota, USA",
+    latitude: 44.9778,
+    longitude: -93.265,
+  },
+  {
+    area: "indianapolis",
+    zip: "46204",
+    state: "IN",
+    suffix: "Indiana, USA",
+    latitude: 39.7684,
+    longitude: -86.1581,
+  },
+  {
+    area: "stlouis",
+    zip: "63101",
+    state: "MO",
+    suffix: "Missouri, USA",
+    latitude: 38.627,
+    longitude: -90.1994,
+  },
+  {
+    area: "kansascity",
+    zip: "64106",
+    state: "MO",
+    suffix: "Missouri, USA",
+    latitude: 39.0997,
+    longitude: -94.5786,
+  },
+  {
+    area: "omaha",
+    zip: "68102",
+    state: "NE",
+    suffix: "Nebraska, USA",
+    latitude: 41.2565,
+    longitude: -95.9345,
+  },
+  {
+    area: "desmoines",
+    zip: "50309",
+    state: "IA",
+    suffix: "Iowa, USA",
+    latitude: 41.5868,
+    longitude: -93.625,
+  },
+  {
+    area: "dallas",
+    zip: "75201",
+    state: "TX",
+    suffix: "Texas, USA",
+    latitude: 32.7767,
+    longitude: -96.797,
+  },
+  {
+    area: "houston",
+    zip: "77002",
+    state: "TX",
+    suffix: "Texas, USA",
+    latitude: 29.7604,
+    longitude: -95.3698,
+  },
+  {
+    area: "austin",
+    zip: "78701",
+    state: "TX",
+    suffix: "Texas, USA",
+    latitude: 30.2672,
+    longitude: -97.7431,
+  },
+  {
+    area: "sanantonio",
+    zip: "78205",
+    state: "TX",
+    suffix: "Texas, USA",
+    latitude: 29.4241,
+    longitude: -98.4936,
+  },
+  {
+    area: "oklahomacity",
+    zip: "73102",
+    state: "OK",
+    suffix: "Oklahoma, USA",
+    latitude: 35.4676,
+    longitude: -97.5164,
+  },
+  {
+    area: "tulsa",
+    zip: "74103",
+    state: "OK",
+    suffix: "Oklahoma, USA",
+    latitude: 36.154,
+    longitude: -95.9928,
+  },
+  {
+    area: "nashville",
+    zip: "37219",
+    state: "TN",
+    suffix: "Tennessee, USA",
+    latitude: 36.1627,
+    longitude: -86.7816,
+  },
+  {
+    area: "memphis",
+    zip: "38103",
+    state: "TN",
+    suffix: "Tennessee, USA",
+    latitude: 35.1495,
+    longitude: -90.049,
+  },
+  {
+    area: "atlanta",
+    zip: "30303",
+    state: "GA",
+    suffix: "Georgia, USA",
+    latitude: 33.749,
+    longitude: -84.388,
+  },
+  {
+    area: "charlotte",
+    zip: "28202",
+    state: "NC",
+    suffix: "North Carolina, USA",
+    latitude: 35.2271,
+    longitude: -80.8431,
+  },
+  {
+    area: "raleigh",
+    zip: "27601",
+    state: "NC",
+    suffix: "North Carolina, USA",
+    latitude: 35.7796,
+    longitude: -78.6382,
+  },
+  {
+    area: "orlando",
+    zip: "32801",
+    state: "FL",
+    suffix: "Florida, USA",
+    latitude: 28.5383,
+    longitude: -81.3792,
+  },
+  {
+    area: "tampa",
+    zip: "33602",
+    state: "FL",
+    suffix: "Florida, USA",
+    latitude: 27.9506,
+    longitude: -82.4572,
+  },
+  {
+    area: "miami",
+    zip: "33130",
+    state: "FL",
+    suffix: "Florida, USA",
+    latitude: 25.7617,
+    longitude: -80.1918,
+  },
+  {
+    area: "washingtondc",
+    zip: "20001",
+    state: "DC",
+    suffix: "District of Columbia, USA",
+    latitude: 38.9072,
+    longitude: -77.0369,
+  },
+  {
+    area: "baltimore",
+    zip: "21201",
+    state: "MD",
+    suffix: "Maryland, USA",
+    latitude: 39.2904,
+    longitude: -76.6122,
+  },
+  {
+    area: "philadelphia",
+    zip: "19107",
+    state: "PA",
+    suffix: "Pennsylvania, USA",
+    latitude: 39.9526,
+    longitude: -75.1652,
+  },
+  {
+    area: "newyork",
+    zip: "10001",
+    state: "NY",
+    suffix: "New York, USA",
+    latitude: 40.7128,
+    longitude: -74.006,
+  },
+  {
+    area: "boston",
+    zip: "02108",
+    state: "MA",
+    suffix: "Massachusetts, USA",
+    latitude: 42.3601,
+    longitude: -71.0589,
+  },
+  {
+    area: "detroit",
+    zip: "48226",
+    state: "MI",
+    suffix: "Michigan, USA",
+    latitude: 42.3314,
+    longitude: -83.0458,
+  },
+  {
+    area: "cleveland",
+    zip: "44114",
+    state: "OH",
+    suffix: "Ohio, USA",
+    latitude: 41.4993,
+    longitude: -81.6944,
+  },
+  {
+    area: "columbus",
+    zip: "43215",
+    state: "OH",
+    suffix: "Ohio, USA",
+    latitude: 39.9612,
+    longitude: -82.9988,
+  },
+  {
+    area: "pittsburgh",
+    zip: "15222",
+    state: "PA",
+    suffix: "Pennsylvania, USA",
+    latitude: 40.4406,
+    longitude: -79.9959,
+  },
+];
+
+function findNearestCraigslistRegion(latitude, longitude) {
   const lat = Number(latitude);
   const lon = Number(longitude);
-
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    return '60565';
+    return CRAIGSLIST_REGION_CENTERS.find(
+      (region) => region.area === "chicago",
+    );
   }
 
-  // Good local defaults for the Naperville / west-suburban sourcing area.
-  // This keeps Craigslist's postal-radius search alive even when the app only
-  // sends GPS coordinates and no ZIP/postal code.
-  const candidates = [
-    { zip: '60565', latitude: 41.724, longitude: -88.155 }, // south Naperville
-    { zip: '60540', latitude: 41.771, longitude: -88.148 }, // central Naperville
-    { zip: '60563', latitude: 41.803, longitude: -88.139 }, // north Naperville
-    { zip: '60564', latitude: 41.706, longitude: -88.202 }, // southwest Naperville
-    { zip: '60504', latitude: 41.748, longitude: -88.236 }, // Aurora / Route 59
-    { zip: '60517', latitude: 41.746, longitude: -88.050 }, // Woodridge
-    { zip: '60585', latitude: 41.682, longitude: -88.203 }, // Plainfield
-  ];
-
-  let best = candidates[0];
+  let best = CRAIGSLIST_REGION_CENTERS[0];
   let bestDistance = Infinity;
-
-  for (const candidate of candidates) {
-    const miles = distanceMiles(lat, lon, candidate.latitude, candidate.longitude);
+  for (const region of CRAIGSLIST_REGION_CENTERS) {
+    const miles = distanceMiles(lat, lon, region.latitude, region.longitude);
     if (Number.isFinite(miles) && miles < bestDistance) {
-      best = candidate;
+      best = region;
       bestDistance = miles;
     }
   }
 
-  return best.zip;
+  return { ...best, distanceMiles: Math.round(bestDistance * 100) / 100 };
+}
+
+function inferPostalFromCoords(latitude, longitude) {
+  return findNearestCraigslistRegion(latitude, longitude)?.zip || "60565";
+}
+
+function getDefaultStateForArea(area) {
+  const region = CRAIGSLIST_REGION_CENTERS.find(
+    (item) => item.area === String(area || "").toLowerCase(),
+  );
+  return region?.state || "IL";
+}
+
+function getDefaultCityForArea(area) {
+  const normalized = String(area || "")
+    .toLowerCase()
+    .trim();
+  const cityOverrides = {
+    spokane: "Spokane",
+    seattle: "Seattle",
+    portland: "Portland",
+    boise: "Boise",
+    missoula: "Missoula",
+    billings: "Billings",
+    saltlakecity: "Salt Lake City",
+    denver: "Denver",
+    phoenix: "Phoenix",
+    lasvegas: "Las Vegas",
+    sfbay: "San Francisco",
+    sacramento: "Sacramento",
+    losangeles: "Los Angeles",
+    sandiego: "San Diego",
+    chicago: "Chicago",
+    milwaukee: "Milwaukee",
+    madison: "Madison",
+    minneapolis: "Minneapolis",
+    indianapolis: "Indianapolis",
+    stlouis: "St. Louis",
+    kansascity: "Kansas City",
+    omaha: "Omaha",
+    desmoines: "Des Moines",
+    dallas: "Dallas",
+    houston: "Houston",
+    austin: "Austin",
+    sanantonio: "San Antonio",
+    oklahomacity: "Oklahoma City",
+    tulsa: "Tulsa",
+    nashville: "Nashville",
+    memphis: "Memphis",
+    atlanta: "Atlanta",
+    charlotte: "Charlotte",
+    raleigh: "Raleigh",
+    orlando: "Orlando",
+    tampa: "Tampa",
+    miami: "Miami",
+    washingtondc: "Washington",
+    baltimore: "Baltimore",
+    philadelphia: "Philadelphia",
+    newyork: "New York",
+    boston: "Boston",
+    detroit: "Detroit",
+    cleveland: "Cleveland",
+    columbus: "Columbus",
+    pittsburgh: "Pittsburgh",
+  };
+  return cityOverrides[normalized] || "";
+}
+
+function getAreaGeocodeSuffixFromRegion(area) {
+  const region = CRAIGSLIST_REGION_CENTERS.find(
+    (item) => item.area === String(area || "").toLowerCase(),
+  );
+  return region?.suffix || "Illinois, USA";
 }
 
 function parseCoordinateValue(value) {
@@ -113,36 +575,17 @@ function isUsableCoordinatePair(latitude, longitude) {
 }
 
 function normalizeAreaFromCoords(latitude, longitude) {
-  const lat = Number(latitude);
-  const lon = Number(longitude);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    return 'chicago';
-  }
-
-  if (lat >= 41 && lat <= 43.5 && lon >= -89.5 && lon <= -86.5)
-    return 'chicago';
-  if (lat >= 42 && lat <= 44.5 && lon >= -89 && lon <= -87) return 'milwaukee';
-  if (lat >= 43 && lat <= 44.5 && lon >= -90.5 && lon <= -88.5)
-    return 'madison';
-  if (lat >= 44 && lat <= 46 && lon >= -94.5 && lon <= -92)
-    return 'minneapolis';
-  if (lat >= 39 && lat <= 41 && lon >= -87 && lon <= -84.5)
-    return 'indianapolis';
-
-  return 'chicago';
+  return findNearestCraigslistRegion(latitude, longitude)?.area || "chicago";
 }
 
 function parseCraigslistDate(textValue, fallbackDay) {
-  const text = String(textValue || '').trim();
+  const text = String(textValue || "").trim();
   if (!text)
-    return fallbackDay === 'dayaftertomorrow'
-      ? formatTargetDayLabel('dayaftertomorrow', dateKeyFromDate(new Date(Date.now() + 2 * 24 * 60 * 60 * 1000)))
-      : fallbackDay === 'tomorrow'
-        ? 'Tomorrow'
-        : fallbackDay === 'today'
-        ? 'Today'
-        : '';
+    return fallbackDay === "tomorrow"
+      ? "Tomorrow"
+      : fallbackDay === "today"
+        ? "Today"
+        : "";
 
   const date = new Date(text);
   if (Number.isNaN(date.getTime())) return text;
@@ -151,21 +594,21 @@ function parseCraigslistDate(textValue, fallbackDay) {
 }
 
 function parsePostingUrl(href, baseUrl) {
-  if (!href) return '';
+  if (!href) return "";
   if (/^https?:\/\//i.test(href)) return href;
   return new URL(href, baseUrl).toString();
 }
 
 function parseGeoFromElement($element) {
   const lat = parseCoordinateValue(
-    $element.attr('data-latitude') ||
-      $element.attr('data-lat') ||
-      $element.attr('latitude'),
+    $element.attr("data-latitude") ||
+      $element.attr("data-lat") ||
+      $element.attr("latitude"),
   );
   const lon = parseCoordinateValue(
-    $element.attr('data-longitude') ||
-      $element.attr('data-lon') ||
-      $element.attr('longitude'),
+    $element.attr("data-longitude") ||
+      $element.attr("data-lon") ||
+      $element.attr("longitude"),
   );
 
   if (isUsableCoordinatePair(lat, lon)) {
@@ -176,7 +619,7 @@ function parseGeoFromElement($element) {
 }
 
 function parseGeoFromHtml(html) {
-  const htmlText = String(html || '');
+  const htmlText = String(html || "");
   if (!htmlText) return { latitude: null, longitude: null };
 
   const patterns = [
@@ -207,70 +650,84 @@ function parseGeoFromHtml(html) {
 }
 
 function extractStreetAddressFromText(value) {
-  const text = String(value || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/\s+/g, ' ')
+  const text = String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
-  if (!text) return '';
+  if (!text) return "";
 
-  const houseNumber = '(?:\\d+[A-Za-z]+\\d+|\\d+[A-Za-z]?|\\d+-\\d+)';
-  const streetSuffix = '(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy|Route|Rt)';
   const patterns = [
-    new RegExp(
-      `\\b(${houseNumber}\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z0-9.#'\\-]+(?:\\s+[A-Za-z0-9.#'\\-]+){0,7}\\s${streetSuffix}\\.?)\\b`,
-      'i',
-    ),
-    new RegExp(
-      `\\b(${houseNumber}\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z][A-Za-z0-9.#'\\-]+(?:\\s+[A-Za-z0-9.#'\\-]+){1,4})\\b`,
-      'i',
-    ),
+    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6}\s(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy))\b/i,
+    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6})\b/i,
   ];
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      const candidate = String(match[1])
-        .replace(/[,:;.-]+$/g, '')
+      return String(match[1])
+        .replace(/[,:;.-]+$/g, "")
         .trim();
-      const candidateHasRoadSuffix = hasRoadSuffix(candidate);
+    }
+  }
 
-      // Avoid treating listing years or item/size text like "24 month" and
-      // "100 Years Old Books" as a street address. Prefer real road suffixes
-      // and the map/address block from the Craigslist detail page.
-      if (
-        (!candidateHasRoadSuffix && hasYearLikeHouseNumberPrefix(candidate)) ||
-        looksLikeSaleItemNotAddress(candidate)
-      ) {
-        continue;
-      }
+  return "";
+}
 
+function extractStreetAddressFromSaleTitle(value) {
+  const rawText = cleanAddressFragment(value);
+  const strippedText = cleanAddressFragment(stripDateNoiseFromText(value));
+  const candidates = [rawText, strippedText].filter(Boolean);
+
+  // Common Craigslist title pattern:
+  // "Yard Sale 9th-11th 9-4 pm 6405 N Normandie Tools Pokemon Hot Wheels"
+  // Capture the house number + directional + street name and stop before item words.
+  const itemStopWords =
+    "tools?|pokemon|hot\\s*wheels|yard|garage|sale|estate|moving|vintage|antiques?|furniture|clothes?|clothing|jewelry|toys?|books?|electronics?|records?|coins?|cards?|bike(?:s)?|household|decor|free|multi|huge|big|lots?|collectibles?|baby|kids?|children|mens?|womens?|shoes?|games?|dvd|cd|nascar|star\\s*wars|funko|pops?";
+  const directionalStreetPattern = new RegExp(
+    `\\b(\\d{1,6}\\s+(?:[NSEW]\\.?|North|South|East|West)\\s+[A-Za-z][A-Za-z0-9.#'\\-]+(?:\\s+(?!${itemStopWords}\\b)[A-Za-z][A-Za-z0-9.#'\\-]+){0,2})\\b`,
+    "i",
+  );
+  const simpleStreetPattern = new RegExp(
+    `\\b(\\d{1,6}\\s+[A-Za-z][A-Za-z0-9.#'\\-]+(?:\\s+(?!${itemStopWords}\\b)[A-Za-z][A-Za-z0-9.#'\\-]+){0,2})\\b`,
+    "i",
+  );
+  const fullStreetPattern =
+    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,5}\s(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy|Route|Rt)\.?)\b/i;
+
+  for (const text of candidates) {
+    const match =
+      text.match(fullStreetPattern) ||
+      text.match(directionalStreetPattern) ||
+      text.match(simpleStreetPattern);
+    const candidate = normalizeRoadAbbreviation(match?.[1] || "");
+    if (candidate && hasHouseNumberPrefix(candidate)) {
       return candidate;
     }
   }
 
-  return '';
+  return "";
 }
 
 function extractExactAddressFromText(value) {
   const text = cleanAddressFragment(value)
-    .replace(/\b(?:location|address|sale address|located at)\s*:?\s*/gi, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\b(?:location|address|sale address|located at)\s*:?\s*/gi, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
   if (!text) {
-    return { street: '', city: '', state: '', zip: '', addressLabel: '' };
+    return { street: "", city: "", state: "", zip: "", addressLabel: "" };
   }
 
   const streetSuffix =
-    '(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)';
+    "(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)";
 
   const exactPattern = new RegExp(
-    "\\b((?:\\d+[A-Za-z]\\d+|\\d+[A-Za-z]?|\\d+-\\d+)\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z0-9.#'\\-]+(?:\\s+[A-Za-z0-9.#'\\-]+){0,7}\\s" +
+    "\b((?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,7}\s" +
       streetSuffix +
-      "\\.?)(?:,)?\\s+([A-Za-z][A-Za-z .'\\-]{1,40}?)(?:,)?\\s+([A-Z]{2})\\s*(\\d{5}(?:-\\d{4})?)?\\b",
-    'i',
+      "\.?)(?:,)?\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:,)?\s+([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?\b",
+    "i",
   );
 
   const exactMatch = text.match(exactPattern);
@@ -278,7 +735,7 @@ function extractExactAddressFromText(value) {
     const street = normalizeRoadAbbreviation(exactMatch[1]);
     const city = cleanAddressFragment(exactMatch[2]);
     const state = cleanAddressFragment(exactMatch[3]).toUpperCase();
-    const zip = cleanAddressFragment(exactMatch[4] || '');
+    const zip = cleanAddressFragment(exactMatch[4] || "");
 
     if (looksLikeRealStreetAddress(street) && isLikelyCityLabel(city)) {
       return {
@@ -295,42 +752,42 @@ function extractExactAddressFromText(value) {
   if (streetOnly && looksLikeRealStreetAddress(streetOnly)) {
     return {
       street: normalizeRoadAbbreviation(streetOnly),
-      city: '',
-      state: '',
-      zip: '',
+      city: "",
+      state: "",
+      zip: "",
       addressLabel: normalizeRoadAbbreviation(streetOnly),
     };
   }
 
-  return { street: '', city: '', state: '', zip: '', addressLabel: '' };
+  return { street: "", city: "", state: "", zip: "", addressLabel: "" };
 }
 
 function buildAddressLabel(parts) {
   const cleanParts = parts
     .map((part) =>
-      String(part || '')
-        .replace(/\s+/g, ' ')
+      String(part || "")
+        .replace(/\s+/g, " ")
         .trim(),
     )
     .filter(Boolean);
 
-  return cleanParts.join(', ').replace(/,\s*,/g, ', ').trim();
+  return cleanParts.join(", ").replace(/,\s*,/g, ", ").trim();
 }
 
 function parseMapAddressFromPage($, html) {
-  const htmlText = String(html || '');
+  const htmlText = String(html || "");
 
   const directCandidates = [
-    $('.mapaddress').first().text().trim(),
-    $('[data-mapaddress]').first().attr('data-mapaddress'),
+    $(".mapaddress").first().text().trim(),
+    $("[data-mapaddress]").first().attr("data-mapaddress"),
     $('[itemprop="streetAddress"]').first().text().trim(),
-    $('[itemprop="streetAddress"]').first().attr('content'),
-    $('meta[property="og:street-address"]').attr('content'),
-    $('meta[name="geo.placename"]').attr('content'),
+    $('[itemprop="streetAddress"]').first().attr("content"),
+    $('meta[property="og:street-address"]').attr("content"),
+    $('meta[name="geo.placename"]').attr("content"),
   ].filter(Boolean);
 
   for (const candidate of directCandidates) {
-    const cleaned = String(candidate || '').trim();
+    const cleaned = String(candidate || "").trim();
     if (cleaned) return cleaned;
   }
 
@@ -345,41 +802,41 @@ function parseMapAddressFromPage($, html) {
     const match = htmlText.match(pattern);
     if (match && match[1]) {
       const cleaned = String(match[1])
-        .replace(/\\u002F/gi, '/')
-        .replace(/\\u0026/gi, '&')
+        .replace(/\\u002F/gi, "/")
+        .replace(/\\u0026/gi, "&")
         .replace(/\\"/g, '"')
         .trim();
       if (cleaned) return cleaned;
     }
   }
 
-  return '';
+  return "";
 }
 
 function cleanAddressFragment(value) {
-  return String(value || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .replace(/[,:;.-]+$/g, '')
+  return String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[,:;.-]+$/g, "")
     .trim();
 }
 
 function normalizeRoadAbbreviation(value) {
-  return String(value || '')
-    .replace(/\bSt\.?\b/gi, 'Street')
-    .replace(/\bRd\.?\b/gi, 'Road')
-    .replace(/\bDr\.?\b/gi, 'Drive')
-    .replace(/\bLn\.?\b/gi, 'Lane')
-    .replace(/\bCt\.?\b/gi, 'Court')
-    .replace(/\bCir\.?\b/gi, 'Circle')
-    .replace(/\bBlvd\.?\b/gi, 'Boulevard')
-    .replace(/\bPkwy\.?\b/gi, 'Parkway')
-    .replace(/\bPl\.?\b/gi, 'Place')
-    .replace(/\bTer\.?\b/gi, 'Terrace')
-    .replace(/\bTrl\.?\b/gi, 'Trail')
-    .replace(/\bHwy\.?\b/gi, 'Highway')
-    .replace(/\s+/g, ' ')
+  return String(value || "")
+    .replace(/\bSt\.?\b/gi, "Street")
+    .replace(/\bRd\.?\b/gi, "Road")
+    .replace(/\bDr\.?\b/gi, "Drive")
+    .replace(/\bLn\.?\b/gi, "Lane")
+    .replace(/\bCt\.?\b/gi, "Court")
+    .replace(/\bCir\.?\b/gi, "Circle")
+    .replace(/\bBlvd\.?\b/gi, "Boulevard")
+    .replace(/\bPkwy\.?\b/gi, "Parkway")
+    .replace(/\bPl\.?\b/gi, "Place")
+    .replace(/\bTer\.?\b/gi, "Terrace")
+    .replace(/\bTrl\.?\b/gi, "Trail")
+    .replace(/\bHwy\.?\b/gi, "Highway")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -387,40 +844,18 @@ function normalizeNearAddressText(value) {
   return cleanAddressFragment(value)
     .replace(
       /\s*\((?:church on corner|corner|near corner|by park|park district).*?\)\s*/gi,
-      ' ',
+      " ",
     )
-    .replace(/\bnear\s+near\b/gi, 'near')
-    .replace(/\s*&\s*/g, ' & ')
-    .replace(/\s+/g, ' ')
+    .replace(/\bnear\s+near\b/gi, "near")
+    .replace(/\s*&\s*/g, " & ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
 function hasHouseNumberPrefix(value) {
   const text = cleanAddressFragment(value);
-  return /^(?:\d+[A-Za-z]+\d+|\d+[A-Za-z]?|\d+-\d+)\b/i.test(text);
+  return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\b/i.test(text);
 }
-function hasYearLikeHouseNumberPrefix(value) {
-  const text = cleanAddressFragment(value);
-  const match = text.match(/^(19\d{2}|20\d{2})\b/);
-  return Boolean(match);
-}
-
-function hasRoadSuffix(value) {
-  return /\b(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy|Route|Rt)\b/i.test(
-    String(value || ''),
-  );
-}
-
-function looksLikeSaleItemNotAddress(value) {
-  const text = cleanAddressFragment(value).toLowerCase();
-  if (!text) return false;
-  if (/^\d+\s*(?:month|months|mo|mos|yr|yrs|year|years|t|x|xl|xxl|inch|inches|cm|mm)\b/i.test(text)) return true;
-  if (/^\d+\s+years?\s+old\b/i.test(text)) return true;
-  if (/^\d+\s*(?:books?|clothing|clothes|shoes?|toys?|comics?|records?|dvds?|cds?|watches?|games?)\b/i.test(text)) return true;
-  if (/\b(?:boys?|girls?|children|kids?|toddler|baby|women|womens|men|mens|clothing|clothes|shoes?|books?|toys?|coach|skecher|madden|toms|comics?|watches?)\b/i.test(text) && !hasRoadSuffix(text)) return true;
-  return false;
-}
-
 
 function isLikelyStreetName(value) {
   const text = normalizeRoadAbbreviation(value);
@@ -434,7 +869,7 @@ function isLikelyStreetName(value) {
     return true;
   }
 
-  return /^(?:\d+[A-Za-z]+\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,5}$/i.test(
+  return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,5}$/i.test(
     text,
   );
 }
@@ -464,15 +899,15 @@ function isLikelyCityLabel(value) {
 function parseCityStateZip(value) {
   const text = cleanAddressFragment(value);
   if (!text) {
-    return { city: '', state: '', zip: '' };
+    return { city: "", state: "", zip: "" };
   }
 
   const zipMatch = text.match(/\b(\d{5})(?:-\d{4})?\b/);
-  const zip = zipMatch ? zipMatch[1] : '';
+  const zip = zipMatch ? zipMatch[1] : "";
 
   let withoutZip = text
-    .replace(/\b\d{5}(?:-\d{4})?\b/g, '')
-    .replace(/\s+/g, ' ')
+    .replace(/\b\d{5}(?:-\d{4})?\b/g, "")
+    .replace(/\s+/g, " ")
     .trim();
 
   const cityStateMatch = withoutZip.match(/^(.+?),\s*([A-Z]{2})$/);
@@ -494,8 +929,8 @@ function parseCityStateZip(value) {
   }
 
   return {
-    city: isLikelyCityLabel(withoutZip) ? withoutZip : '',
-    state: '',
+    city: isLikelyCityLabel(withoutZip) ? withoutZip : "",
+    state: "",
     zip,
   };
 }
@@ -504,19 +939,19 @@ function splitNearAddress(rawValue) {
   const text = normalizeNearAddressText(rawValue);
   if (!text) {
     return {
-      street: '',
-      crossStreet: '',
-      raw: '',
+      street: "",
+      crossStreet: "",
+      raw: "",
     };
   }
 
   if (/^near\s+/i.test(text)) {
     const crossStreetOnly = normalizeRoadAbbreviation(
-      text.replace(/^near\s+/i, ''),
+      text.replace(/^near\s+/i, ""),
     );
     return {
-      street: '',
-      crossStreet: isLikelyCrossStreet(crossStreetOnly) ? crossStreetOnly : '',
+      street: "",
+      crossStreet: isLikelyCrossStreet(crossStreetOnly) ? crossStreetOnly : "",
       raw: text,
     };
   }
@@ -533,7 +968,7 @@ function splitNearAddress(rawValue) {
     if (leftHasHouseNumber && leftLooksStreet) {
       return {
         street: left,
-        crossStreet: rightLooksStreet ? right : '',
+        crossStreet: rightLooksStreet ? right : "",
         raw: text,
       };
     }
@@ -551,15 +986,15 @@ function splitNearAddress(rawValue) {
 
     if (!leftHasHouseNumber && rightLooksStreet) {
       return {
-        street: '',
+        street: "",
         crossStreet: right,
         raw: text,
       };
     }
 
     return {
-      street: '',
-      crossStreet: '',
+      street: "",
+      crossStreet: "",
       raw: text,
     };
   }
@@ -567,8 +1002,8 @@ function splitNearAddress(rawValue) {
   const street = normalizeRoadAbbreviation(text);
   return {
     street:
-      isLikelyStreetName(street) && hasHouseNumberPrefix(street) ? street : '',
-    crossStreet: '',
+      isLikelyStreetName(street) && hasHouseNumberPrefix(street) ? street : "",
+    crossStreet: "",
     raw: text,
   };
 }
@@ -577,8 +1012,8 @@ function buildMapsQuery(parts) {
   return parts
     .map((part) => cleanAddressFragment(part))
     .filter(Boolean)
-    .join(', ')
-    .replace(/,\s*,/g, ', ')
+    .join(", ")
+    .replace(/,\s*,/g, ", ")
     .trim();
 }
 
@@ -587,82 +1022,124 @@ function getDefaultCityFromContext({
   title,
   mapAddress,
   approximateAddress,
-  bodyText,
-  locationDetail,
 }) {
   const combined = [
     cleanAddressFragment(hood),
     cleanAddressFragment(title),
     cleanAddressFragment(mapAddress),
     cleanAddressFragment(approximateAddress),
-    cleanAddressFragment(bodyText),
-    cleanAddressFragment(locationDetail),
   ]
     .filter(Boolean)
-    .join(' ')
+    .join(" ")
     .toLowerCase();
 
-  if (combined.includes('carillon lakes')) return 'Crest Hill';
-  if (combined.includes('crest hill')) return 'Crest Hill';
-  if (combined.includes('lemont')) return 'Lemont';
-  if (combined.includes('woodridge')) return 'Woodridge';
-  if (combined.includes('downers grove')) return 'Downers Grove';
-  if (combined.includes('bolingbrook')) return 'Bolingbrook';
-  if (combined.includes('romeoville')) return 'Romeoville';
-  if (combined.includes('naperville')) return 'Naperville';
-  if (combined.includes('plainfield')) return 'Plainfield';
-  if (combined.includes('darien')) return 'Darien';
-  if (combined.includes('lisle')) return 'Lisle';
-  if (combined.includes('aurora')) return 'Aurora';
-  if (combined.includes('oswego')) return 'Oswego';
-  if (combined.includes('wheaton')) return 'Wheaton';
-  if (combined.includes('lockport')) return 'Lockport';
-  if (combined.includes('yorkville')) return 'Yorkville';
+  if (combined.includes("carillon lakes")) return "Crest Hill";
+  if (combined.includes("crest hill")) return "Crest Hill";
+  if (combined.includes("lemont")) return "Lemont";
+  if (combined.includes("woodridge")) return "Woodridge";
+  if (combined.includes("downers grove")) return "Downers Grove";
+  if (combined.includes("bolingbrook")) return "Bolingbrook";
+  if (combined.includes("romeoville")) return "Romeoville";
+  if (combined.includes("naperville")) return "Naperville";
+  if (combined.includes("plainfield")) return "Plainfield";
+  if (combined.includes("darien")) return "Darien";
+  if (combined.includes("lisle")) return "Lisle";
 
-  return '';
+  return "";
 }
 
-
 const CITY_FALLBACK_COORDINATES = {
-  aurora: { latitude: 41.7606, longitude: -88.3201, label: 'Aurora, IL' },
-  bolingbrook: { latitude: 41.6986, longitude: -88.0684, label: 'Bolingbrook, IL' },
-  'carillon lakes': { latitude: 41.5578, longitude: -88.1120, label: 'Crest Hill, IL' },
-  'carol stream': { latitude: 41.9125, longitude: -88.1348, label: 'Carol Stream, IL' },
-  'crest hill': { latitude: 41.5548, longitude: -88.0987, label: 'Crest Hill, IL' },
-  darien: { latitude: 41.7456, longitude: -87.9784, label: 'Darien, IL' },
-  'downers grove': { latitude: 41.8089, longitude: -88.0112, label: 'Downers Grove, IL' },
-  elmhurst: { latitude: 41.8995, longitude: -87.9403, label: 'Elmhurst, IL' },
-  lemont: { latitude: 41.6736, longitude: -88.0017, label: 'Lemont, IL' },
-  lisle: { latitude: 41.8011, longitude: -88.0748, label: 'Lisle, IL' },
-  lockport: { latitude: 41.5895, longitude: -88.0578, label: 'Lockport, IL' },
-  naperville: { latitude: 41.7508, longitude: -88.1535, label: 'Naperville, IL' },
-  'north aurora': { latitude: 41.8061, longitude: -88.3273, label: 'North Aurora, IL' },
-  oswego: { latitude: 41.6828, longitude: -88.3515, label: 'Oswego, IL' },
-  plainfield: { latitude: 41.6322, longitude: -88.2120, label: 'Plainfield, IL' },
-  'river forest': { latitude: 41.8978, longitude: -87.8139, label: 'River Forest, IL' },
-  romeoville: { latitude: 41.6475, longitude: -88.0895, label: 'Romeoville, IL' },
-  streamwood: { latitude: 42.0256, longitude: -88.1784, label: 'Streamwood, IL' },
-  wheaton: { latitude: 41.8661, longitude: -88.1070, label: 'Wheaton, IL' },
-  willowbrook: { latitude: 41.7698, longitude: -87.9359, label: 'Willowbrook, IL' },
-  woodridge: { latitude: 41.7469, longitude: -88.0503, label: 'Woodridge, IL' },
-  yorkville: { latitude: 41.6411, longitude: -88.4473, label: 'Yorkville, IL' },
-  'west chicagoland': { latitude: 41.8011, longitude: -88.0748, label: 'West Chicagoland, IL' },
+  aurora: { latitude: 41.7606, longitude: -88.3201, label: "Aurora, IL" },
+  bolingbrook: {
+    latitude: 41.6986,
+    longitude: -88.0684,
+    label: "Bolingbrook, IL",
+  },
+  "carillon lakes": {
+    latitude: 41.5578,
+    longitude: -88.112,
+    label: "Crest Hill, IL",
+  },
+  "carol stream": {
+    latitude: 41.9125,
+    longitude: -88.1348,
+    label: "Carol Stream, IL",
+  },
+  "crest hill": {
+    latitude: 41.5548,
+    longitude: -88.0987,
+    label: "Crest Hill, IL",
+  },
+  darien: { latitude: 41.7456, longitude: -87.9784, label: "Darien, IL" },
+  "downers grove": {
+    latitude: 41.8089,
+    longitude: -88.0112,
+    label: "Downers Grove, IL",
+  },
+  elmhurst: { latitude: 41.8995, longitude: -87.9403, label: "Elmhurst, IL" },
+  lemont: { latitude: 41.6736, longitude: -88.0017, label: "Lemont, IL" },
+  lisle: { latitude: 41.8011, longitude: -88.0748, label: "Lisle, IL" },
+  lockport: { latitude: 41.5895, longitude: -88.0578, label: "Lockport, IL" },
+  naperville: {
+    latitude: 41.7508,
+    longitude: -88.1535,
+    label: "Naperville, IL",
+  },
+  "north aurora": {
+    latitude: 41.8061,
+    longitude: -88.3273,
+    label: "North Aurora, IL",
+  },
+  oswego: { latitude: 41.6828, longitude: -88.3515, label: "Oswego, IL" },
+  plainfield: {
+    latitude: 41.6322,
+    longitude: -88.212,
+    label: "Plainfield, IL",
+  },
+  "river forest": {
+    latitude: 41.8978,
+    longitude: -87.8139,
+    label: "River Forest, IL",
+  },
+  romeoville: {
+    latitude: 41.6475,
+    longitude: -88.0895,
+    label: "Romeoville, IL",
+  },
+  streamwood: {
+    latitude: 42.0256,
+    longitude: -88.1784,
+    label: "Streamwood, IL",
+  },
+  wheaton: { latitude: 41.8661, longitude: -88.107, label: "Wheaton, IL" },
+  willowbrook: {
+    latitude: 41.7698,
+    longitude: -87.9359,
+    label: "Willowbrook, IL",
+  },
+  woodridge: { latitude: 41.7469, longitude: -88.0503, label: "Woodridge, IL" },
+  yorkville: { latitude: 41.6411, longitude: -88.4473, label: "Yorkville, IL" },
+  "west chicagoland": {
+    latitude: 41.8011,
+    longitude: -88.0748,
+    label: "West Chicagoland, IL",
+  },
 };
 
 function normalizeCityLookupKey(value) {
-  return String(value || '')
+  return String(value || "")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
 function escapeRegExp(value) {
-  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function findFallbackCityCoordinates(...values) {
-  const combined = normalizeCityLookupKey(values.filter(Boolean).join(' '));
+  const combined = normalizeCityLookupKey(values.filter(Boolean).join(" "));
   if (!combined) return null;
 
   // Prefer the longest city names first so "north aurora" wins before "aurora".
@@ -672,7 +1149,10 @@ function findFallbackCityCoordinates(...values) {
 
   for (const [cityKey, coords] of entries) {
     const normalizedCityKey = normalizeCityLookupKey(cityKey);
-    const cityPattern = escapeRegExp(normalizedCityKey).replace(/\\s+/g, '\\s+');
+    const cityPattern = escapeRegExp(normalizedCityKey).replace(
+      /\\s+/g,
+      "\\s+",
+    );
     if (new RegExp(`(^|\\s)${cityPattern}(\\s|$)`).test(combined)) {
       return { ...coords, cityKey };
     }
@@ -703,18 +1183,17 @@ function getFallbackCoordinatesForSale({
   );
 }
 
-
 function isGenericCraigslistRegion(value) {
   const text = normalizeCityLookupKey(value);
   if (!text) return false;
   return [
-    'west chicagoland',
-    'north chicagoland',
-    'south chicagoland',
-    'northwest suburbs',
-    'western suburbs',
-    'southwest suburbs',
-    'chicago suburbs',
+    "west chicagoland",
+    "north chicagoland",
+    "south chicagoland",
+    "northwest suburbs",
+    "western suburbs",
+    "southwest suburbs",
+    "chicago suburbs",
   ].includes(text);
 }
 
@@ -788,6 +1267,7 @@ function buildFinalAddressData({
   fallbackAddressLabel,
   bodyText,
   locationDetail,
+  area,
 }) {
   const cleanMapAddress = normalizeNearAddressText(mapAddress);
   const cleanApproximateAddress = normalizeNearAddressText(approximateAddress);
@@ -797,135 +1277,117 @@ function buildFinalAddressData({
   const cleanLocationDetail = cleanAddressFragment(locationDetail);
 
   const titleStreet = cleanAddressFragment(
-    extractStreetAddressFromText(stripDateNoiseFromText(title)),
+    extractStreetAddressFromSaleTitle(title) ||
+      extractStreetAddressFromText(stripDateNoiseFromText(title)),
   );
 
-  // Craigslist's best human-facing location is the text directly under the map
-  // on the ad detail page (the circled spot in the user's screenshots). Use that
-  // before scanning the ad body, because the body can contain item/size text like
-  // "24 month" or "8 and 10" that looks address-ish but is not the sale address.
-  const mapExactAddress = extractExactAddressFromText(cleanMapAddress);
-  const mapParts = splitNearAddress(cleanMapAddress);
-  const mapHasUsableAddress = Boolean(
-    mapExactAddress.street || mapParts.street || mapParts.crossStreet,
-  );
-
+  // Prefer a complete street/city/state/ZIP found in the posting body.
+  // Craigslist often shows a vague map label like "Bradford near Hull" while
+  // the seller writes the exact address in the body.
   const locationExactAddress = extractExactAddressFromText(cleanLocationDetail);
   const bodyExactAddress = extractExactAddressFromText(cleanBodyText);
   const exactBodyAddress = locationExactAddress.addressLabel
     ? locationExactAddress
     : bodyExactAddress;
 
+  const mapParts = splitNearAddress(cleanMapAddress);
   const approxParts = splitNearAddress(cleanApproximateAddress);
   const hoodParts = parseCityStateZip(cleanHood);
 
   const trustedTitleStreet =
     hasHouseNumberPrefix(titleStreet) && looksLikeRealStreetAddress(titleStreet)
       ? normalizeRoadAbbreviation(titleStreet)
-      : '';
+      : "";
 
   const street =
-    mapExactAddress.street ||
+    exactBodyAddress.street ||
     mapParts.street ||
-    (!mapHasUsableAddress ? exactBodyAddress.street : '') ||
     trustedTitleStreet ||
     approxParts.street ||
-    '';
+    "";
 
-  const crossStreet =
-    mapExactAddress.street || mapParts.street || exactBodyAddress.street
-      ? mapParts.crossStreet || ''
-      : approxParts.crossStreet || '';
+  const crossStreet = exactBodyAddress.street
+    ? ""
+    : mapParts.crossStreet || approxParts.crossStreet || "";
 
   const contextualCity = getDefaultCityFromContext({
     hood: cleanHood,
     title,
     mapAddress: cleanMapAddress,
     approximateAddress: cleanApproximateAddress,
-    bodyText: cleanBodyText,
-    locationDetail: cleanLocationDetail,
   });
 
   const inferredCity =
-    mapExactAddress.city ||
-    (!mapHasUsableAddress ? exactBodyAddress.city : '') ||
+    exactBodyAddress.city ||
     contextualCity ||
-    (isGenericCraigslistRegion(cleanHood) ? '' : hoodParts.city);
+    (isGenericCraigslistRegion(cleanHood) ? "" : hoodParts.city);
 
   const city =
     inferredCity ||
     (!street && !crossStreet && isLikelyCityLabel(cleanMapAddress)
       ? cleanMapAddress
-      : '') ||
+      : "") ||
     (!street && !crossStreet && isLikelyCityLabel(cleanApproximateAddress)
       ? cleanApproximateAddress
-      : '');
+      : "");
+
+  const defaultAreaCity = getDefaultCityForArea(area);
+  const cityWithAreaFallback =
+    city || (street || crossStreet ? defaultAreaCity : "");
 
   const state =
-    mapExactAddress.state ||
-    (!mapHasUsableAddress ? exactBodyAddress.state : '') ||
-    hoodParts.state ||
-    'IL';
-  const zip =
-    mapExactAddress.zip ||
-    (!mapHasUsableAddress ? exactBodyAddress.zip : '') ||
-    hoodParts.zip ||
-    '';
+    exactBodyAddress.state || hoodParts.state || getDefaultStateForArea(area);
+  const zip = exactBodyAddress.zip || hoodParts.zip || "";
 
-  const mapBasedAddress = buildMapsQuery([
+  const primaryAddress = buildMapsQuery([
     street,
-    crossStreet ? `near ${crossStreet}` : '',
-    city,
+    crossStreet ? `near ${crossStreet}` : "",
+    cityWithAreaFallback,
     state,
     zip,
   ]);
 
-  const displayAddress =
-    mapBasedAddress ||
-    mapExactAddress.addressLabel ||
-    (!mapHasUsableAddress ? exactBodyAddress.addressLabel : '') ||
+  const fallbackAddress =
     cleanMapAddress ||
     cleanApproximateAddress ||
     cleanHood ||
     cleanFallback ||
-    'Approximate location';
+    "Approximate location";
+
+  const displayAddress =
+    exactBodyAddress.addressLabel ||
+    (primaryAddress && primaryAddress !== state ? primaryAddress : "") ||
+    buildMapsQuery([fallbackAddress, cityWithAreaFallback, state, zip]) ||
+    fallbackAddress;
 
   const mapsQuery =
+    exactBodyAddress.addressLabel ||
     buildPreferredMapsQuery({
       street,
       crossStreet,
-      city,
+      cityWithAreaFallback,
       state,
       zip,
       mapAddress: cleanMapAddress,
       approximateAddress: cleanApproximateAddress,
       fallbackAddressLabel: cleanFallback,
-    }) ||
-    mapExactAddress.addressLabel ||
-    (!mapHasUsableAddress ? exactBodyAddress.addressLabel : '');
+    });
 
   return {
     street,
     crossStreet,
-    city,
+    city: cityWithAreaFallback,
     state,
     zip,
-    country: 'USA',
+    country: "USA",
     addressLabel: displayAddress,
     displayAddress,
     mapAddress:
-      buildMapsQuery([
-        street,
-        crossStreet ? `near ${crossStreet}` : '',
-        city,
-        state,
-        zip,
-      ]) ||
-      mapExactAddress.addressLabel ||
+      exactBodyAddress.addressLabel ||
       cleanMapAddress ||
       cleanApproximateAddress ||
       cleanHood ||
-      '',
+      "",
     mapsQuery: mapsQuery || displayAddress,
   };
 }
@@ -933,27 +1395,33 @@ function stripDateNoiseFromText(value) {
   return cleanAddressFragment(value)
     .replace(
       /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b\s*\d{1,2}(?:\s*[-/,]\s*\d{1,2})?(?:\s*,?\s*\d{2,4})?/gi,
-      ' ',
+      " ",
     )
-    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, ' ')
-    .replace(/\b\d{4}\b/g, ' ')
-    .replace(/\b\d{1,2}\s*(?:am|pm)\b/gi, ' ')
+    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, " ")
+    .replace(/\b\d{4}\b/g, " ")
+    .replace(/\b\d{1,2}\s*(?:am|pm)\b/gi, " ")
     .replace(
       /\b(?:today|tomorrow|thursday|friday|saturday|sunday|monday|tuesday|wednesday)\b/gi,
-      ' ',
+      " ",
     )
-    .replace(/\s+/g, ' ')
+    .replace(/\s+/g, " ")
     .trim();
 }
 
 function looksLikeRealStreetAddress(value) {
   const text = cleanAddressFragment(value);
   if (!text) return false;
-  if (looksLikeSaleItemNotAddress(text)) return false;
-  if (/\b(?:\d+[A-Za-z]+\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z]/.test(text) && hasRoadSuffix(text)) {
+  if (
+    /\b\d{1,6}\s+[A-Za-z]/.test(text) &&
+    /\b(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)\b/i.test(
+      text,
+    )
+  ) {
     return true;
   }
-  return /^(?:\d+[A-Za-z]+\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z][A-Za-z0-9.#'\-]*(?:\s+[A-Za-z0-9.#'\-]+){1,3}$/i.test(text);
+  return /^\d{1,6}\s+[A-Za-z][A-Za-z0-9.#'\-]*(?:\s+[A-Za-z0-9.#'\-]+){0,4}$/i.test(
+    text,
+  );
 }
 
 function buildBestAddressLabel({ mapAddress, title, hood }) {
@@ -969,7 +1437,7 @@ function buildBestAddressLabel({ mapAddress, title, hood }) {
     return buildAddressLabel([extractedStreet, hood]);
   }
 
-  return '';
+  return "";
 }
 
 function buildGeocodeCandidates({ mapAddress, addressLabel, hood, title }) {
@@ -1010,35 +1478,23 @@ async function geocodeWithFallbacks(candidates, area) {
     }
   }
 
-  return { latitude: null, longitude: null, approximateAddress: '' };
+  return { latitude: null, longitude: null, approximateAddress: "" };
 }
 
 const postingPageDetailCache = new Map();
 const approximateGeocodeCache = new Map();
 
 function getAreaGeocodeSuffix(area) {
-  switch (String(area || '').toLowerCase()) {
-    case 'milwaukee':
-      return 'Wisconsin, USA';
-    case 'madison':
-      return 'Wisconsin, USA';
-    case 'minneapolis':
-      return 'Minnesota, USA';
-    case 'indianapolis':
-      return 'Indiana, USA';
-    case 'chicago':
-    default:
-      return 'Illinois, USA';
-  }
+  return getAreaGeocodeSuffixFromRegion(area);
 }
 
 function buildApproximateGeocodeQuery(rawValue, area) {
-  const value = String(rawValue || '')
-    .replace(/[()]/g, ' ')
-    .replace(/\s+/g, ' ')
+  const value = String(rawValue || "")
+    .replace(/[()]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
-  if (!value) return '';
+  if (!value) return "";
 
   const suffix = getAreaGeocodeSuffix(area);
   if (value.toLowerCase().includes(suffix.toLowerCase())) {
@@ -1051,30 +1507,30 @@ function buildApproximateGeocodeQuery(rawValue, area) {
 async function geocodeApproximateLocation(rawValue, area) {
   const query = buildApproximateGeocodeQuery(rawValue, area);
   if (!query) {
-    return { latitude: null, longitude: null, approximateAddress: '' };
+    return { latitude: null, longitude: null, approximateAddress: "" };
   }
 
-  const cacheKey = `${String(area || '').toLowerCase()}::${query.toLowerCase()}`;
+  const cacheKey = `${String(area || "").toLowerCase()}::${query.toLowerCase()}`;
   if (approximateGeocodeCache.has(cacheKey)) {
     return approximateGeocodeCache.get(cacheKey);
   }
 
   try {
     const response = await axios.get(
-      'https://nominatim.openstreetmap.org/search',
+      "https://nominatim.openstreetmap.org/search",
       {
         timeout: 12000,
         params: {
           q: query,
-          format: 'jsonv2',
+          format: "jsonv2",
           limit: 1,
-          countrycodes: 'us',
+          countrycodes: "us",
           addressdetails: 1,
         },
         headers: {
-          'User-Agent': 'ListAssist/1.0 (garage-sale geocoder)',
-          Accept: 'application/json',
-          'Accept-Language': 'en-US,en;q=0.9',
+          "User-Agent": "ListAssist/1.0 (garage-sale geocoder)",
+          Accept: "application/json",
+          "Accept-Language": "en-US,en;q=0.9",
         },
         validateStatus: () => true,
       },
@@ -1088,7 +1544,7 @@ async function geocodeApproximateLocation(rawValue, area) {
       const fallback = {
         latitude: null,
         longitude: null,
-        approximateAddress: '',
+        approximateAddress: "",
       };
       approximateGeocodeCache.set(cacheKey, fallback);
       return fallback;
@@ -1110,7 +1566,7 @@ async function geocodeApproximateLocation(rawValue, area) {
     const fallback = {
       latitude: null,
       longitude: null,
-      approximateAddress: '',
+      approximateAddress: "",
     };
     approximateGeocodeCache.set(cacheKey, fallback);
     return fallback;
@@ -1118,10 +1574,10 @@ async function geocodeApproximateLocation(rawValue, area) {
 }
 
 function normalizeTimingText(value) {
-  return String(value || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/\s+/g, ' ')
+  return String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -1130,19 +1586,19 @@ function extractCraigslistAttributeText($) {
   // "dates: friday 2026-05-01 saturday 2026-05-02 start time: 10".
   // Keep this separate from the body so date/time parsing sees it clearly.
   try {
-    return $('.attrgroup, .mapaddress, .postingtitletext')
+    return $(".attrgroup, .mapaddress, .postingtitletext")
       .toArray()
       .map((node) => $(node).text())
-      .join(' ')
-      .replace(/\s+/g, ' ')
+      .join(" ")
+      .replace(/\s+/g, " ")
       .trim();
   } catch (_error) {
-    return '';
+    return "";
   }
 }
 
 function monthNameToIndex(value) {
-  const text = String(value || '')
+  const text = String(value || "")
     .trim()
     .toLowerCase();
   const months = {
@@ -1201,59 +1657,66 @@ function buildSaleDateValue({ month, day, year }, referenceDate) {
 }
 
 function formatSaleDateLabel(date) {
-  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "";
   return `${date.getMonth() + 1}/${date.getDate()}/${date.getFullYear()}`;
 }
 
 function formatSaleDayLabel(date) {
-  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
-  return date.toLocaleDateString('en-US', { weekday: 'long' });
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString("en-US", { weekday: "long" });
 }
 
-
 function dateKeyFromDate(date) {
-  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "";
   const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
 
 function dateFromDateKey(dateKey) {
-  const match = String(dateKey || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const match = String(dateKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return null;
-  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 9, 0, 0, 0);
+  const date = new Date(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    9,
+    0,
+    0,
+    0,
+  );
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function formatSaleDateKeyLabel(dateKey) {
   const date = dateFromDateKey(dateKey);
-  return date ? formatSaleDateLabel(date) : '';
+  return date ? formatSaleDateLabel(date) : "";
 }
 
 function formatSaleDateKeyDayLabel(dateKey) {
   const date = dateFromDateKey(dateKey);
-  return date ? formatSaleDayLabel(date) : '';
-}
-
-function formatTargetDayLabel(day, targetDateKey = '') {
-  if (day === 'today') return 'Today';
-  if (day === 'tomorrow') return 'Tomorrow';
-  if (day === 'dayaftertomorrow') {
-    return formatSaleDateKeyDayLabel(targetDateKey) || formatSaleDayLabel(new Date(Date.now() + 2 * 24 * 60 * 60 * 1000));
-  }
-  return '';
+  return date ? formatSaleDayLabel(date) : "";
 }
 
 function uniqueDateKeysList(values) {
-  return [...new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean))].sort();
+  return [
+    ...new Set(
+      (values || []).map((value) => String(value || "").trim()).filter(Boolean),
+    ),
+  ].sort();
 }
 
-function saleDateKeysFromSearchRow({ title, metaText, hood, dateText }, referenceDate) {
+function saleDateKeysFromSearchRow(
+  { title, metaText, hood, dateText },
+  referenceDate,
+) {
   const searchText = [title, metaText, hood, dateText]
     .filter(Boolean)
-    .join(' ');
-  return extractSaleDatesFromText(searchText, referenceDate).map(dateKeyFromDate);
+    .join(" ");
+  return extractSaleDatesFromText(searchText, referenceDate).map(
+    dateKeyFromDate,
+  );
 }
 
 function uniqueDates(dates) {
@@ -1294,12 +1757,17 @@ function extractSaleDatesFromText(text, referenceDate) {
   // "friday 2026-05-01" / "saturday 2026-05-02" in the right rail.
   // The old parser only understood text dates and numeric dates, so those
   // structured ISO dates could be missed or misread as a future weekday.
-  for (const isoMatch of haystack.matchAll(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/g)) {
-    const parsed = buildSaleDateValue({
-      month: Number(isoMatch[2]) - 1,
-      day: Number(isoMatch[3]),
-      year: Number(isoMatch[1]),
-    }, ref);
+  for (const isoMatch of haystack.matchAll(
+    /\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/g,
+  )) {
+    const parsed = buildSaleDateValue(
+      {
+        month: Number(isoMatch[2]) - 1,
+        day: Number(isoMatch[3]),
+        year: Number(isoMatch[1]),
+      },
+      ref,
+    );
     if (parsed) dates.push(parsed);
   }
 
@@ -1323,26 +1791,39 @@ function extractSaleDatesFromText(text, referenceDate) {
     sat: 6,
   };
 
-  for (const weekdayMatch of haystack.matchAll(/\b(sun(?:day)?|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?)\b/gi)) {
+  for (const weekdayMatch of haystack.matchAll(
+    /\b(sun(?:day)?|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?)\b/gi,
+  )) {
     const key = weekdayMatch[1].toLowerCase();
     const dayIndex = weekdayIndexes[key];
-    if (Number.isFinite(dayIndex)) dates.push(nextDateForWeekday(dayIndex, ref));
+    if (Number.isFinite(dayIndex))
+      dates.push(nextDateForWeekday(dayIndex, ref));
   }
 
-  for (const monthMatch of haystack.matchAll(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*(?:-|–|to|through|thru|and|&)\s*(\d{1,2})(?:st|nd|rd|th)?)?(?:\s*,?\s*(\d{2,4}))?/gi)) {
+  for (const monthMatch of haystack.matchAll(
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*(?:-|–|to|through|thru|and|&)\s*(\d{1,2})(?:st|nd|rd|th)?)?(?:\s*,?\s*(\d{2,4}))?/gi,
+  )) {
     const monthIndex = monthNameToIndex(monthMatch[1]);
     const firstDay = Number(monthMatch[2]);
     const secondDay = monthMatch[3] ? Number(monthMatch[3]) : null;
     const year = monthMatch[4] ? Number(monthMatch[4]) : null;
-    const first = buildSaleDateValue({ month: monthIndex, day: firstDay, year }, ref);
+    const first = buildSaleDateValue(
+      { month: monthIndex, day: firstDay, year },
+      ref,
+    );
     if (first) dates.push(first);
     if (Number.isFinite(secondDay)) {
-      const second = buildSaleDateValue({ month: monthIndex, day: secondDay, year }, ref);
+      const second = buildSaleDateValue(
+        { month: monthIndex, day: secondDay, year },
+        ref,
+      );
       if (second) dates.push(second);
     }
   }
 
-  for (const numericMatch of haystack.matchAll(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/g)) {
+  for (const numericMatch of haystack.matchAll(
+    /\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/g,
+  )) {
     const month = Number(numericMatch[1]) - 1;
     const day = Number(numericMatch[2]);
     const year = numericMatch[3] ? Number(numericMatch[3]) : null;
@@ -1356,8 +1837,8 @@ function extractSaleDatesFromText(text, referenceDate) {
 function normalizeClockLabel(hours, minutes, meridiem) {
   const numericHours = Number(hours);
   const numericMinutes = Number(minutes || 0);
-  const mm = String(numericMinutes).padStart(2, '0');
-  const suffix = meridiem ? ` ${String(meridiem).toUpperCase()}` : '';
+  const mm = String(numericMinutes).padStart(2, "0");
+  const suffix = meridiem ? ` ${String(meridiem).toUpperCase()}` : "";
 
   if (numericMinutes === 0) {
     return `${numericHours}${suffix}`;
@@ -1369,46 +1850,46 @@ function inferGarageSaleMeridiem(hour, role, pairedHour) {
   const numericHour = Number(hour);
   const numericPair = Number(pairedHour);
 
-  if (!Number.isFinite(numericHour)) return '';
-  if (numericHour >= 12) return 'PM';
+  if (!Number.isFinite(numericHour)) return "";
+  if (numericHour >= 12) return "PM";
 
-  if (role === 'start') {
-    if (numericHour >= 5 && numericHour <= 11) return 'AM';
+  if (role === "start") {
+    if (numericHour >= 5 && numericHour <= 11) return "AM";
     if (
       numericHour >= 1 &&
       numericHour <= 4 &&
       Number.isFinite(numericPair) &&
       numericPair <= 7
     )
-      return 'PM';
-    return 'AM';
+      return "PM";
+    return "AM";
   }
 
-  if (role === 'end') {
-    if (numericHour >= 1 && numericHour <= 7) return 'PM';
-    if (numericHour >= 8 && numericHour <= 11) return 'AM';
-    return 'PM';
+  if (role === "end") {
+    if (numericHour >= 1 && numericHour <= 7) return "PM";
+    if (numericHour >= 8 && numericHour <= 11) return "AM";
+    return "PM";
   }
 
-  if (numericHour >= 5 && numericHour <= 11) return 'AM';
-  if (numericHour >= 1 && numericHour <= 7) return 'PM';
-  return '';
+  if (numericHour >= 5 && numericHour <= 11) return "AM";
+  if (numericHour >= 1 && numericHour <= 7) return "PM";
+  return "";
 }
 
 function normalizeTimeMatchToLabel(match, options = {}) {
   const startHours = Number(match[1]);
   const startMinutes = Number(match[2] || 0);
-  const rawStartMeridiem = String(match[3] || '').toUpperCase();
+  const rawStartMeridiem = String(match[3] || "").toUpperCase();
   const endHours = Number(match[4]);
   const endMinutes = Number(match[5] || 0);
-  const rawEndMeridiem = String(match[6] || '').toUpperCase();
+  const rawEndMeridiem = String(match[6] || "").toUpperCase();
 
   const startMeridiem =
-    rawStartMeridiem || inferGarageSaleMeridiem(startHours, 'start', endHours);
+    rawStartMeridiem || inferGarageSaleMeridiem(startHours, "start", endHours);
   const endMeridiem =
     rawEndMeridiem ||
     rawStartMeridiem ||
-    inferGarageSaleMeridiem(endHours, 'end', startHours);
+    inferGarageSaleMeridiem(endHours, "end", startHours);
 
   const startTime = normalizeClockLabel(
     startHours,
@@ -1417,22 +1898,22 @@ function normalizeTimeMatchToLabel(match, options = {}) {
   );
   const endTime = Number.isFinite(endHours)
     ? normalizeClockLabel(endHours, endMinutes, endMeridiem)
-    : '';
+    : "";
 
   return {
     startTime,
     endTime,
     timeLabel: endTime ? `${startTime} - ${endTime}` : startTime,
-    timePattern: options.timePattern || 'time_range',
+    timePattern: options.timePattern || "time_range",
   };
 }
 
 function extractSaleTimeLabel(text) {
   const haystack = normalizeTimingText(text)
-    .replace(/\bnoon\b/gi, '12 PM')
-    .replace(/\bmidnight\b/gi, '12 AM');
+    .replace(/\bnoon\b/gi, "12 PM")
+    .replace(/\bmidnight\b/gi, "12 AM");
   if (!haystack)
-    return { timeLabel: '', endTime: '', startTime: '', timePattern: '' };
+    return { timeLabel: "", endTime: "", startTime: "", timePattern: "" };
 
   // Craigslist often renders this as "start time: 8:30 am" near the
   // bottom of the posting. Prefer that labeled value when present so we do
@@ -1442,13 +1923,13 @@ function extractSaleTimeLabel(text) {
   );
 
   if (labeledStartMatch) {
-    const labeledValue = String(labeledStartMatch[1] || '').trim();
+    const labeledValue = String(labeledStartMatch[1] || "").trim();
     if (/^now$/i.test(labeledValue)) {
       return {
-        startTime: 'Now',
-        endTime: '',
-        timeLabel: 'Now',
-        timePattern: 'starts_now',
+        startTime: "Now",
+        endTime: "",
+        timeLabel: "Now",
+        timePattern: "starts_now",
       };
     }
 
@@ -1457,16 +1938,16 @@ function extractSaleTimeLabel(text) {
       const hours = Number(match[1]);
       const minutes = Number(match[2] || 0);
       const meridiem =
-        String(match[3] || '').toUpperCase() ||
-        inferGarageSaleMeridiem(hours, 'start');
+        String(match[3] || "").toUpperCase() ||
+        inferGarageSaleMeridiem(hours, "start");
       const label = normalizeClockLabel(hours, minutes, meridiem);
       return {
         startTime: label,
-        endTime: '',
+        endTime: "",
         timeLabel: label,
         timePattern: match[3]
-          ? 'labeled_start'
-          : 'labeled_start_inferred_meridiem',
+          ? "labeled_start"
+          : "labeled_start_inferred_meridiem",
       };
     }
   }
@@ -1489,38 +1970,37 @@ function extractSaleTimeLabel(text) {
   if (rangeMatch) {
     return normalizeTimeMatchToLabel(rangeMatch, {
       timePattern: labeledRangeMatch
-        ? 'labeled_range'
+        ? "labeled_range"
         : rangeWithMeridiemMatch
-          ? 'range_with_meridiem'
-          : 'range_inferred_meridiem',
+          ? "range_with_meridiem"
+          : "range_inferred_meridiem",
     });
   }
 
   const singleMatch = haystack.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
   if (singleMatch) {
-    const meridiem = String(singleMatch[3] || '').toUpperCase();
+    const meridiem = String(singleMatch[3] || "").toUpperCase();
     const hours = Number(singleMatch[1]);
     const minutes = Number(singleMatch[2] || 0);
     const label = normalizeClockLabel(hours, minutes, meridiem);
     return {
       startTime: label,
-      endTime: '',
+      endTime: "",
       timeLabel: label,
-      timePattern: 'single_time_with_meridiem',
+      timePattern: "single_time_with_meridiem",
     };
   }
 
-  return { timeLabel: '', endTime: '', startTime: '', timePattern: '' };
+  return { timeLabel: "", endTime: "", startTime: "", timePattern: "" };
 }
 
-
 function splitTimingLines(value) {
-  return String(value || '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<\/div>/gi, '\n')
-    .replace(/\r/g, '\n')
-    .split('\n')
+  return String(value || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
     .map((line) => normalizeTimingText(line))
     .filter(Boolean);
 }
@@ -1530,7 +2010,9 @@ function extractTimeForDateKeyFromText(text, targetDateKey, referenceDate) {
 
   const lines = splitTimingLines(text);
   for (const line of lines) {
-    const lineDateKeys = extractSaleDatesFromText(line, referenceDate).map(dateKeyFromDate);
+    const lineDateKeys = extractSaleDatesFromText(line, referenceDate).map(
+      dateKeyFromDate,
+    );
     if (!lineDateKeys.includes(targetDateKey)) continue;
 
     const timeInfo = extractSaleTimeLabel(line);
@@ -1549,8 +2031,8 @@ function extractTimeForDateKeyFromText(text, targetDateKey, referenceDate) {
   if (!compact || !targetDate) return null;
 
   const weekday = formatSaleDayLabel(targetDate);
-  const monthName = targetDate.toLocaleDateString('en-US', { month: 'long' });
-  const monthShort = targetDate.toLocaleDateString('en-US', { month: 'short' });
+  const monthName = targetDate.toLocaleDateString("en-US", { month: "long" });
+  const monthShort = targetDate.toLocaleDateString("en-US", { month: "short" });
   const day = targetDate.getDate();
   const probes = [
     `${weekday}, ${monthName} ${day}`,
@@ -1595,19 +2077,19 @@ function extractSaleDateFromText(text, referenceDate) {
 
 function extractPostingBodyText($) {
   return normalizeTimingText(
-    $('#postingbody').text() ||
-      $('section#postingbody').text() ||
-      $('.postingbody').text() ||
-      $('body').text(),
+    $("#postingbody").text() ||
+      $("section#postingbody").text() ||
+      $(".postingbody").text() ||
+      $("body").text(),
   );
 }
 
 function cleanGarageSaleDetailText(value) {
-  return String(value || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .replace(/^[\s:•\-–—]+|[\s:•\-–—]+$/g, '')
+  return String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s:•\-–—]+|[\s:•\-–—]+$/g, "")
     .trim();
 }
 
@@ -1616,10 +2098,10 @@ function limitGarageSaleDetailText(value, maxLength = 220) {
   if (!text || text.length <= maxLength) return text;
   const trimmed = text.slice(0, maxLength + 1);
   const lastBreak = Math.max(
-    trimmed.lastIndexOf('. '),
-    trimmed.lastIndexOf('; '),
-    trimmed.lastIndexOf(', '),
-    trimmed.lastIndexOf(' '),
+    trimmed.lastIndexOf(". "),
+    trimmed.lastIndexOf("; "),
+    trimmed.lastIndexOf(", "),
+    trimmed.lastIndexOf(" "),
   );
   return `${trimmed.slice(0, lastBreak > 80 ? lastBreak : maxLength).trim()}…`;
 }
@@ -1630,8 +2112,8 @@ function uniqueCleanList(values, limit = 12) {
 
   for (const value of values || []) {
     const cleaned = cleanGarageSaleDetailText(value)
-      .replace(/\s+/g, ' ')
-      .replace(/^[,;:•\-–—]+|[,;:•\-–—]+$/g, '')
+      .replace(/\s+/g, " ")
+      .replace(/^[,;:•\-–—]+|[,;:•\-–—]+$/g, "")
       .trim();
     if (!cleaned) continue;
 
@@ -1646,219 +2128,219 @@ function uniqueCleanList(values, limit = 12) {
 }
 
 function normalizeForKeywordScan(value) {
-  return String(value || '')
+  return String(value || "")
     .replace(/[’‘]/g, "'")
     .replace(/[“”]/g, '"')
-    .replace(/&amp;/gi, '&')
-    .replace(/[^a-zA-Z0-9$&+/#.'\-\s]/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/&amp;/gi, "&")
+    .replace(/[^a-zA-Z0-9$&+/#.'\-\s]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
 const GARAGE_SALE_ITEM_CATEGORIES = [
   {
-    category: 'High resale potential',
+    category: "High resale potential",
     weight: 18,
     terms: [
-      'vintage',
-      'antique',
-      'antiques',
-      'collectible',
-      'collectibles',
-      'mid century',
-      'mcm',
-      'danish modern',
-      'sterling',
-      'silver',
-      'gold',
-      'jewelry',
-      'watches',
-      'coins',
-      'records',
-      'vinyl',
-      'video games',
-      'nintendo',
-      'sega',
-      'playstation',
-      'xbox',
-      'pokemon',
-      'sports cards',
-      'trading cards',
-      'comic books',
-      'comics',
-      'camera',
-      'cameras',
-      'lenses',
-      'guitar',
-      'musical instruments',
-      'turntable',
-      'audio equipment',
-      'stereo',
+      "vintage",
+      "antique",
+      "antiques",
+      "collectible",
+      "collectibles",
+      "mid century",
+      "mcm",
+      "danish modern",
+      "sterling",
+      "silver",
+      "gold",
+      "jewelry",
+      "watches",
+      "coins",
+      "records",
+      "vinyl",
+      "video games",
+      "nintendo",
+      "sega",
+      "playstation",
+      "xbox",
+      "pokemon",
+      "sports cards",
+      "trading cards",
+      "comic books",
+      "comics",
+      "camera",
+      "cameras",
+      "lenses",
+      "guitar",
+      "musical instruments",
+      "turntable",
+      "audio equipment",
+      "stereo",
     ],
   },
   {
-    category: 'Tools and garage',
+    category: "Tools and garage",
     weight: 14,
     terms: [
-      'tools',
-      'power tools',
-      'hand tools',
-      'tool box',
-      'toolbox',
-      'snap-on',
-      'snap on',
-      'craftsman',
-      'dewalt',
-      'milwaukee tools',
-      'makita',
-      'bosch',
-      'ryobi',
-      'air compressor',
-      'ladder',
-      'garage items',
-      'hardware',
-      'lawn mower',
-      'snowblower',
-      'generator',
+      "tools",
+      "power tools",
+      "hand tools",
+      "tool box",
+      "toolbox",
+      "snap-on",
+      "snap on",
+      "craftsman",
+      "dewalt",
+      "milwaukee tools",
+      "makita",
+      "bosch",
+      "ryobi",
+      "air compressor",
+      "ladder",
+      "garage items",
+      "hardware",
+      "lawn mower",
+      "snowblower",
+      "generator",
     ],
   },
   {
-    category: 'Home and furniture',
+    category: "Home and furniture",
     weight: 10,
     terms: [
-      'furniture',
-      'dresser',
-      'desk',
-      'table',
-      'chairs',
-      'sofa',
-      'couch',
-      'bookshelf',
-      'bookcase',
-      'lamps',
-      'rugs',
-      'home decor',
-      'decor',
-      'art',
-      'framed art',
-      'mirrors',
-      'kitchenware',
-      'pyrex',
-      'fiesta',
-      'fiestaware',
-      'corningware',
-      'le creuset',
-      'cast iron',
+      "furniture",
+      "dresser",
+      "desk",
+      "table",
+      "chairs",
+      "sofa",
+      "couch",
+      "bookshelf",
+      "bookcase",
+      "lamps",
+      "rugs",
+      "home decor",
+      "decor",
+      "art",
+      "framed art",
+      "mirrors",
+      "kitchenware",
+      "pyrex",
+      "fiesta",
+      "fiestaware",
+      "corningware",
+      "le creuset",
+      "cast iron",
     ],
   },
   {
-    category: 'Clothing and accessories',
+    category: "Clothing and accessories",
     weight: 7,
     terms: [
-      'clothing',
-      'clothes',
-      'mens clothing',
-      'women clothing',
+      "clothing",
+      "clothes",
+      "mens clothing",
+      "women clothing",
       "women's clothing",
-      'shoes',
-      'boots',
-      'sneakers',
-      'purses',
-      'handbags',
-      'coach',
-      'kate spade',
-      'designer',
-      'vintage clothing',
-      'costume jewelry',
+      "shoes",
+      "boots",
+      "sneakers",
+      "purses",
+      "handbags",
+      "coach",
+      "kate spade",
+      "designer",
+      "vintage clothing",
+      "costume jewelry",
     ],
   },
   {
-    category: 'Kids and toys',
+    category: "Kids and toys",
     weight: 6,
     terms: [
-      'toys',
-      'lego',
-      'legos',
-      'barbie',
-      'american girl',
-      'hot wheels',
-      'matchbox',
-      'baby items',
-      'baby gear',
-      'stroller',
-      'crib',
-      'kids clothes',
-      'children',
-      'board games',
-      'puzzles',
+      "toys",
+      "lego",
+      "legos",
+      "barbie",
+      "american girl",
+      "hot wheels",
+      "matchbox",
+      "baby items",
+      "baby gear",
+      "stroller",
+      "crib",
+      "kids clothes",
+      "children",
+      "board games",
+      "puzzles",
     ],
   },
   {
-    category: 'Books and media',
+    category: "Books and media",
     weight: 5,
     terms: [
-      'books',
-      'dvds',
-      'cds',
-      'blu ray',
-      'bluray',
-      'records',
-      'vinyl',
-      'magazines',
-      'sheet music',
+      "books",
+      "dvds",
+      "cds",
+      "blu ray",
+      "bluray",
+      "records",
+      "vinyl",
+      "magazines",
+      "sheet music",
     ],
   },
   {
-    category: 'Electronics',
+    category: "Electronics",
     weight: 9,
     terms: [
-      'electronics',
-      'computer',
-      'laptop',
-      'ipad',
-      'iphone',
-      'tablet',
-      'monitor',
-      'speakers',
-      'receiver',
-      'amplifier',
-      'printer',
-      'gaming',
+      "electronics",
+      "computer",
+      "laptop",
+      "ipad",
+      "iphone",
+      "tablet",
+      "monitor",
+      "speakers",
+      "receiver",
+      "amplifier",
+      "printer",
+      "gaming",
     ],
   },
   {
-    category: 'Outdoor and sporting goods',
+    category: "Outdoor and sporting goods",
     weight: 6,
     terms: [
-      'bikes',
-      'bicycles',
-      'sporting goods',
-      'golf clubs',
-      'fishing',
-      'camping',
-      'patio furniture',
-      'grill',
-      'cooler',
-      'yard tools',
+      "bikes",
+      "bicycles",
+      "sporting goods",
+      "golf clubs",
+      "fishing",
+      "camping",
+      "patio furniture",
+      "grill",
+      "cooler",
+      "yard tools",
     ],
   },
 ];
 
 const GARAGE_SALE_WARNING_PATTERNS = [
   {
-    label: 'Possible dealer / reseller language',
+    label: "Possible dealer / reseller language",
     pattern: /\b(?:dealer|dealers|vendor|vendors|flea market vendor)\b/i,
   },
-  { label: 'Cash only', pattern: /\bcash\s+only\b/i },
-  { label: 'No early birds', pattern: /\bno\s+early\s+birds?\b/i },
-  { label: 'Rain date mentioned', pattern: /\brain\s+date\b/i },
+  { label: "Cash only", pattern: /\bcash\s+only\b/i },
+  { label: "No early birds", pattern: /\bno\s+early\s+birds?\b/i },
+  { label: "Rain date mentioned", pattern: /\brain\s+date\b/i },
   {
-    label: 'Canceled or postponed language',
+    label: "Canceled or postponed language",
     pattern: /\b(?:cancelled|canceled|postponed|rescheduled)\b/i,
   },
-  { label: 'Everything must go', pattern: /\beverything\s+must\s+go\b/i },
+  { label: "Everything must go", pattern: /\beverything\s+must\s+go\b/i },
   {
-    label: 'Bring help / large items',
+    label: "Bring help / large items",
     pattern: /\b(?:bring\s+help|must\s+haul|you\s+haul|pickup\s+only)\b/i,
   },
 ];
@@ -1878,16 +2360,16 @@ function extractMentionedItemsFromText(value) {
     for (const term of group.terms) {
       const escaped = escapeRegexText(term.toLowerCase()).replace(
         /\s+/g,
-        '\\s+',
+        "\\s+",
       );
-      const regex = new RegExp(`\\b${escaped}\\b`, 'i');
+      const regex = new RegExp(`\\b${escaped}\\b`, "i");
       if (regex.test(text)) {
         const label = term
-          .split(' ')
+          .split(" ")
           .map((part) =>
             part ? part.charAt(0).toUpperCase() + part.slice(1) : part,
           )
-          .join(' ');
+          .join(" ");
         groupMatches.push(label);
         matchedItems.push(label);
       }
@@ -1936,32 +2418,32 @@ function calculateLocationConfidence({
 
   if (hasExactCoordinates) {
     score += 40;
-    reasons.push('exact coordinates');
+    reasons.push("exact coordinates");
   } else if (hasApproximateCoordinates) {
     score += 22;
-    reasons.push('approximate geocode');
+    reasons.push("approximate geocode");
   }
 
-  if (geoSource === 'posting_page') {
+  if (geoSource === "posting_page") {
     score += 18;
-    reasons.push('coordinates from posting page');
-  } else if (geoSource === 'search_row') {
+    reasons.push("coordinates from posting page");
+  } else if (geoSource === "search_row") {
     score += 14;
-    reasons.push('coordinates from search result');
-  } else if (geoSource === 'geocoder') {
+    reasons.push("coordinates from search result");
+  } else if (geoSource === "geocoder") {
     score += 8;
-    reasons.push('coordinates from geocoder');
+    reasons.push("coordinates from geocoder");
   }
 
   if (street && hasHouseNumberPrefix(street)) {
     score += 24;
-    reasons.push('full street address');
+    reasons.push("full street address");
   } else if (street && crossStreet) {
     score += 18;
-    reasons.push('street and cross street');
+    reasons.push("street and cross street");
   } else if (street || crossStreet) {
     score += 12;
-    reasons.push('street-level location');
+    reasons.push("street-level location");
   }
 
   if (city) score += 8;
@@ -1971,12 +2453,12 @@ function calculateLocationConfidence({
   const normalizedScore = Math.max(0, Math.min(100, Math.round(score)));
   const label =
     normalizedScore >= 78
-      ? 'high'
+      ? "high"
       : normalizedScore >= 50
-        ? 'medium'
+        ? "medium"
         : normalizedScore >= 25
-          ? 'low'
-          : 'very_low';
+          ? "low"
+          : "very_low";
 
   return {
     label,
@@ -1986,9 +2468,9 @@ function calculateLocationConfidence({
 }
 
 function normalizeConfidenceLabel(value) {
-  const text = String(value || '').toLowerCase();
-  if (['high', 'medium', 'low', 'very_low'].includes(text)) return text;
-  return 'low';
+  const text = String(value || "").toLowerCase();
+  if (["high", "medium", "low", "very_low"].includes(text)) return text;
+  return "low";
 }
 
 function calculateTimeConfidence({
@@ -2004,34 +2486,34 @@ function calculateTimeConfidence({
 
   if (saleDate) {
     score += 32;
-    reasons.push('sale date found');
+    reasons.push("sale date found");
   }
   if (dayLabel) {
     score += 12;
-    reasons.push('day label found');
+    reasons.push("day label found");
   }
   if (timeLabel || startTime) {
     score += 34;
-    reasons.push('start time found');
+    reasons.push("start time found");
   }
   if (endTime) {
     score += 10;
-    reasons.push('end time found');
+    reasons.push("end time found");
   }
 
   const normalized = normalizeConfidenceLabel(timingConfidence);
-  if (normalized === 'high') score += 12;
-  if (normalized === 'medium') score += 6;
+  if (normalized === "high") score += 12;
+  if (normalized === "medium") score += 6;
 
   const normalizedScore = Math.max(0, Math.min(100, Math.round(score)));
   const label =
     normalizedScore >= 72
-      ? 'high'
+      ? "high"
       : normalizedScore >= 42
-        ? 'medium'
+        ? "medium"
         : normalizedScore > 0
-          ? 'low'
-          : 'very_low';
+          ? "low"
+          : "very_low";
 
   return {
     label,
@@ -2052,14 +2534,14 @@ function calculateSaleScore({
   distanceMiles: saleDistanceMiles,
 }) {
   const scanText = normalizeForKeywordScan(
-    [title, bodyText, descriptionPreview].filter(Boolean).join(' '),
+    [title, bodyText, descriptionPreview].filter(Boolean).join(" "),
   );
   let score = 35;
   const reasons = [];
 
-  if (saleType === 'estate') {
+  if (saleType === "estate") {
     score += 12;
-    reasons.push('estate sale');
+    reasons.push("estate sale");
   }
 
   if (
@@ -2068,7 +2550,7 @@ function calculateSaleScore({
     )
   ) {
     score += 10;
-    reasons.push('larger sale format');
+    reasons.push("larger sale format");
   }
 
   for (const category of itemCategories || []) {
@@ -2082,16 +2564,16 @@ function calculateSaleScore({
 
   if (descriptionPreview && descriptionPreview.length > 80) {
     score += 8;
-    reasons.push('useful item description');
+    reasons.push("useful item description");
   }
 
-  if (locationConfidence?.label === 'high') score += 8;
-  else if (locationConfidence?.label === 'medium') score += 4;
-  else if (locationConfidence?.label === 'very_low') score -= 8;
+  if (locationConfidence?.label === "high") score += 8;
+  else if (locationConfidence?.label === "medium") score += 4;
+  else if (locationConfidence?.label === "very_low") score -= 8;
 
-  if (timeConfidence?.label === 'high') score += 8;
-  else if (timeConfidence?.label === 'medium') score += 4;
-  else if (timeConfidence?.label === 'very_low') score -= 8;
+  if (timeConfidence?.label === "high") score += 8;
+  else if (timeConfidence?.label === "medium") score += 4;
+  else if (timeConfidence?.label === "very_low") score -= 8;
 
   const distance = Number(saleDistanceMiles);
   if (Number.isFinite(distance)) {
@@ -2102,7 +2584,7 @@ function calculateSaleScore({
 
   if ((warningFlags || []).some((flag) => /canceled|postponed/i.test(flag))) {
     score -= 35;
-    reasons.push('possible cancellation warning');
+    reasons.push("possible cancellation warning");
   }
   if ((warningFlags || []).some((flag) => /dealer/i.test(flag))) {
     score -= 8;
@@ -2111,12 +2593,12 @@ function calculateSaleScore({
   const normalizedScore = Math.max(0, Math.min(100, Math.round(score)));
   const label =
     normalizedScore >= 82
-      ? 'excellent'
+      ? "excellent"
       : normalizedScore >= 65
-        ? 'strong'
+        ? "strong"
         : normalizedScore >= 48
-          ? 'fair'
-          : 'low';
+          ? "fair"
+          : "low";
 
   return {
     score: normalizedScore,
@@ -2126,28 +2608,28 @@ function calculateSaleScore({
 }
 
 function normalizeSaleTitleForDedupe(value) {
-  return String(value || '')
+  return String(value || "")
     .toLowerCase()
     .replace(
       /\b(?:garage|yard|estate|moving|rummage|sale|multi|family|huge|big|today|tomorrow|sat|sun|fri|saturday|sunday|friday)\b/g,
-      ' ',
+      " ",
     )
-    .replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/g, ' ')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
 function extractPhotoUrlsFromPostingPage($, html) {
   const urls = [];
-  $('img').each((_index, element) => {
+  $("img").each((_index, element) => {
     const $img = $(element);
     const src =
-      $img.attr('src') || $img.attr('data-src') || $img.attr('data-full-image');
+      $img.attr("src") || $img.attr("data-src") || $img.attr("data-full-image");
     if (src && /^https?:\/\//i.test(src)) urls.push(src);
   });
 
-  const htmlText = String(html || '');
+  const htmlText = String(html || "");
   const imageMatches =
     htmlText.match(/https?:\/\/images\.craigslist\.org\/[^"'\s<>]+/gi) || [];
   urls.push(...imageMatches);
@@ -2157,82 +2639,82 @@ function extractPhotoUrlsFromPostingPage($, html) {
 
 function buildFallbackDescriptionPreview(bodyText, notes) {
   const body = normalizePostingBodyForDetails(bodyText || notes);
-  if (!body) return '';
+  if (!body) return "";
 
   const resaleKeywords =
     /\b(?:vintage|antiques?|collectibles?|furniture|clothing|tools?|toys?|books?|records?|vinyl|ceramics?|silver|jewelry|electronics?|art supplies|holiday|christmas|halloween|textiles?|fabric|kitchen|decor|baby gear|bikes?|y2k)\b/i;
   const parts = body
     .replace(
       /\b(?:location|address|dates?|time|hours?|start time)\s*:?\s*[^.]{0,160}/gi,
-      ' ',
+      " ",
     )
     .replace(
       /\b(?:friday|saturday|sunday|monday|tuesday|wednesday|thursday)\b[^.]{0,120}/gi,
-      ' ',
+      " ",
     )
     .split(/(?<=[.!?])\s+|\s*[•\-–—]\s*/g)
     .map(cleanGarageSaleDetailText)
     .filter((part) => part.length >= 12 && resaleKeywords.test(part))
     .slice(0, 4);
 
-  return parts.length ? limitGarageSaleDetailText(parts.join(' • '), 320) : '';
+  return parts.length ? limitGarageSaleDetailText(parts.join(" • "), 320) : "";
 }
 
 function escapeRegexText(value) {
-  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function normalizePostingBodyForDetails(value) {
   return cleanGarageSaleDetailText(value)
-    .replace(/\s*\n\s*/g, ' ')
-    .replace(/✨/g, ' ')
-    .replace(/📍/g, ' Location: ')
-    .replace(/🗓️|📅|🗓/g, ' Dates: ')
-    .replace(/⏰|🕘|🕙|🕗/g, ' Time: ')
-    .replace(/🪑|💵|🚗/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\s*\n\s*/g, " ")
+    .replace(/✨/g, " ")
+    .replace(/📍/g, " Location: ")
+    .replace(/🗓️|📅|🗓/g, " Dates: ")
+    .replace(/⏰|🕘|🕙|🕗/g, " Time: ")
+    .replace(/🪑|💵|🚗/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
 function extractLabelValueFromPostingBody(bodyText, labels, stopLabels) {
   const body = normalizePostingBodyForDetails(bodyText);
-  if (!body) return '';
+  if (!body) return "";
 
-  const labelPattern = labels.map(escapeRegexText).join('|');
-  const stopPattern = stopLabels.map(escapeRegexText).join('|');
+  const labelPattern = labels.map(escapeRegexText).join("|");
+  const stopPattern = stopLabels.map(escapeRegexText).join("|");
   const regex = new RegExp(
     `(?:^|\\s)(?:${labelPattern})\\s*:?\\s*(.*?)(?=\\s(?:${stopPattern})\\s*:?|$)`,
-    'i',
+    "i",
   );
   const match = body.match(regex);
-  return match && match[1] ? cleanGarageSaleDetailText(match[1]) : '';
+  return match && match[1] ? cleanGarageSaleDetailText(match[1]) : "";
 }
 
 function extractLocationDetailFromPostingBody(bodyText) {
   const body = normalizePostingBodyForDetails(bodyText);
   const locationText = extractLabelValueFromPostingBody(
     body,
-    ['Location', 'Address', 'Located at', 'Sale address'],
+    ["Location", "Address", "Located at", "Sale address"],
     [
-      'Dates',
-      'Date',
-      'Time',
-      'Hours',
-      'What you’ll find',
+      "Dates",
+      "Date",
+      "Time",
+      "Hours",
+      "What you’ll find",
       "What you'll find",
-      'What you will find',
-      'You will find',
-      'Items',
-      'For sale',
-      'Includes',
-      'Early arrival',
-      'Cash',
-      'Venmo',
-      'Please',
-      'Parking',
-      'Start time',
-      'dates',
-      'start time',
+      "What you will find",
+      "You will find",
+      "Items",
+      "For sale",
+      "Includes",
+      "Early arrival",
+      "Cash",
+      "Venmo",
+      "Please",
+      "Parking",
+      "Start time",
+      "dates",
+      "start time",
     ],
   );
 
@@ -2244,39 +2726,39 @@ function extractLocationDetailFromPostingBody(bodyText) {
 
   return fallbackMatch && fallbackMatch[1]
     ? limitGarageSaleDetailText(fallbackMatch[1], 220)
-    : '';
+    : "";
 }
 
 function extractDescriptionPreviewFromPostingBody(bodyText) {
   const body = normalizePostingBodyForDetails(bodyText);
-  if (!body) return '';
+  if (!body) return "";
 
   const whatYouWillFind = extractLabelValueFromPostingBody(
     body,
     [
-      'What you’ll find',
+      "What you’ll find",
       "What you'll find",
-      'What you will find',
-      'You will find',
-      'Items include',
-      'Items',
-      'For sale',
-      'Includes',
+      "What you will find",
+      "You will find",
+      "Items include",
+      "Items",
+      "For sale",
+      "Includes",
     ],
     [
-      'Location',
-      'Address',
-      'Dates',
-      'Date',
-      'Time',
-      'Hours',
-      'Early arrival',
-      'Cash',
-      'Venmo',
-      'Please',
-      'Parking',
-      'dates',
-      'start time',
+      "Location",
+      "Address",
+      "Dates",
+      "Date",
+      "Time",
+      "Hours",
+      "Early arrival",
+      "Cash",
+      "Venmo",
+      "Please",
+      "Parking",
+      "dates",
+      "start time",
     ],
   );
 
@@ -2285,33 +2767,33 @@ function extractDescriptionPreviewFromPostingBody(bodyText) {
   }
 
   const resaleKeywords = [
-    'vintage',
-    'antiques?',
-    'collectibles?',
-    'furniture',
-    'clothing',
-    'tools?',
-    'toys?',
-    'books?',
-    'records?',
-    'vinyl',
-    'ceramics?',
-    'silver',
-    'jewelry',
-    'electronics?',
-    'art supplies',
-    'holiday',
-    'christmas',
-    'halloween',
-    'textiles?',
-    'fabric',
-    'kitchen',
-    'decor',
-    'baby gear',
-    'bikes?',
-    'y2k',
+    "vintage",
+    "antiques?",
+    "collectibles?",
+    "furniture",
+    "clothing",
+    "tools?",
+    "toys?",
+    "books?",
+    "records?",
+    "vinyl",
+    "ceramics?",
+    "silver",
+    "jewelry",
+    "electronics?",
+    "art supplies",
+    "holiday",
+    "christmas",
+    "halloween",
+    "textiles?",
+    "fabric",
+    "kitchen",
+    "decor",
+    "baby gear",
+    "bikes?",
+    "y2k",
   ];
-  const keywordRegex = new RegExp(`\\b(?:${resaleKeywords.join('|')})\\b`, 'i');
+  const keywordRegex = new RegExp(`\\b(?:${resaleKeywords.join("|")})\\b`, "i");
   const sentences = body
     .split(/(?<=[.!?])\s+|\s{2,}|(?:\s*[•\-–—]\s*)/)
     .map(cleanGarageSaleDetailText)
@@ -2319,24 +2801,24 @@ function extractDescriptionPreviewFromPostingBody(bodyText) {
     .slice(0, 4);
 
   if (sentences.length) {
-    return limitGarageSaleDetailText(sentences.join(' • '), 300);
+    return limitGarageSaleDetailText(sentences.join(" • "), 300);
   }
 
   const cleaned = body
     .replace(
       /\b(?:dates?|time|hours?|location|address|start time)\s*:?\s*[^.]{0,140}/gi,
-      ' ',
+      " ",
     )
     .replace(
       /\b(?:friday|saturday|sunday|monday|tuesday|wednesday|thursday)\b[^.]{0,100}/gi,
-      ' ',
+      " ",
     )
-    .replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b[^.]{0,80}/gi, ' ')
-    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b[^.]{0,80}/gi, " ")
+    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
-  if (!cleaned || cleaned.length < 35) return '';
+  if (!cleaned || cleaned.length < 35) return "";
   return limitGarageSaleDetailText(cleaned, 260);
 }
 
@@ -2351,7 +2833,7 @@ function buildFullLocationText({
   const address = cleanGarageSaleDetailText(displayAddress || mapAddress);
   const cleanCity = cleanGarageSaleDetailText(city);
   const cleanState = cleanGarageSaleDetailText(state);
-  const cityState = [cleanCity, cleanState].filter(Boolean).join(', ');
+  const cityState = [cleanCity, cleanState].filter(Boolean).join(", ");
 
   if (cleanLocationDetail) {
     const lowerDetail = cleanLocationDetail.toLowerCase();
@@ -2365,7 +2847,7 @@ function buildFullLocationText({
     return cleanLocationDetail;
   }
 
-  if (!address) return '';
+  if (!address) return "";
   const lowerAddress = address.toLowerCase();
 
   if (
@@ -2392,15 +2874,18 @@ function extractTimingDetailsFromPosting({
   ].filter(Boolean);
 
   let bestDate = null;
-  let bestDateLabel = '';
-  let bestDayLabel = '';
-  let bestTime = { timeLabel: '', startTime: '', endTime: '' };
-  let foundDateSource = '';
-  let foundTimeSource = '';
+  let bestDateLabel = "";
+  let bestDayLabel = "";
+  let bestTime = { timeLabel: "", startTime: "", endTime: "" };
+  let foundDateSource = "";
+  let foundTimeSource = "";
   const allSaleDates = [];
 
   for (const candidate of candidates) {
-    const candidateSaleDates = extractSaleDatesFromText(candidate, referenceDate);
+    const candidateSaleDates = extractSaleDatesFromText(
+      candidate,
+      referenceDate,
+    );
     if (candidateSaleDates.length) {
       allSaleDates.push(...candidateSaleDates);
       if (!bestDate) {
@@ -2434,33 +2919,33 @@ function extractTimingDetailsFromPosting({
       timeLabel: bestTime.timeLabel,
       startTime: bestTime.startTime,
       endTime: bestTime.endTime,
-      timePattern: bestTime.timePattern || '',
+      timePattern: bestTime.timePattern || "",
       timingConfidence:
         bestDate && bestTime.timeLabel
-          ? 'high'
+          ? "high"
           : bestDate || bestTime.timeLabel
-            ? 'medium'
-            : 'low',
+            ? "medium"
+            : "low",
       timingSource: bestTime.timeLabel
-        ? 'posting_body_or_html'
+        ? "posting_body_or_html"
         : foundDateSource
-          ? 'posting_date'
-          : '',
+          ? "posting_date"
+          : "",
     };
   }
 
   return {
     saleDate: null,
-    saleDateLabel: '',
+    saleDateLabel: "",
     saleDateKeys: [],
     saleDateLabels: [],
-    dayLabel: '',
-    timeLabel: '',
-    startTime: '',
-    endTime: '',
-    timePattern: '',
-    timingConfidence: 'low',
-    timingSource: '',
+    dayLabel: "",
+    timeLabel: "",
+    startTime: "",
+    endTime: "",
+    timePattern: "",
+    timingConfidence: "low",
+    timingSource: "",
   };
 }
 
@@ -2469,20 +2954,20 @@ async function fetchPostingPageDetails(postingUrl, baseUrl) {
     return {
       latitude: null,
       longitude: null,
-      mapAddress: '',
-      bodyText: '',
-      saleDate: '',
-      saleDateTime: '',
+      mapAddress: "",
+      bodyText: "",
+      saleDate: "",
+      saleDateTime: "",
       saleDateKeys: [],
       saleDateLabels: [],
-      dayLabel: '',
-      timeLabel: '',
-      startTime: '',
-      endTime: '',
-      timingConfidence: 'low',
-      timingSource: '',
-      locationDetail: '',
-      descriptionPreview: '',
+      dayLabel: "",
+      timeLabel: "",
+      startTime: "",
+      endTime: "",
+      timingConfidence: "low",
+      timingSource: "",
+      locationDetail: "",
+      descriptionPreview: "",
       photoUrls: [],
     };
   }
@@ -2496,15 +2981,15 @@ async function fetchPostingPageDetails(postingUrl, baseUrl) {
       timeout: 15000,
       validateStatus: () => true,
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         Referer: baseUrl,
-        DNT: '1',
-        Connection: 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
+        DNT: "1",
+        Connection: "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
       },
     });
 
@@ -2512,25 +2997,25 @@ async function fetchPostingPageDetails(postingUrl, baseUrl) {
       const fallback = {
         latitude: null,
         longitude: null,
-        mapAddress: '',
-        bodyText: '',
-        saleDate: '',
-        saleDateTime: '',
+        mapAddress: "",
+        bodyText: "",
+        saleDate: "",
+        saleDateTime: "",
         saleDateKeys: [],
         saleDateLabels: [],
-        dayLabel: '',
-        timeLabel: '',
-        startTime: '',
-        endTime: '',
-        timingConfidence: 'low',
-        locationDetail: '',
-        descriptionPreview: '',
+        dayLabel: "",
+        timeLabel: "",
+        startTime: "",
+        endTime: "",
+        timingConfidence: "low",
+        locationDetail: "",
+        descriptionPreview: "",
       };
       postingPageDetailCache.set(postingUrl, fallback);
       return fallback;
     }
 
-    const html = String(response.data || '');
+    const html = String(response.data || "");
     const $ = cheerio.load(html);
     const parsedMapAddress = parseMapAddressFromPage($, html);
     const bodyText = extractPostingBodyText($);
@@ -2540,15 +3025,15 @@ async function fetchPostingPageDetails(postingUrl, baseUrl) {
       extractDescriptionPreviewFromPostingBody(bodyText);
     const photoUrls = extractPhotoUrlsFromPostingPage($, html);
     const timing = extractTimingDetailsFromPosting({
-      title: $('title').first().text() || '',
-      bodyText: [attributeText, bodyText].filter(Boolean).join('\n'),
+      title: $("title").first().text() || "",
+      bodyText: [attributeText, bodyText].filter(Boolean).join("\n"),
       html,
       referenceDate: new Date(),
     });
     const directGeo =
-      parseGeoFromElement($('#map')) ||
-      parseGeoFromElement($('[data-latitude][data-longitude]').first()) ||
-      parseGeoFromElement($('[data-lat][data-lon]').first()) ||
+      parseGeoFromElement($("#map")) ||
+      parseGeoFromElement($("[data-latitude][data-longitude]").first()) ||
+      parseGeoFromElement($("[data-lat][data-lon]").first()) ||
       parseGeoFromHtml(html);
     const detail = {
       latitude: directGeo.latitude,
@@ -2559,16 +3044,20 @@ async function fetchPostingPageDetails(postingUrl, baseUrl) {
       descriptionPreview,
       photoUrls,
       saleDate: timing.saleDateLabel,
-      saleDateTime: timing.saleDate ? timing.saleDate.toISOString() : '',
-      saleDateKeys: Array.isArray(timing.saleDateKeys) ? timing.saleDateKeys : [],
-      saleDateLabels: Array.isArray(timing.saleDateLabels) ? timing.saleDateLabels : [],
+      saleDateTime: timing.saleDate ? timing.saleDate.toISOString() : "",
+      saleDateKeys: Array.isArray(timing.saleDateKeys)
+        ? timing.saleDateKeys
+        : [],
+      saleDateLabels: Array.isArray(timing.saleDateLabels)
+        ? timing.saleDateLabels
+        : [],
       dayLabel: timing.dayLabel,
       timeLabel: timing.timeLabel,
       startTime: timing.startTime,
       endTime: timing.endTime,
       timingConfidence: timing.timingConfidence,
-      timingSource: timing.timingSource || '',
-      timePattern: timing.timePattern || '',
+      timingSource: timing.timingSource || "",
+      timePattern: timing.timePattern || "",
     };
     postingPageDetailCache.set(postingUrl, detail);
     return detail;
@@ -2576,20 +3065,20 @@ async function fetchPostingPageDetails(postingUrl, baseUrl) {
     const fallback = {
       latitude: null,
       longitude: null,
-      mapAddress: '',
-      bodyText: '',
-      saleDate: '',
-      saleDateTime: '',
+      mapAddress: "",
+      bodyText: "",
+      saleDate: "",
+      saleDateTime: "",
       saleDateKeys: [],
       saleDateLabels: [],
-      dayLabel: '',
-      timeLabel: '',
-      startTime: '',
-      endTime: '',
-      timingConfidence: 'low',
-      timingSource: '',
-      locationDetail: '',
-      descriptionPreview: '',
+      dayLabel: "",
+      timeLabel: "",
+      startTime: "",
+      endTime: "",
+      timingConfidence: "low",
+      timingSource: "",
+      locationDetail: "",
+      descriptionPreview: "",
     };
     postingPageDetailCache.set(postingUrl, fallback);
     return fallback;
@@ -2599,8 +3088,8 @@ async function fetchPostingPageDetails(postingUrl, baseUrl) {
 function parseGeoFromRow($row) {
   const direct =
     parseGeoFromElement($row) ||
-    parseGeoFromElement($row.find('[data-latitude][data-longitude]').first()) ||
-    parseGeoFromElement($row.find('[data-lat][data-lon]').first()) ||
+    parseGeoFromElement($row.find("[data-latitude][data-longitude]").first()) ||
+    parseGeoFromElement($row.find("[data-lat][data-lon]").first()) ||
     parseGeoFromHtml($row.html());
 
   if (isUsableCoordinatePair(direct.latitude, direct.longitude)) {
@@ -2613,7 +3102,7 @@ function parseGeoFromRow($row) {
 function detectCraigslistSaleType({ title, metaText, hood, bodyText }) {
   const haystack = [title, metaText, hood, bodyText]
     .filter(Boolean)
-    .join(' ')
+    .join(" ")
     .toLowerCase();
 
   const blockedPatterns = [
@@ -2634,15 +3123,17 @@ function detectCraigslistSaleType({ title, metaText, hood, bodyText }) {
   ];
 
   if (blockedPatterns.some((pattern) => pattern.test(haystack))) {
-    return 'blocked';
+    return "blocked";
   }
 
-  if (/\bestate\b|estate sale|estate liquidation|estate tag sale/.test(haystack)) {
-    return 'estate';
+  if (
+    /\bestate\b|estate sale|estate liquidation|estate tag sale/.test(haystack)
+  ) {
+    return "estate";
   }
 
   if (/\bmoving\b|moving sale|move out|must go|relocation/.test(haystack)) {
-    return 'moving';
+    return "moving";
   }
 
   if (
@@ -2650,10 +3141,10 @@ function detectCraigslistSaleType({ title, metaText, hood, bodyText }) {
       haystack,
     )
   ) {
-    return 'garage';
+    return "garage";
   }
 
-  return 'garage';
+  return "garage";
 }
 
 function isSameCalendarDay(dateA, dateB) {
@@ -2670,7 +3161,7 @@ function buildSaleDedupKey(sale) {
   const coordKey =
     Number.isFinite(lat) && Number.isFinite(lon)
       ? `${lat.toFixed(4)}|${lon.toFixed(4)}`
-      : 'no-coords';
+      : "no-coords";
 
   const addressKey = String(
     sale?.mapAddress ||
@@ -2679,20 +3170,20 @@ function buildSaleDedupKey(sale) {
       sale?.addressLabel ||
       sale?.mapsQuery ||
       sale?.hood ||
-      '',
+      "",
   )
     .toLowerCase()
-    .replace(/\bnear\b/g, ' ')
+    .replace(/\bnear\b/g, " ")
     .replace(
       /\b(?:sat|sun|fri|apr|may|today|tomorrow|rain|shine|or|and)\b/g,
-      ' ',
+      " ",
     )
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
   const titleKey = normalizeSaleTitleForDedupe(sale?.title).slice(0, 80);
-  const dateKey = String(sale?.saleDate || sale?.dayLabel || '').toLowerCase();
+  const dateKey = String(sale?.saleDate || sale?.dayLabel || "").toLowerCase();
 
   return `${coordKey}|${addressKey}|${titleKey}|${dateKey}`;
 }
@@ -2706,13 +3197,13 @@ function chooseBetterDuplicateSale(currentSale, nextSale) {
     if (sale?.state) total += 1;
     if (sale?.zip) total += 1;
     if (sale?.hasExactCoordinates) total += 3;
-    if (sale?.geoSource === 'posting_page') total += 2;
+    if (sale?.geoSource === "posting_page") total += 2;
     if (sale?.saleScore) total += Number(sale.saleScore) / 10;
     if (Array.isArray(sale?.itemsMentioned))
       total += Math.min(4, sale.itemsMentioned.length);
     if (sale?.timeLabel) total += 2;
     if (sale?.descriptionPreview) total += 2;
-    total += Math.max(0, 120 - (String(sale?.title || '').length || 0)) / 120;
+    total += Math.max(0, 120 - (String(sale?.title || "").length || 0)) / 120;
     return total;
   };
 
@@ -2747,23 +3238,18 @@ async function fetchCraigslistGarageSales({
   const today = new Date();
   const tomorrow = new Date(today);
   tomorrow.setDate(today.getDate() + 1);
-  const dayAfterTomorrow = new Date(today);
-  dayAfterTomorrow.setDate(today.getDate() + 2);
   const normalizedTargetDay =
-    day === 'today' || day === 'tomorrow' || day === 'dayaftertomorrow'
-      ? day
-      : null;
+    day === "today" || day === "tomorrow" ? day : null;
   const targetDate =
-    normalizedTargetDay === 'dayaftertomorrow'
-      ? dayAfterTomorrow
-      : normalizedTargetDay === 'tomorrow'
-        ? tomorrow
-        : normalizedTargetDay === 'today'
-          ? today
-          : null;
-  const targetDateKey = targetDate ? dateKeyFromDate(targetDate) : '';
+    normalizedTargetDay === "tomorrow"
+      ? tomorrow
+      : normalizedTargetDay === "today"
+        ? today
+        : null;
+  const targetDateKey = targetDate ? dateKeyFromDate(targetDate) : "";
 
-  const postalCode = normalizePostalCode(postal) || inferPostalFromCoords(latitude, longitude);
+  const postalCode =
+    normalizePostalCode(postal) || inferPostalFromCoords(latitude, longitude);
 
   // Craigslist radius is not perfectly aligned with exact map/geocode distance.
   // For sourcing, missing a good estate sale is worse than showing an extra
@@ -2779,16 +3265,19 @@ async function fetchCraigslistGarageSales({
 
   const baseQuery = new URLSearchParams({
     search_distance: String(craigslistRadius || 25),
-    sort: 'date',
+    sort: "date",
   });
 
   if (postalCode) {
     // Postal searches match Craigslist's own UI much better than lat/lon searches
     // and prevent valid listings from disappearing.
-    baseQuery.set('postal', postalCode);
-  } else if (Number.isFinite(Number(latitude)) && Number.isFinite(Number(longitude))) {
-    baseQuery.set('lat', String(latitude));
-    baseQuery.set('lon', String(longitude));
+    baseQuery.set("postal", postalCode);
+  } else if (
+    Number.isFinite(Number(latitude)) &&
+    Number.isFinite(Number(longitude))
+  ) {
+    baseQuery.set("lat", String(latitude));
+    baseQuery.set("lon", String(longitude));
   }
 
   function buildSearchUrl(extraParams = {}) {
@@ -2803,62 +3292,107 @@ async function fetchCraigslistGarageSales({
 
   const searchUrls = [];
   const addSearchUrl = (candidateUrl) => {
-    if (candidateUrl && !searchUrls.includes(candidateUrl)) searchUrls.push(candidateUrl);
+    if (candidateUrl && !searchUrls.includes(candidateUrl))
+      searchUrls.push(candidateUrl);
   };
 
   // Pull more than one Craigslist view. The normal upcoming page sometimes omits
   // rows that appear when the calendar/day view is active, and vice versa.
   addSearchUrl(buildSearchUrl());
-  if (normalizedTargetDay) addSearchUrl(buildSearchUrl({ sale_date: normalizedTargetDay }));
+  if (normalizedTargetDay)
+    addSearchUrl(buildSearchUrl({ sale_date: normalizedTargetDay }));
   if (targetDateKey) addSearchUrl(buildSearchUrl({ sale_date: targetDateKey }));
 
   // Craigslist's plain gms page can still miss/reshuffle some estate and moving
   // sale rows. Add focused category searches so high-value sourcing sales are
   // not lost when the generic page changes its grouping or calendar view.
-  ['estate sale', 'moving sale', 'garage sale', 'yard sale'].forEach((query) => {
-    addSearchUrl(buildSearchUrl({ query }));
-    if (targetDateKey) addSearchUrl(buildSearchUrl({ query, sale_date: targetDateKey }));
-  });
+  ["estate sale", "moving sale", "garage sale", "yard sale"].forEach(
+    (query) => {
+      addSearchUrl(buildSearchUrl({ query }));
+      if (targetDateKey)
+        addSearchUrl(buildSearchUrl({ query, sale_date: targetDateKey }));
+    },
+  );
 
   const craigslistHeaders = {
-    'User-Agent':
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
     Referer: baseUrl,
-    DNT: '1',
-    Connection: 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
+    DNT: "1",
+    Connection: "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
   };
 
-  const pageResults = await Promise.all(
-    searchUrls.map(async (searchUrl) => {
-      try {
-        const response = await axios.get(searchUrl, {
-          timeout: 20000,
-          validateStatus: () => true,
-          headers: craigslistHeaders,
+  // One normal category search is usually sufficient. If it returns valid HTML
+  // but no rows, try at most two date-oriented views sequentially. Never launch
+  // the prior 11-page burst, and stop immediately on a 403 so we do not extend
+  // Craigslist's temporary block.
+  const pageResults = [];
+  const limitedSearchUrls = searchUrls.slice(0, 3);
+
+  for (let index = 0; index < limitedSearchUrls.length; index += 1) {
+    const searchUrl = limitedSearchUrls[index];
+    try {
+      const response = await axios.get(searchUrl, {
+        timeout: 20000,
+        validateStatus: () => true,
+        headers: craigslistHeaders,
+      });
+
+      if (response.status >= 400) {
+        pageResults.push({
+          searchUrl,
+          html: "",
+          status: response.status,
+          error: `Craigslist responded with status ${response.status}`,
         });
+        if (response.status === 403 || response.status === 429) break;
+      } else {
+        const html = String(response.data || "");
+        if (!html || html.trim().startsWith("{")) {
+          pageResults.push({
+            searchUrl,
+            html: "",
+            status: response.status,
+            error: "Craigslist HTML was not returned.",
+          });
+        } else {
+          pageResults.push({
+            searchUrl,
+            html,
+            status: response.status,
+            error: "",
+          });
 
-        if (response.status >= 400) {
-          return { searchUrl, html: '', error: `Craigslist responded with status ${response.status}` };
+          const test$ = cheerio.load(html);
+          const rowCount = test$(
+            ".cl-search-result, .result-row, li.cl-static-search-result, li.result-row, .gallery-card",
+          ).length;
+          if (rowCount > 0) break;
         }
-
-        const html = String(response.data || '');
-        if (!html || html.trim().startsWith('{')) {
-          return { searchUrl, html: '', error: 'Craigslist HTML was not returned.' };
-        }
-
-        return { searchUrl, html, error: '' };
-      } catch (error) {
-        return { searchUrl, html: '', error: error?.message || 'Craigslist request failed' };
       }
-    }),
-  );
+    } catch (error) {
+      pageResults.push({
+        searchUrl,
+        html: "",
+        status: 0,
+        error: error?.message || "Craigslist request failed",
+      });
+    }
+
+    if (index < limitedSearchUrls.length - 1) await wait(750);
+  }
 
   const goodPages = pageResults.filter((page) => page.html);
   if (!goodPages.length) {
-    throw new Error(pageResults.map((page) => page.error).filter(Boolean).join(' | ') || 'Craigslist HTML was not returned.');
+    throw new Error(
+      pageResults
+        .map((page) => page.error)
+        .filter(Boolean)
+        .join(" | ") || "Craigslist HTML was not returned.",
+    );
   }
 
   const rowEntries = [];
@@ -2867,20 +3401,23 @@ async function fetchCraigslistGarageSales({
   for (const page of goodPages) {
     const page$ = cheerio.load(page.html);
     const pageRows = page$(
-      '.cl-search-result, .result-row, li.cl-static-search-result, li.result-row, .gallery-card',
+      ".cl-search-result, .result-row, li.cl-static-search-result, li.result-row, .gallery-card",
     ).toArray();
 
     pageRows.forEach((node) => {
       const $row = page$(node);
       const href = $row
-        .find('.result-title, .posting-title, .title, a')
+        .find(".result-title, .posting-title, .title, a")
         .first()
-        .attr('href');
+        .attr("href");
       const postingUrl = parsePostingUrl(href, baseUrl);
       const title =
-        $row.find('.result-title, .posting-title, .title').first().text().trim() ||
-        $row.find('a').first().text().trim();
-      const fallbackKey = `${title}|${$row.text().replace(/\s+/g, ' ').trim().slice(0, 160)}`;
+        $row
+          .find(".result-title, .posting-title, .title")
+          .first()
+          .text()
+          .trim() || $row.find("a").first().text().trim();
+      const fallbackKey = `${title}|${$row.text().replace(/\s+/g, " ").trim().slice(0, 160)}`;
       const searchKey = postingUrl || fallbackKey;
 
       if (searchKey && seenPostingUrlsFromSearch.has(searchKey)) return;
@@ -2890,43 +3427,48 @@ async function fetchCraigslistGarageSales({
     });
   }
 
-  const rows = rowEntries;
-  const resolvedSales = await Promise.all(
-    rows.map(async (rowEntry, index) => {
+  // Detail pages provide the best addresses and sale times, but requesting all
+  // of them simultaneously is another burst. Resolve a practical maximum with
+  // only two active Craigslist requests at a time.
+  const rows = rowEntries.slice(0, 40);
+  const resolvedSales = await mapWithConcurrency(
+    rows,
+    2,
+    async (rowEntry, index) => {
       const page$ = rowEntry.$;
       const $row = page$(rowEntry.node);
       const title =
         $row
-          .find('.result-title, .posting-title, .title')
+          .find(".result-title, .posting-title, .title")
           .first()
           .text()
           .trim() ||
-        $row.find('a').first().text().trim() ||
+        $row.find("a").first().text().trim() ||
         `Garage Sale ${index + 1}`;
 
       const postingUrl = parsePostingUrl(
         $row
-          .find('.result-title, .posting-title, .title, a')
+          .find(".result-title, .posting-title, .title, a")
           .first()
-          .attr('href'),
+          .attr("href"),
         baseUrl,
       );
 
       const hood = $row
-        .find('.meta .nearby, .result-hood, .location')
+        .find(".meta .nearby, .result-hood, .location")
         .first()
         .text()
         .trim();
-      const price = $row.find('.price').first().text().trim();
+      const price = $row.find(".price").first().text().trim();
       const metaText = $row
-        .find('.meta, .supertitle, .details')
+        .find(".meta, .supertitle, .details")
         .text()
-        .replace(/\s+/g, ' ')
+        .replace(/\s+/g, " ")
         .trim();
       const dateText =
-        $row.find('time').first().attr('datetime') ||
-        $row.find('time').first().text().trim() ||
-        $row.find('.meta time').first().text().trim();
+        $row.find("time").first().attr("datetime") ||
+        $row.find("time").first().text().trim() ||
+        $row.find(".meta time").first().text().trim();
 
       // Important: Craigslist's <time> on the search row is usually the POSTED date,
       // not the sale date. Do not filter on it or good multi-day sales disappear.
@@ -2951,24 +3493,33 @@ async function fetchCraigslistGarageSales({
         ...rowSaleDateKeys,
         ...detailSaleDateKeys,
       ]);
-      if (targetDateKey && saleDateKeys.length && !saleDateKeys.includes(targetDateKey)) {
+      if (
+        targetDateKey &&
+        saleDateKeys.length &&
+        !saleDateKeys.includes(targetDateKey)
+      ) {
         return null;
       }
       const selectedSaleDateKey =
         targetDateKey && saleDateKeys.includes(targetDateKey)
           ? targetDateKey
-          : saleDateKeys[0] || '';
-      const selectedSaleDateLabel =
-        selectedSaleDateKey ? formatSaleDateKeyLabel(selectedSaleDateKey) : '';
+          : saleDateKeys[0] || "";
+      const selectedSaleDateLabel = selectedSaleDateKey
+        ? formatSaleDateKeyLabel(selectedSaleDateKey)
+        : "";
       const selectedDayLabel =
-        targetDateKey && selectedSaleDateKey === targetDateKey && normalizedTargetDay
-          ? formatTargetDayLabel(normalizedTargetDay, targetDateKey)
+        targetDateKey &&
+        selectedSaleDateKey === targetDateKey &&
+        normalizedTargetDay
+          ? normalizedTargetDay === "tomorrow"
+            ? "Tomorrow"
+            : "Today"
           : selectedSaleDateKey
             ? formatSaleDateKeyDayLabel(selectedSaleDateKey)
-            : '';
+            : "";
       const targetSpecificTiming = selectedSaleDateKey
         ? extractTimeForDateKeyFromText(
-            [pageDetails.bodyText, title, metaText].filter(Boolean).join('\n'),
+            [pageDetails.bodyText, title, metaText].filter(Boolean).join("\n"),
             selectedSaleDateKey,
             new Date(),
           )
@@ -2976,19 +3527,19 @@ async function fetchCraigslistGarageSales({
       const selectedTimeLabel =
         cleanAddressFragment(targetSpecificTiming?.timeLabel) ||
         cleanAddressFragment(pageDetails.timeLabel) ||
-        '';
+        "";
       const selectedStartTime =
         cleanAddressFragment(targetSpecificTiming?.startTime) ||
         cleanAddressFragment(pageDetails.startTime) ||
-        '';
+        "";
       const selectedEndTime =
         cleanAddressFragment(targetSpecificTiming?.endTime) ||
         cleanAddressFragment(pageDetails.endTime) ||
-        '';
+        "";
       const selectedTimePattern =
         cleanAddressFragment(targetSpecificTiming?.timePattern) ||
         cleanAddressFragment(pageDetails.timePattern) ||
-        '';
+        "";
       const pageHasUsableGeo = isUsableCoordinatePair(
         pageDetails.latitude,
         pageDetails.longitude,
@@ -3016,23 +3567,27 @@ async function fetchCraigslistGarageSales({
         cleanAddressFragment(pageDetails.locationDetail),
       ].filter(Boolean);
       const cityFallbackGeo = getFallbackCoordinatesForSale({
-        city: '',
+        city: "",
         hood,
         title,
         mapAddress: pageDetails.mapAddress,
-        approximateAddress: '',
+        approximateAddress: "",
         addressLabel: resolvedAddressLabel,
         bodyText: pageDetails.bodyText,
         locationDetail: pageDetails.locationDetail,
+        area,
       });
       const approximateGeo = !isUsableCoordinatePair(
         exactGeo.latitude,
         exactGeo.longitude,
       )
-        ? (await geocodeWithFallbacks(geocodeCandidates, area))
-        : { latitude: null, longitude: null, approximateAddress: '' };
+        ? await geocodeWithFallbacks(geocodeCandidates, area)
+        : { latitude: null, longitude: null, approximateAddress: "" };
       if (
-        !isUsableCoordinatePair(approximateGeo.latitude, approximateGeo.longitude) &&
+        !isUsableCoordinatePair(
+          approximateGeo.latitude,
+          approximateGeo.longitude,
+        ) &&
         cityFallbackGeo
       ) {
         approximateGeo.latitude = cityFallbackGeo.latitude;
@@ -3064,12 +3619,12 @@ async function fetchCraigslistGarageSales({
       let distanceLabel = hasExactCoordinates
         ? milesAway !== null
           ? `${milesAway} mi away`
-          : 'Use map for area'
+          : "Use map for area"
         : hasApproximateCoordinates
           ? milesAway !== null
             ? `Approx. ${milesAway} mi away`
-            : 'Approximate area'
-          : 'Use map for area';
+            : "Approximate area"
+          : "Use map for area";
       const approximateAddressLabel = cleanAddressFragment(
         approximateGeo.approximateAddress,
       );
@@ -3082,6 +3637,7 @@ async function fetchCraigslistGarageSales({
         fallbackAddressLabel: resolvedAddressLabel || hoodLabel,
         bodyText: pageDetails.bodyText,
         locationDetail: pageDetails.locationDetail,
+        area,
       });
 
       if (
@@ -3103,17 +3659,17 @@ async function fetchCraigslistGarageSales({
         hood,
         bodyText: pageDetails.bodyText,
       });
-      if (saleType === 'blocked') {
+      if (saleType === "blocked") {
         return null;
       }
       const saleLabel =
-        saleType === 'estate'
-          ? 'Estate Sale'
-          : saleType === 'moving'
-            ? 'Moving Sale'
-            : 'Garage/Yard Sale';
+        saleType === "estate"
+          ? "Estate Sale"
+          : saleType === "moving"
+            ? "Moving Sale"
+            : "Garage/Yard Sale";
       const rawNotes =
-        [metaText, price].filter(Boolean).join(' • ') ||
+        [metaText, price].filter(Boolean).join(" • ") ||
         `${saleLabel} listing from Craigslist`;
       const notes =
         !hasExactCoordinates && hasApproximateCoordinates
@@ -3143,7 +3699,7 @@ async function fetchCraigslistGarageSales({
         fullLocationText,
       ]
         .filter(Boolean)
-        .join(' ');
+        .join(" ");
       const itemData = extractMentionedItemsFromText(qualityScanText);
       const warningFlags = extractWarningFlagsFromText(qualityScanText);
       const locationConfidence = calculateLocationConfidence({
@@ -3151,13 +3707,13 @@ async function fetchCraigslistGarageSales({
         hasApproximateCoordinates,
         geoSource: hasExactCoordinates
           ? rowHasUsableGeo
-            ? 'search_row'
+            ? "search_row"
             : pageHasUsableGeo
-              ? 'posting_page'
-              : 'unknown'
+              ? "posting_page"
+              : "unknown"
           : hasApproximateCoordinates
-            ? 'geocoder'
-            : 'none',
+            ? "geocoder"
+            : "none",
         street: finalAddress.street,
         crossStreet: finalAddress.crossStreet,
         city: finalAddress.city,
@@ -3168,13 +3724,15 @@ async function fetchCraigslistGarageSales({
         saleDate:
           selectedSaleDateLabel ||
           cleanAddressFragment(pageDetails.saleDate) ||
-          (dateText ? parseCraigslistDate(dateText, normalizedTargetDay) : ''),
+          (dateText ? parseCraigslistDate(dateText, normalizedTargetDay) : ""),
         dayLabel:
           selectedDayLabel ||
           cleanAddressFragment(pageDetails.dayLabel) ||
           (normalizedTargetDay
-            ? formatTargetDayLabel(normalizedTargetDay, targetDateKey)
-            : ''),
+            ? normalizedTargetDay === "tomorrow"
+              ? "Tomorrow"
+              : "Today"
+            : ""),
         timeLabel: selectedTimeLabel,
         startTime: selectedStartTime,
         endTime: selectedEndTime,
@@ -3192,14 +3750,14 @@ async function fetchCraigslistGarageSales({
         distanceMiles: milesAway,
       });
       const helpfulSummaryParts = [
-        saleScoreData.label ? `${saleScoreData.label} sale` : '',
+        saleScoreData.label ? `${saleScoreData.label} sale` : "",
         itemData.bestItems.length
-          ? `Best mentions: ${itemData.bestItems.slice(0, 5).join(', ')}`
-          : '',
-        selectedTimeLabel ? `Time: ${selectedTimeLabel}` : '',
-        fullLocationText ? `Location: ${fullLocationText}` : '',
+          ? `Best mentions: ${itemData.bestItems.slice(0, 5).join(", ")}`
+          : "",
+        selectedTimeLabel ? `Time: ${selectedTimeLabel}` : "",
+        fullLocationText ? `Location: ${fullLocationText}` : "",
       ].filter(Boolean);
-      const helpfulSummary = helpfulSummaryParts.join(' • ');
+      const helpfulSummary = helpfulSummaryParts.join(" • ");
 
       return {
         id: `garage-${area}-${index + 1}`,
@@ -3249,8 +3807,8 @@ async function fetchCraigslistGarageSales({
         saleDate:
           selectedSaleDateLabel ||
           cleanAddressFragment(pageDetails.saleDate) ||
-          (dateText ? parseCraigslistDate(dateText, normalizedTargetDay) : ''),
-        saleDateTime: pageDetails.saleDateTime || '',
+          (dateText ? parseCraigslistDate(dateText, normalizedTargetDay) : ""),
+        saleDateTime: pageDetails.saleDateTime || "",
         saleDateKeys,
         saleDateLabels: saleDateKeys.map(formatSaleDateKeyLabel),
         startTime: selectedStartTime,
@@ -3260,11 +3818,13 @@ async function fetchCraigslistGarageSales({
           selectedDayLabel ||
           cleanAddressFragment(pageDetails.dayLabel) ||
           (normalizedTargetDay
-            ? formatTargetDayLabel(normalizedTargetDay, targetDateKey)
-            : ''),
+            ? normalizedTargetDay === "tomorrow"
+              ? "Tomorrow"
+              : "Today"
+            : ""),
         timingConfidence:
           pageDetails.timingConfidence ||
-          (cleanAddressFragment(pageDetails.saleDate) ? 'high' : 'low'),
+          (cleanAddressFragment(pageDetails.saleDate) ? "high" : "low"),
         timePattern: selectedTimePattern,
         isProbableSale:
           !cleanAddressFragment(pageDetails.saleDate) &&
@@ -3274,32 +3834,32 @@ async function fetchCraigslistGarageSales({
         query: `${title} ${finalAddress.addressLabel}`.trim(),
         mapsQuery: finalAddress.mapsQuery,
         pinColor:
-          saleType === 'estate'
-            ? '#7c3aed'
-            : saleType === 'moving'
-              ? '#ea580c'
-              : '#2563eb',
+          saleType === "estate"
+            ? "#7c3aed"
+            : saleType === "moving"
+              ? "#ea580c"
+              : "#2563eb",
         craigslistUrl: postingUrl,
         geoSource: hasExactCoordinates
           ? rowHasUsableGeo
-            ? 'search_row'
+            ? "search_row"
             : pageHasUsableGeo
-              ? 'posting_page'
-              : 'unknown'
+              ? "posting_page"
+              : "unknown"
           : hasApproximateCoordinates
-            ? 'geocoder'
-            : 'none',
+            ? "geocoder"
+            : "none",
         geocodeQuery:
           !hasExactCoordinates && hasApproximateCoordinates
             ? buildApproximateGeocodeQuery(
                 geocodeCandidates[0] || finalAddress.addressLabel,
                 area,
               )
-            : '',
+            : "",
         distanceMiles: milesAway,
         distanceLabel,
       };
-    }),
+    },
   );
 
   const salesBeforeDedupe = resolvedSales.filter(Boolean);
@@ -3329,9 +3889,9 @@ async function fetchCraigslistGarageSales({
       .length,
     withStreet: sales.filter((sale) => sale.street).length,
     withCity: sales.filter((sale) => sale.city).length,
-    fromPostingPage: sales.filter((sale) => sale.geoSource === 'posting_page')
+    fromPostingPage: sales.filter((sale) => sale.geoSource === "posting_page")
       .length,
-    fromGeocoder: sales.filter((sale) => sale.geoSource === 'geocoder').length,
+    fromGeocoder: sales.filter((sale) => sale.geoSource === "geocoder").length,
     withLocationDetail: sales.filter((sale) => sale.locationNote).length,
     withDescriptionPreview: sales.filter((sale) => sale.descriptionPreview)
       .length,
@@ -3340,10 +3900,10 @@ async function fetchCraigslistGarageSales({
         Array.isArray(sale.itemsMentioned) && sale.itemsMentioned.length,
     ).length,
     withHighLocationConfidence: sales.filter(
-      (sale) => sale.locationConfidence === 'high',
+      (sale) => sale.locationConfidence === "high",
     ).length,
     withHighTimeConfidence: sales.filter(
-      (sale) => sale.timeConfidence === 'high',
+      (sale) => sale.timeConfidence === "high",
     ).length,
     averageSaleScore: sales.length
       ? Math.round(
@@ -3357,7 +3917,12 @@ async function fetchCraigslistGarageSales({
     returned: sales.length,
   };
 
-  return { sales, sourceUrl: searchUrls[0], sourceUrls: searchUrls, diagnostics };
+  return {
+    sales,
+    sourceUrl: searchUrls[0],
+    sourceUrls: searchUrls,
+    diagnostics,
+  };
 }
 
 async function handleGarageSales(req, res) {
@@ -3371,77 +3936,138 @@ async function handleGarageSales(req, res) {
     const searchRadiusMiles = Math.max(
       radiusMiles,
       Math.min(
-        Number(req.query.searchRadiusMiles || req.query.craigslistRadiusMiles) ||
-          (radiusMiles <= 10 ? 25 : radiusMiles <= 25 ? 35 : radiusMiles),
+        Number(
+          req.query.searchRadiusMiles || req.query.craigslistRadiusMiles,
+        ) || (radiusMiles <= 10 ? 25 : radiusMiles <= 25 ? 35 : radiusMiles),
         50,
       ),
     );
     const postal = normalizePostalCode(
-      req.query.postal || req.query.zip || req.query.postalCode || '',
+      req.query.postal || req.query.zip || req.query.postalCode || "",
     );
-    const rawDay = String(req.query.day || '').toLowerCase().trim();
     const day =
-      rawDay === 'dayaftertomorrow' ||
-      rawDay === 'day-after-tomorrow' ||
-      rawDay === '2daysout' ||
-      rawDay === 'two-days-out'
-        ? 'dayaftertomorrow'
-        : rawDay === 'tomorrow'
-          ? 'tomorrow'
-          : rawDay === 'today'
-            ? 'today'
-            : null;
-    const area =
-      String(req.query.area || normalizeAreaFromCoords(latitude, longitude))
-        .trim()
-        .toLowerCase() || 'chicago';
-
-    const { sales, sourceUrl, diagnostics } = await fetchCraigslistGarageSales({
-      area,
+      req.query.day === "tomorrow"
+        ? "tomorrow"
+        : req.query.day === "today"
+          ? "today"
+          : null;
+    const nearestCraigslistRegion = findNearestCraigslistRegion(
       latitude,
       longitude,
+    );
+    const area =
+      String(
+        req.query.area ||
+          nearestCraigslistRegion?.area ||
+          normalizeAreaFromCoords(latitude, longitude),
+      )
+        .trim()
+        .toLowerCase() || "chicago";
+
+    const cacheKey = [
+      area,
+      postal || inferPostalFromCoords(latitude, longitude),
+      Math.round(latitude * 100) / 100,
+      Math.round(longitude * 100) / 100,
       radiusMiles,
       searchRadiusMiles,
-      day,
-      postal,
-    });
+      day || "all",
+    ].join("|");
+    const cached = garageResultsCache.get(cacheKey);
+    const cacheAgeMs = cached ? Date.now() - cached.fetchedAt : Infinity;
     const debugEnabled =
-      req.query.debug === '1' ||
-      req.query.debug === 'true' ||
-      req.query.debug === 'yes';
+      req.query.debug === "1" ||
+      req.query.debug === "true" ||
+      req.query.debug === "yes";
 
-    return res.json({
+    if (cached && cacheAgeMs <= GARAGE_RESULTS_CACHE_TTL_MS) {
+      return res.json({
+        ...cached.response,
+        cached: true,
+        cacheStatus: "fresh",
+        cacheAgeSeconds: Math.round(cacheAgeMs / 1000),
+        ...(debugEnabled ? { diagnostics: cached.diagnostics } : {}),
+      });
+    }
+
+    let craigslistResult;
+    try {
+      craigslistResult = await fetchCraigslistGarageSales({
+        area,
+        latitude,
+        longitude,
+        radiusMiles,
+        searchRadiusMiles,
+        day,
+        postal,
+      });
+    } catch (error) {
+      if (cached && cacheAgeMs <= GARAGE_RESULTS_STALE_TTL_MS) {
+        return res.json({
+          ...cached.response,
+          cached: true,
+          cacheStatus: "stale-fallback",
+          cacheAgeSeconds: Math.round(cacheAgeMs / 1000),
+          warning:
+            "Craigslist is temporarily unavailable. Showing the most recent saved results.",
+          ...(debugEnabled ? { diagnostics: cached.diagnostics } : {}),
+        });
+      }
+      throw error;
+    }
+
+    const { sales, sourceUrl, diagnostics } = craigslistResult;
+    const responseBody = {
       ok: true,
       area,
-      source: 'craigslist',
+      source: "craigslist",
       sourceUrl,
-      day: day || 'all',
+      day: day || "all",
       radiusMiles,
       searchRadiusMiles,
       postal: postal || inferPostalFromCoords(latitude, longitude),
+      nearestCraigslistRegion: nearestCraigslistRegion
+        ? {
+            area: nearestCraigslistRegion.area,
+            zip: nearestCraigslistRegion.zip,
+            distanceMiles: nearestCraigslistRegion.distanceMiles,
+          }
+        : null,
       sales,
       count: sales.length,
-      ...(debugEnabled ? { diagnostics } : {}),
+      cached: false,
+      cacheStatus: "live",
       message: sales.length
         ? `Loaded ${sales.length} Craigslist sale listings.`
-        : 'No Craigslist garage, yard, or estate sale listings matched this area and radius.',
+        : "No Craigslist garage, yard, or estate sale listings matched this area and radius.",
+    };
+
+    garageResultsCache.set(cacheKey, {
+      fetchedAt: Date.now(),
+      response: responseBody,
+      diagnostics,
+    });
+
+    return res.json({
+      ...responseBody,
+      ...(debugEnabled ? { diagnostics } : {}),
     });
   } catch (error) {
-    console.error('Garage sales route failed:', error?.message || error);
+    console.error("Garage sales route failed:", error?.message || error);
     return res.status(500).json({
       ok: false,
-      error: 'garage_sales_fetch_failed',
-      message: 'Could not load garage sales from Craigslist right now.',
+      error: "garage_sales_fetch_failed",
+      message: "Could not load garage sales from Craigslist right now.",
       detail: error?.message || String(error),
     });
   }
 }
 
-router.get('/garage-sales-health', (_req, res) => {
-  return res.json({ ok: true, route: 'garage-sales-route', mounted: true });
+router.get("/garage-sales-health", (_req, res) => {
+  return res.json({ ok: true, route: "garage-sales-route", mounted: true });
 });
 
-router.get('/garage-sales', handleGarageSales);
-router.get('/api/garage-sales', handleGarageSales);
+router.get("/garage-sales", handleGarageSales);
+router.get("/api/garage-sales", handleGarageSales);
 
 module.exports = router;
