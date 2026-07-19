@@ -649,10 +649,42 @@ function parseGeoFromHtml(html) {
   return { latitude: null, longitude: null };
 }
 
-function extractStreetAddressFromText(value) {
-  const text = String(value || "")
+function stripSaleScheduleNoiseFromAddressText(value) {
+  return String(value || "")
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
+    .replace(
+      /\b(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)(?:day)?\b/gi,
+      " ",
+    )
+    .replace(
+      /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*,?\s*\d{4})?\b/gi,
+      " ",
+    )
+    .replace(/\b(?:19|20)\d{2}\s+(?:through|thru|until|to)\b/gi, " ")
+    .replace(/\b\d{1,2}\s*[-â€“â€”]\s*\d{1,2}\b/g, " ")
+    .replace(
+      /\b(?:\d{1,2}\s+)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b/gi,
+      " ",
+    )
+    .replace(/\b(?:to|until|through|thru)\s+\d{1,2}(?::\d{2})?\b/gi, " ")
+    .replace(/\b(?:each day|daily|every day|start time|sale time)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksLikeNonAddressNumberPhrase(value) {
+  const text = cleanAddressFragment(value).toLowerCase();
+  if (!text) return false;
+  if (/^(?:19|20)\d{2}\b/.test(text)) return true;
+  if (/^\d+\s*[-â€“â€”]\s*\d+\b/.test(text)) return true;
+  return /^\d+\s+(?:am|pm|chairs?|tables?|augers?|items?|days?|hours?|books?|toys?|clothes?|pieces?|pairs?|sets?|people|families?)\b/i.test(
+    text,
+  );
+}
+
+function extractStreetAddressFromText(value) {
+  const text = stripSaleScheduleNoiseFromAddressText(value)
     .replace(/\s+/g, " ")
     .trim();
 
@@ -660,15 +692,15 @@ function extractStreetAddressFromText(value) {
 
   const patterns = [
     /\b((?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6}\s(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy))\b/i,
-    /\b((?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6})\b/i,
   ];
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      return String(match[1])
+      const candidate = String(match[1])
         .replace(/[,:;.-]+$/g, "")
         .trim();
+      if (!looksLikeNonAddressNumberPhrase(candidate)) return candidate;
     }
   }
 
@@ -711,7 +743,7 @@ function extractStreetAddressFromSaleTitle(value) {
 }
 
 function extractExactAddressFromText(value) {
-  const text = cleanAddressFragment(value)
+  const text = cleanAddressFragment(stripSaleScheduleNoiseFromAddressText(value))
     .replace(/\b(?:location|address|sale address|located at)\s*:?\s*/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -767,7 +799,7 @@ function escapeRegExp(value) {
 }
 
 function extractAddressUsingCityHint(value, cityHint, stateHint = "") {
-  const text = cleanAddressFragment(value);
+  const text = cleanAddressFragment(stripSaleScheduleNoiseFromAddressText(value));
   const city = cleanAddressFragment(cityHint);
   if (!text || !isLikelyCityLabel(city)) {
     return { street: "", city: "", state: "", zip: "", addressLabel: "" };
@@ -781,7 +813,11 @@ function extractAddressUsingCityHint(value, cityHint, stateHint = "") {
   );
   const match = text.match(pattern);
   const street = normalizeRoadAbbreviation(match?.[1] || "");
-  if (!street || !hasHouseNumberPrefix(street)) {
+  if (
+    !street ||
+    !hasHouseNumberPrefix(street) ||
+    looksLikeNonAddressNumberPhrase(street)
+  ) {
     return { street: "", city: "", state: "", zip: "", addressLabel: "" };
   }
 
@@ -884,7 +920,7 @@ function normalizeRoadAbbreviation(value) {
 }
 
 function normalizeNearAddressText(value) {
-  return cleanAddressFragment(value)
+  return cleanAddressFragment(stripSaleScheduleNoiseFromAddressText(value))
     .replace(
       /\s*\((?:church on corner|corner|near corner|by park|park district).*?\)\s*/gi,
       " ",
@@ -917,6 +953,7 @@ function looksLikeRelativeLocation(value) {
 function isLikelyStreetName(value) {
   const text = normalizeRoadAbbreviation(value);
   if (!text) return false;
+  if (looksLikeNonAddressNumberPhrase(text)) return false;
 
   if (
     /\b(?:Street|Road|Drive|Lane|Court|Circle|Boulevard|Parkway|Place|Terrace|Way|Trail|Highway|Ave(?:nue)?|Route)\b/i.test(
@@ -939,7 +976,10 @@ function isLikelyCrossStreet(value) {
   if (/^(?:[NESW]\s+)?\d{1,3}(?:st|nd|rd|th)\b/i.test(text)) return true;
   if (/^(?:Route|Rt)\s*\d+\b/i.test(text)) return true;
 
-  return isLikelyStreetName(text);
+  return (
+    isLikelyStreetName(text) ||
+    /^[A-Za-z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){0,3}$/.test(text)
+  );
 }
 
 function isLikelyCityLabel(value) {
