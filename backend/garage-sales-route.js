@@ -659,8 +659,8 @@ function extractStreetAddressFromText(value) {
   if (!text) return "";
 
   const patterns = [
-    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6}\s(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy))\b/i,
-    /\b(\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6})\b/i,
+    /\b((?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6}\s(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy))\b/i,
+    /\b((?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,6})\b/i,
   ];
 
   for (const pattern of patterns) {
@@ -724,9 +724,9 @@ function extractExactAddressFromText(value) {
     "(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)";
 
   const exactPattern = new RegExp(
-    "\b((?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9.#'\-]+(?:\s+[A-Za-z0-9.#'\-]+){0,7}\s" +
+    "\\b((?:\\d+[A-Za-z]\\d+|\\d+[A-Za-z]?|\\d+-\\d+)\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z0-9.#'\\-]+(?:\\s+[A-Za-z0-9.#'\\-]+){0,7}\\s" +
       streetSuffix +
-      "\.?)(?:,)?\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:,)?\s+([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?\b",
+      "\\.?)(?:,)?\\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:,)?\\s+([A-Z]{2})\\s*(\\d{5}(?:-\\d{4})?)?\\b",
     "i",
   );
 
@@ -760,6 +760,40 @@ function extractExactAddressFromText(value) {
   }
 
   return { street: "", city: "", state: "", zip: "", addressLabel: "" };
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractAddressUsingCityHint(value, cityHint, stateHint = "") {
+  const text = cleanAddressFragment(value);
+  const city = cleanAddressFragment(cityHint);
+  if (!text || !isLikelyCityLabel(city)) {
+    return { street: "", city: "", state: "", zip: "", addressLabel: "" };
+  }
+
+  const houseNumber = "(?:\\d+[A-Za-z]\\d+|\\d+[A-Za-z]?|\\d+-\\d+)";
+  const cityPattern = escapeRegExp(city).replace(/\\\s+/g, "\\s+");
+  const pattern = new RegExp(
+    `\\b(${houseNumber}\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z0-9.#'\\-]+(?:\\s+[A-Za-z0-9.#'\\-]+){0,6}?)(?:,)?\\s+${cityPattern}(?:,)?\\s*(?:([A-Z]{2})\\b)?\\s*(\\d{5}(?:-\\d{4})?)?`,
+    "i",
+  );
+  const match = text.match(pattern);
+  const street = normalizeRoadAbbreviation(match?.[1] || "");
+  if (!street || !hasHouseNumberPrefix(street)) {
+    return { street: "", city: "", state: "", zip: "", addressLabel: "" };
+  }
+
+  const state = cleanAddressFragment(match?.[2] || stateHint).toUpperCase();
+  const zip = cleanAddressFragment(match?.[3] || "");
+  return {
+    street,
+    city,
+    state,
+    zip,
+    addressLabel: buildMapsQuery([street, city, state, zip]),
+  };
 }
 
 function buildAddressLabel(parts) {
@@ -824,9 +858,17 @@ function cleanAddressFragment(value) {
 
 function normalizeRoadAbbreviation(value) {
   return String(value || "")
+    .replace(
+      /\b(\d+)([nsew])(\d+)\b/gi,
+      (_match, first, direction, last) =>
+        `${first}${String(direction).toUpperCase()}${last}`,
+    )
     .replace(/\bSt\.?\b/gi, "Street")
+    .replace(/\bStreet\b/gi, "Street")
     .replace(/\bRd\.?\b/gi, "Road")
+    .replace(/\bRoad\b/gi, "Road")
     .replace(/\bDr\.?\b/gi, "Drive")
+    .replace(/\bDrive\b/gi, "Drive")
     .replace(/\bLn\.?\b/gi, "Lane")
     .replace(/\bCt\.?\b/gi, "Court")
     .replace(/\bCir\.?\b/gi, "Circle")
@@ -836,6 +878,7 @@ function normalizeRoadAbbreviation(value) {
     .replace(/\bTer\.?\b/gi, "Terrace")
     .replace(/\bTrl\.?\b/gi, "Trail")
     .replace(/\bHwy\.?\b/gi, "Highway")
+    .replace(/\bAvenue\b/gi, "Avenue")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -855,6 +898,20 @@ function normalizeNearAddressText(value) {
 function hasHouseNumberPrefix(value) {
   const text = cleanAddressFragment(value);
   return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\b/i.test(text);
+}
+
+function looksLikeRelativeLocation(value) {
+  const text = cleanAddressFragment(value).toLowerCase();
+  if (!text) return false;
+  return (
+    /^(?:about\s+|approx(?:imately)?\s+)?\d+(?:\.\d+)?\s*(?:mile|miles|mi)\s+(?:north|south|east|west|northeast|northwest|southeast|southwest)\s+of\b/i.test(
+      text,
+    ) ||
+    /^(?:north|south|east|west|northeast|northwest|southeast|southwest)\s+of\b/i.test(
+      text,
+    ) ||
+    /^(?:near|by|around|close to|vicinity of)\b/i.test(text)
+  );
 }
 
 function isLikelyStreetName(value) {
@@ -1275,6 +1332,10 @@ function buildFinalAddressData({
   const cleanFallback = cleanAddressFragment(fallbackAddressLabel);
   const cleanBodyText = cleanAddressFragment(bodyText);
   const cleanLocationDetail = cleanAddressFragment(locationDetail);
+  const hoodParts = parseCityStateZip(cleanHood);
+  const hintedCity = isGenericCraigslistRegion(cleanHood)
+    ? ""
+    : hoodParts.city || cleanHood.replace(/^\(|\)$/g, "");
 
   const titleStreet = cleanAddressFragment(
     extractStreetAddressFromSaleTitle(title) ||
@@ -1286,13 +1347,19 @@ function buildFinalAddressData({
   // the seller writes the exact address in the body.
   const locationExactAddress = extractExactAddressFromText(cleanLocationDetail);
   const bodyExactAddress = extractExactAddressFromText(cleanBodyText);
-  const exactBodyAddress = locationExactAddress.addressLabel
-    ? locationExactAddress
-    : bodyExactAddress;
+  const cityHintAddress = extractAddressUsingCityHint(
+    cleanBodyText,
+    hintedCity,
+    hoodParts.state || getDefaultStateForArea(area),
+  );
+  const exactBodyAddress = cityHintAddress.addressLabel
+    ? cityHintAddress
+    : bodyExactAddress.addressLabel
+      ? bodyExactAddress
+      : locationExactAddress;
 
   const mapParts = splitNearAddress(cleanMapAddress);
   const approxParts = splitNearAddress(cleanApproximateAddress);
-  const hoodParts = parseCityStateZip(cleanHood);
 
   const trustedTitleStreet =
     hasHouseNumberPrefix(titleStreet) && looksLikeRealStreetAddress(titleStreet)
@@ -1319,6 +1386,7 @@ function buildFinalAddressData({
 
   const inferredCity =
     exactBodyAddress.city ||
+    (exactBodyAddress.street ? hintedCity : "") ||
     contextualCity ||
     (isGenericCraigslistRegion(cleanHood) ? "" : hoodParts.city);
 
@@ -1355,17 +1423,21 @@ function buildFinalAddressData({
     "Approximate location";
 
   const displayAddress =
-    exactBodyAddress.addressLabel ||
+    (exactBodyAddress.addressLabel && exactBodyAddress.city
+      ? exactBodyAddress.addressLabel
+      : "") ||
     (primaryAddress && primaryAddress !== state ? primaryAddress : "") ||
     buildMapsQuery([fallbackAddress, cityWithAreaFallback, state, zip]) ||
     fallbackAddress;
 
   const mapsQuery =
-    exactBodyAddress.addressLabel ||
+    (exactBodyAddress.addressLabel && exactBodyAddress.city
+      ? exactBodyAddress.addressLabel
+      : "") ||
     buildPreferredMapsQuery({
       street,
       crossStreet,
-      cityWithAreaFallback,
+      city: cityWithAreaFallback,
       state,
       zip,
       mapAddress: cleanMapAddress,
@@ -1383,7 +1455,10 @@ function buildFinalAddressData({
     addressLabel: displayAddress,
     displayAddress,
     mapAddress:
-      exactBodyAddress.addressLabel ||
+      (exactBodyAddress.addressLabel && exactBodyAddress.city
+        ? exactBodyAddress.addressLabel
+        : "") ||
+      (exactBodyAddress.street ? displayAddress : "") ||
       cleanMapAddress ||
       cleanApproximateAddress ||
       cleanHood ||
@@ -1411,15 +1486,16 @@ function stripDateNoiseFromText(value) {
 function looksLikeRealStreetAddress(value) {
   const text = cleanAddressFragment(value);
   if (!text) return false;
+  if (looksLikeRelativeLocation(text)) return false;
   if (
-    /\b\d{1,6}\s+[A-Za-z]/.test(text) &&
+    /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z0-9]/i.test(text) &&
     /\b(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Cir|Circle|Blvd|Boulevard|Pkwy|Parkway|Pl|Place|Ter|Terrace|Way|Trail|Trl|Highway|Hwy)\b/i.test(
       text,
     )
   ) {
     return true;
   }
-  return /^\d{1,6}\s+[A-Za-z][A-Za-z0-9.#'\-]*(?:\s+[A-Za-z0-9.#'\-]+){0,4}$/i.test(
+  return /^(?:\d+[A-Za-z]\d+|\d+[A-Za-z]?|\d+-\d+)\s+[A-Za-z0-9][A-Za-z0-9.#'\-]*(?:\s+[A-Za-z0-9.#'\-]+){0,4}$/i.test(
     text,
   );
 }
@@ -1801,7 +1877,7 @@ function extractSaleDatesFromText(text, referenceDate) {
   }
 
   for (const monthMatch of haystack.matchAll(
-    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*(?:-|–|to|through|thru|and|&)\s*(\d{1,2})(?:st|nd|rd|th)?)?(?:\s*,?\s*(\d{2,4}))?/gi,
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*(?:-|â€“|to|through|thru|and|&)\s*(\d{1,2})(?:st|nd|rd|th)?)?(?:\s*,?\s*(\d{2,4}))?/gi,
   )) {
     const monthIndex = monthNameToIndex(monthMatch[1]);
     const firstDay = Number(monthMatch[2]);
@@ -1953,15 +2029,15 @@ function extractSaleTimeLabel(text) {
   }
 
   const labeledRangeMatch = haystack.match(
-    /\b(?:time|times|hours?|open|sale\s*time)\s*:?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|–|—|to|until|through|thru)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
+    /\b(?:time|times|hours?|open|sale\s*time)\s*:?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|â€“|â€”|to|until|through|thru)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
   );
 
   const rangeWithMeridiemMatch = haystack.match(
-    /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:-|–|—|to|until|through|thru)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
+    /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:-|â€“|â€”|to|until|through|thru)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
   );
 
   const compactRangeMatch = haystack.match(
-    /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|–|—|to|until|through|thru)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
+    /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|â€“|â€”|to|until|through|thru)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
   );
 
   const rangeMatch =
@@ -2089,7 +2165,7 @@ function cleanGarageSaleDetailText(value) {
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/\s+/g, " ")
-    .replace(/^[\s:•\-–—]+|[\s:•\-–—]+$/g, "")
+    .replace(/^[\s:â€¢\-â€“â€”]+|[\s:â€¢\-â€“â€”]+$/g, "")
     .trim();
 }
 
@@ -2103,7 +2179,7 @@ function limitGarageSaleDetailText(value, maxLength = 220) {
     trimmed.lastIndexOf(", "),
     trimmed.lastIndexOf(" "),
   );
-  return `${trimmed.slice(0, lastBreak > 80 ? lastBreak : maxLength).trim()}…`;
+  return `${trimmed.slice(0, lastBreak > 80 ? lastBreak : maxLength).trim()}â€¦`;
 }
 
 function uniqueCleanList(values, limit = 12) {
@@ -2113,7 +2189,7 @@ function uniqueCleanList(values, limit = 12) {
   for (const value of values || []) {
     const cleaned = cleanGarageSaleDetailText(value)
       .replace(/\s+/g, " ")
-      .replace(/^[,;:•\-–—]+|[,;:•\-–—]+$/g, "")
+      .replace(/^[,;:â€¢\-â€“â€”]+|[,;:â€¢\-â€“â€”]+$/g, "")
       .trim();
     if (!cleaned) continue;
 
@@ -2129,8 +2205,8 @@ function uniqueCleanList(values, limit = 12) {
 
 function normalizeForKeywordScan(value) {
   return String(value || "")
-    .replace(/[’‘]/g, "'")
-    .replace(/[“”]/g, '"')
+    .replace(/[â€™â€˜]/g, "'")
+    .replace(/[â€œâ€]/g, '"')
     .replace(/&amp;/gi, "&")
     .replace(/[^a-zA-Z0-9$&+/#.'\-\s]/g, " ")
     .replace(/\s+/g, " ")
@@ -2424,7 +2500,10 @@ function calculateLocationConfidence({
     reasons.push("approximate geocode");
   }
 
-  if (geoSource === "posting_page") {
+  if (geoSource === "geocoder_exact_address") {
+    score += 18;
+    reasons.push("seller address geocoded");
+  } else if (geoSource === "posting_page") {
     score += 18;
     reasons.push("coordinates from posting page");
   } else if (geoSource === "search_row") {
@@ -2652,12 +2731,12 @@ function buildFallbackDescriptionPreview(bodyText, notes) {
       /\b(?:friday|saturday|sunday|monday|tuesday|wednesday|thursday)\b[^.]{0,120}/gi,
       " ",
     )
-    .split(/(?<=[.!?])\s+|\s*[•\-–—]\s*/g)
+    .split(/(?<=[.!?])\s+|\s*[â€¢\-â€“â€”]\s*/g)
     .map(cleanGarageSaleDetailText)
     .filter((part) => part.length >= 12 && resaleKeywords.test(part))
     .slice(0, 4);
 
-  return parts.length ? limitGarageSaleDetailText(parts.join(" • "), 320) : "";
+  return parts.length ? limitGarageSaleDetailText(parts.join(" â€¢ "), 320) : "";
 }
 
 function escapeRegexText(value) {
@@ -2667,11 +2746,11 @@ function escapeRegexText(value) {
 function normalizePostingBodyForDetails(value) {
   return cleanGarageSaleDetailText(value)
     .replace(/\s*\n\s*/g, " ")
-    .replace(/✨/g, " ")
-    .replace(/📍/g, " Location: ")
-    .replace(/🗓️|📅|🗓/g, " Dates: ")
-    .replace(/⏰|🕘|🕙|🕗/g, " Time: ")
-    .replace(/🪑|💵|🚗/g, " ")
+    .replace(/âœ¨/g, " ")
+    .replace(/ðŸ“/g, " Location: ")
+    .replace(/ðŸ—“ï¸|ðŸ“…|ðŸ—“/g, " Dates: ")
+    .replace(/â°|ðŸ•˜|ðŸ•™|ðŸ•—/g, " Time: ")
+    .replace(/ðŸª‘|ðŸ’µ|ðŸš—/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -2700,7 +2779,7 @@ function extractLocationDetailFromPostingBody(bodyText) {
       "Date",
       "Time",
       "Hours",
-      "What you’ll find",
+      "What youâ€™ll find",
       "What you'll find",
       "What you will find",
       "You will find",
@@ -2736,7 +2815,7 @@ function extractDescriptionPreviewFromPostingBody(bodyText) {
   const whatYouWillFind = extractLabelValueFromPostingBody(
     body,
     [
-      "What you’ll find",
+      "What youâ€™ll find",
       "What you'll find",
       "What you will find",
       "You will find",
@@ -2795,13 +2874,13 @@ function extractDescriptionPreviewFromPostingBody(bodyText) {
   ];
   const keywordRegex = new RegExp(`\\b(?:${resaleKeywords.join("|")})\\b`, "i");
   const sentences = body
-    .split(/(?<=[.!?])\s+|\s{2,}|(?:\s*[•\-–—]\s*)/)
+    .split(/(?<=[.!?])\s+|\s{2,}|(?:\s*[â€¢\-â€“â€”]\s*)/)
     .map(cleanGarageSaleDetailText)
     .filter((part) => part.length >= 12 && keywordRegex.test(part))
     .slice(0, 4);
 
   if (sentences.length) {
-    return limitGarageSaleDetailText(sentences.join(" • "), 300);
+    return limitGarageSaleDetailText(sentences.join(" â€¢ "), 300);
   }
 
   const cleaned = body
@@ -3557,7 +3636,22 @@ async function fetchCraigslistGarageSales({
         title,
         hood,
       });
+      const preliminaryAddress = buildFinalAddressData({
+        title,
+        hood,
+        mapAddress: pageDetails.mapAddress,
+        approximateAddress: "",
+        fallbackAddressLabel: resolvedAddressLabel || hood,
+        bodyText: pageDetails.bodyText,
+        locationDetail: pageDetails.locationDetail,
+        area,
+      });
+      const hasSellerWrittenStreetAddress =
+        hasHouseNumberPrefix(preliminaryAddress.street) &&
+        looksLikeRealStreetAddress(preliminaryAddress.street);
       const geocodeCandidates = [
+        hasSellerWrittenStreetAddress ? preliminaryAddress.mapsQuery : "",
+        hasSellerWrittenStreetAddress ? preliminaryAddress.addressLabel : "",
         ...buildGeocodeCandidates({
           mapAddress: pageDetails.mapAddress,
           addressLabel: resolvedAddressLabel,
@@ -3577,12 +3671,17 @@ async function fetchCraigslistGarageSales({
         locationDetail: pageDetails.locationDetail,
         area,
       });
-      const approximateGeo = !isUsableCoordinatePair(
-        exactGeo.latitude,
-        exactGeo.longitude,
-      )
+      const approximateGeo =
+        hasSellerWrittenStreetAddress ||
+        !isUsableCoordinatePair(exactGeo.latitude, exactGeo.longitude)
         ? await geocodeWithFallbacks(geocodeCandidates, area)
         : { latitude: null, longitude: null, approximateAddress: "" };
+      const sellerAddressGeocodeSucceeded =
+        hasSellerWrittenStreetAddress &&
+        isUsableCoordinatePair(
+          approximateGeo.latitude,
+          approximateGeo.longitude,
+        );
       if (
         !isUsableCoordinatePair(
           approximateGeo.latitude,
@@ -3594,22 +3693,33 @@ async function fetchCraigslistGarageSales({
         approximateGeo.longitude = cityFallbackGeo.longitude;
         approximateGeo.approximateAddress = cityFallbackGeo.label;
       }
-      const hasExactCoordinates = isUsableCoordinatePair(
+      const hasGeocodedSellerAddress =
+        sellerAddressGeocodeSucceeded;
+      const hasCraigslistCoordinates = isUsableCoordinatePair(
         exactGeo.latitude,
         exactGeo.longitude,
       );
-      let hasApproximateCoordinates = isUsableCoordinatePair(
-        approximateGeo.latitude,
-        approximateGeo.longitude,
-      );
-      let geo = hasExactCoordinates
-        ? exactGeo
-        : hasApproximateCoordinates
-          ? {
-              latitude: approximateGeo.latitude,
-              longitude: approximateGeo.longitude,
-            }
-          : { latitude: null, longitude: null };
+      const hasExactCoordinates =
+        hasGeocodedSellerAddress || hasCraigslistCoordinates;
+      let hasApproximateCoordinates =
+        !hasExactCoordinates &&
+        isUsableCoordinatePair(
+          approximateGeo.latitude,
+          approximateGeo.longitude,
+        );
+      let geo = hasGeocodedSellerAddress
+        ? {
+            latitude: approximateGeo.latitude,
+            longitude: approximateGeo.longitude,
+          }
+        : hasCraigslistCoordinates
+          ? exactGeo
+          : hasApproximateCoordinates
+            ? {
+                latitude: approximateGeo.latitude,
+                longitude: approximateGeo.longitude,
+              }
+            : { latitude: null, longitude: null };
       let milesAway = distanceMiles(
         latitude,
         longitude,
@@ -3639,6 +3749,17 @@ async function fetchCraigslistGarageSales({
         locationDetail: pageDetails.locationDetail,
         area,
       });
+      const resolvedGeoSource = hasGeocodedSellerAddress
+        ? "geocoder_exact_address"
+        : hasCraigslistCoordinates
+          ? rowHasUsableGeo
+            ? "search_row"
+            : pageHasUsableGeo
+              ? "posting_page"
+              : "unknown"
+          : hasApproximateCoordinates
+            ? "geocoder"
+            : "none";
 
       if (
         !finalAddress.street &&
@@ -3669,11 +3790,11 @@ async function fetchCraigslistGarageSales({
             ? "Moving Sale"
             : "Garage/Yard Sale";
       const rawNotes =
-        [metaText, price].filter(Boolean).join(" • ") ||
+        [metaText, price].filter(Boolean).join(" â€¢ ") ||
         `${saleLabel} listing from Craigslist`;
       const notes =
         !hasExactCoordinates && hasApproximateCoordinates
-          ? `${rawNotes} • Approximate location from listing area.`
+          ? `${rawNotes} â€¢ Approximate location from listing area.`
           : rawNotes;
       const locationDetail = cleanGarageSaleDetailText(
         pageDetails.locationDetail,
@@ -3705,15 +3826,7 @@ async function fetchCraigslistGarageSales({
       const locationConfidence = calculateLocationConfidence({
         hasExactCoordinates,
         hasApproximateCoordinates,
-        geoSource: hasExactCoordinates
-          ? rowHasUsableGeo
-            ? "search_row"
-            : pageHasUsableGeo
-              ? "posting_page"
-              : "unknown"
-          : hasApproximateCoordinates
-            ? "geocoder"
-            : "none",
+        geoSource: resolvedGeoSource,
         street: finalAddress.street,
         crossStreet: finalAddress.crossStreet,
         city: finalAddress.city,
@@ -3757,13 +3870,13 @@ async function fetchCraigslistGarageSales({
         selectedTimeLabel ? `Time: ${selectedTimeLabel}` : "",
         fullLocationText ? `Location: ${fullLocationText}` : "",
       ].filter(Boolean);
-      const helpfulSummary = helpfulSummaryParts.join(" • ");
+      const helpfulSummary = helpfulSummaryParts.join(" â€¢ ");
 
       return {
         id: `garage-${area}-${index + 1}`,
         saleType,
         title,
-        subtitle: `${saleLabel} • ${distanceLabel}`,
+        subtitle: `${saleLabel} â€¢ ${distanceLabel}`,
         latitude: geo.latitude,
         longitude: geo.longitude,
         lat: geo.latitude,
@@ -3840,15 +3953,7 @@ async function fetchCraigslistGarageSales({
               ? "#ea580c"
               : "#2563eb",
         craigslistUrl: postingUrl,
-        geoSource: hasExactCoordinates
-          ? rowHasUsableGeo
-            ? "search_row"
-            : pageHasUsableGeo
-              ? "posting_page"
-              : "unknown"
-          : hasApproximateCoordinates
-            ? "geocoder"
-            : "none",
+        geoSource: resolvedGeoSource,
         geocodeQuery:
           !hasExactCoordinates && hasApproximateCoordinates
             ? buildApproximateGeocodeQuery(
